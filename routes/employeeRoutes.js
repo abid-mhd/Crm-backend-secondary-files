@@ -37,6 +37,21 @@ router.post('/import',
   employeeController.importEmployees
 );
 
+router.get('/send-reminders', async (req, res) => {
+  try {
+    const result = await checkAndSendReminderNotifications();
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Failed to send reminders',
+      error: error.message
+    });
+  }
+});
+
+// router.get('/trigger-reminder', attendanceController.triggerReminderManually);
+
 // Auth routes
 // router.post('/auth/create-password', authController.createPassword);
 
