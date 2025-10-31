@@ -1,8 +1,6 @@
 const db = require("../config/db");
 const { validationResult } = require('express-validator');
 
-
-
 const getEmployeeId = async (req) => {
   console.log('Request user in settings:', req.user);
   if (!req.user || !req.user.id) {
@@ -10,7 +8,6 @@ const getEmployeeId = async (req) => {
   }
   
   try {
-    // Get employee_id from users table
     const [users] = await db.execute(
       "SELECT employee_id FROM users WHERE id = ?",
       [req.user.id]
@@ -80,7 +77,8 @@ exports.getEmployeesWithAttendance = async (req, res) => {
         a.check_out as checkOut,
         a.overtime_hours as overtimeHours,
         a.overtime_rate as overtimeRate,
-        a.overtime_amount as overtimeAmount
+        a.overtime_amount as overtimeAmount,
+        a.location_data as locationData
       FROM employees e
       LEFT JOIN attendance a ON e.id = a.employee_id 
         AND DATE(a.date) = ?
@@ -88,7 +86,19 @@ exports.getEmployeesWithAttendance = async (req, res) => {
       ORDER BY e.name
     `, [targetDate]);
 
-    res.json(employees);
+    // Parse location data if it exists
+    const employeesWithLocation = employees.map(emp => {
+      if (emp.locationData) {
+        try {
+          emp.locationData = JSON.parse(emp.locationData);
+        } catch (e) {
+          emp.locationData = null;
+        }
+      }
+      return emp;
+    });
+
+    res.json(employeesWithLocation);
   } catch (error) {
     console.error("Error fetching employees with attendance:", error);
     res.status(500).json({ message: "Server error" });
@@ -210,7 +220,7 @@ exports.getAttendanceSummary = async (req, res) => {
   }
 };
 
-// Mark attendance
+// Mark attendance with location
 exports.markAttendance = async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -218,38 +228,106 @@ exports.markAttendance = async (req, res) => {
       return res.status(400).json({ errors: errors.array() });
     }
 
-    const { employeeId, status, date, remarks = '' } = req.body;
+    const { 
+      employeeId, 
+      status, 
+      date, 
+      checkIn, 
+      checkOut, 
+      remarks = '',
+      locationData = null 
+    } = req.body;
     
-    // Fix: Use only the date part, not the full datetime
     const targetDate = date ? new Date(date).toISOString().split('T')[0] : new Date().toISOString().split('T')[0];
 
-    console.log('Marking attendance for:', { employeeId, status, targetDate }); // Debug log
+    console.log('Marking attendance for:', { 
+      employeeId, 
+      status, 
+      targetDate, 
+      checkIn, 
+      checkOut,
+      locationData 
+    });
+
+    // Validate location data structure if provided
+    let locationJson = null;
+    if (locationData) {
+      try {
+        locationJson = JSON.stringify({
+          latitude: locationData.latitude,
+          longitude: locationData.longitude,
+          accuracy: locationData.accuracy,
+          address: locationData.address || null,
+          timestamp: new Date().toISOString(),
+          source: locationData.source || 'browser'
+        });
+      } catch (error) {
+        console.error('Error parsing location data:', error);
+        return res.status(400).json({ 
+          success: false, 
+          message: 'Invalid location data format' 
+        });
+      }
+    }
 
     // Check if attendance already exists
     const [existing] = await db.query(
-      "SELECT id FROM attendance WHERE employee_id = ? AND DATE(date) = ?",
+      "SELECT id, check_in, check_out FROM attendance WHERE employee_id = ? AND DATE(date) = ?",
       [employeeId, targetDate]
     );
+
+    let updateData = { 
+      status, 
+      remarks, 
+      updated_at: new Date() 
+    };
+    
+    // Add location data if provided
+    if (locationJson) {
+      updateData.location_data = locationJson;
+    }
+    
+    // Only update check_in if it's provided and not already set
+    if (checkIn && (!existing[0]?.check_in || existing[0]?.check_in === '00:00:00')) {
+      updateData.check_in = checkIn;
+    }
+    
+    // Only update check_out if it's provided
+    if (checkOut) {
+      updateData.check_out = checkOut;
+    }
 
     if (existing.length > 0) {
       // Update existing attendance
       await db.query(
         `UPDATE attendance 
-         SET status = ?, remarks = ?, updated_at = NOW()
+         SET ? 
          WHERE employee_id = ? AND DATE(date) = ?`,
-        [status, remarks, employeeId, targetDate]
+        [updateData, employeeId, targetDate]
       );
       
-      console.log('Updated existing attendance record'); // Debug log
+      console.log('Updated existing attendance record');
     } else {
-      // Create new attendance record - use only the date part
+      // Create new attendance record
+      const newData = {
+        employee_id: employeeId,
+        date: targetDate,
+        status: status,
+        remarks: remarks,
+        created_at: new Date(),
+        updated_at: new Date()
+      };
+      
+      if (checkIn) newData.check_in = checkIn;
+      if (checkOut) newData.check_out = checkOut;
+      if (locationJson) newData.location_data = locationJson;
+      
       await db.query(
-        `INSERT INTO attendance (employee_id, date, status, remarks, created_at, updated_at)
-         VALUES (?, ?, ?, ?, NOW(), NOW())`,
-        [employeeId, targetDate, status, remarks]
+        `INSERT INTO attendance SET ?`,
+        [newData]
       );
       
-      console.log('Created new attendance record'); // Debug log
+      console.log('Created new attendance record');
     }
 
     // Update employee status in employees table
@@ -260,16 +338,20 @@ exports.markAttendance = async (req, res) => {
       [status, employeeId]
     );
 
-    console.log('Updated employee status in employees table'); // Debug log
+    console.log('Updated employee status in employees table');
 
-    res.json({ success: true, message: 'Attendance marked successfully' });
+    res.json({ 
+      success: true, 
+      message: 'Attendance marked successfully',
+      locationRecorded: !!locationData 
+    });
   } catch (error) {
     console.error('Error marking attendance:', error);
     res.status(500).json({ success: false, message: 'Server error' });
   }
 };
 
-// Add overtime
+// Add overtime with location (optional)
 exports.addOvertime = async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -277,12 +359,39 @@ exports.addOvertime = async (req, res) => {
       return res.status(400).json({ errors: errors.array() });
     }
 
-    const { employeeId, hours, rate, type, amount, date, calculationType } = req.body;
+    const { 
+      employeeId, 
+      hours, 
+      rate, 
+      type, 
+      amount, 
+      date, 
+      calculationType,
+      locationData = null 
+    } = req.body;
+    
     const targetDate = date ? new Date(date) : new Date().toISOString().split('T')[0];
 
     // Convert rate from string with commas to decimal
     const cleanRate = parseFloat(rate.replace(/,/g, ''));
     const cleanAmount = parseFloat(amount.toString().replace(/,/g, ''));
+
+    // Prepare location data if provided
+    let locationJson = null;
+    if (locationData) {
+      try {
+        locationJson = JSON.stringify({
+          latitude: locationData.latitude,
+          longitude: locationData.longitude,
+          accuracy: locationData.accuracy,
+          address: locationData.address || null,
+          timestamp: new Date().toISOString(),
+          source: locationData.source || 'browser'
+        });
+      } catch (error) {
+        console.error('Error parsing location data for overtime:', error);
+      }
+    }
 
     // Check if attendance record exists
     const [existing] = await db.query(
@@ -292,31 +401,64 @@ exports.addOvertime = async (req, res) => {
 
     if (existing.length > 0) {
       // Update existing record with overtime
+      const updateData = {
+        overtime_hours: hours,
+        overtime_rate: cleanRate,
+        overtime_type: type,
+        overtime_amount: cleanAmount,
+        overtime_calculation_type: calculationType,
+        updated_at: new Date()
+      };
+
+      // Add location data if provided
+      if (locationJson) {
+        updateData.location_data = locationJson;
+      }
+
       await db.query(
         `UPDATE attendance 
-         SET overtime_hours = ?, overtime_rate = ?, overtime_type = ?, overtime_amount = ?, 
-             overtime_calculation_type = ?, updated_at = NOW()
+         SET ?
          WHERE employee_id = ? AND DATE(date) = ?`,
-        [hours, cleanRate, type, cleanAmount, calculationType, employeeId, targetDate]
+        [updateData, employeeId, targetDate]
       );
     } else {
       // Create new record with overtime
+      const newData = {
+        employee_id: employeeId,
+        date: targetDate,
+        status: 'Present',
+        overtime_hours: hours,
+        overtime_rate: cleanRate,
+        overtime_type: type,
+        overtime_amount: cleanAmount,
+        overtime_calculation_type: calculationType,
+        created_at: new Date(),
+        updated_at: new Date()
+      };
+
+      // Add location data if provided
+      if (locationJson) {
+        newData.location_data = locationJson;
+      }
+
       await db.query(
-        `INSERT INTO attendance (employee_id, date, status, overtime_hours, overtime_rate, 
-         overtime_type, overtime_amount, overtime_calculation_type, created_at, updated_at)
-         VALUES (?, ?, 'Present', ?, ?, ?, ?, ?, NOW(), NOW())`,
-        [employeeId, targetDate, hours, cleanRate, type, cleanAmount, calculationType]
+        `INSERT INTO attendance SET ?`,
+        [newData]
       );
     }
 
-    res.json({ success: true, message: 'Overtime added successfully' });
+    res.json({ 
+      success: true, 
+      message: 'Overtime added successfully',
+      locationRecorded: !!locationData 
+    });
   } catch (error) {
     console.error('Error adding overtime:', error);
     res.status(500).json({ success: false, message: 'Server error' });
   }
 };
 
-// Get attendance history for an employee
+// Get attendance history for an employee with location data
 exports.getAttendanceHistory = async (req, res) => {
   try {
     const { employeeId } = req.params;
@@ -327,26 +469,325 @@ exports.getAttendanceHistory = async (req, res) => {
 
     const [history] = await db.query(`
       SELECT 
-      id,
+        id,
         date,
         status,
         check_in as checkIn,
         check_out as checkOut,
         overtime_hours as overtimeHours,
         overtime_amount as overtimeAmount,
-        remarks
+        remarks,
+        location_data as locationData
       FROM attendance 
       WHERE employee_id = ? 
         AND date BETWEEN ? AND ?
       ORDER BY date DESC
     `, [employeeId, startDate, endDate]);
 
-    res.json({ success: true, data: history });
+    // Parse location data for each record
+    const historyWithLocation = history.map(record => {
+      if (record.locationData) {
+        try {
+          record.locationData = JSON.parse(record.locationData);
+        } catch (e) {
+          record.locationData = null;
+        }
+      }
+      return record;
+    });
+
+    res.json({ success: true, data: historyWithLocation });
   } catch (error) {
     console.error('Error fetching attendance history:', error);
     res.status(500).json({ success: false, message: 'Server error' });
   }
 };
+
+// Update attendance with location
+exports.updateAttendance = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { 
+      status, 
+      checkIn, 
+      checkOut, 
+      overtimeHours, 
+      remarks, 
+      date,
+      locationData = null 
+    } = req.body;
+
+    console.log('Updating attendance:', { 
+      id, 
+      status, 
+      checkIn, 
+      checkOut, 
+      overtimeHours, 
+      remarks,
+      locationData 
+    });
+
+    // Check if attendance record exists
+    const [existing] = await db.query(
+      "SELECT id FROM attendance WHERE id = ?",
+      [id]
+    );
+
+    if (existing.length === 0) {
+      return res.status(404).json({ success: false, message: 'Attendance record not found' });
+    }
+
+    // Prepare location data if provided
+    let locationJson = null;
+    if (locationData) {
+      try {
+        locationJson = JSON.stringify({
+          latitude: locationData.latitude,
+          longitude: locationData.longitude,
+          accuracy: locationData.accuracy,
+          address: locationData.address || null,
+          timestamp: new Date().toISOString(),
+          source: locationData.source || 'manual_update'
+        });
+      } catch (error) {
+        console.error('Error parsing location data for update:', error);
+      }
+    }
+
+    // Build update object with only provided fields
+    const updateFields = {
+      updated_at: new Date()
+    };
+
+    if (status) updateFields.status = status;
+    if (checkIn) updateFields.check_in = checkIn;
+    if (checkOut) updateFields.check_out = checkOut;
+    if (overtimeHours) updateFields.overtime_hours = overtimeHours;
+    if (remarks) updateFields.remarks = remarks;
+    if (locationJson) updateFields.location_data = locationJson;
+
+    await db.query(
+      `UPDATE attendance 
+       SET ?
+       WHERE id = ?`,
+      [updateFields, id]
+    );
+
+    res.json({ 
+      success: true, 
+      message: 'Attendance updated successfully',
+      locationUpdated: !!locationData 
+    });
+  } catch (error) {
+    console.error('Error updating attendance:', error);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+};
+
+// Today's attendance with location data
+exports.todayAttendance = async (req, res) => {
+  try {
+    const { date } = req.query;
+    const targetDate = date ? new Date(date).toISOString().split('T')[0] : new Date().toISOString().split('T')[0];
+
+    console.log('Fetching today attendance for date:', targetDate);
+
+    const [attendance] = await db.query(`
+      SELECT 
+        a.id as attendance_id,
+        a.employee_id,
+        a.status,
+        a.check_in,
+        a.check_out,
+        a.overtime_hours,
+        a.remarks,
+        a.location_data as locationData,
+        a.date as attendance_date,
+        e.id as employee_id,
+        e.employeeName as employee_name,
+        e.department,
+        e.position,
+        e.phone,
+        e.balance,
+        e.last_month_due
+      FROM attendance a
+      JOIN employees e ON a.employee_id = e.id
+      WHERE DATE(a.date) = ?
+      ORDER BY e.employeeName
+    `, [targetDate]);
+
+    // Don't parse location data here - let frontend handle it
+    // Just return the raw data as is
+    console.log(`Found ${attendance.length} attendance records for ${targetDate}`);
+
+    // Debug: Check first record's location data
+    if (attendance.length > 0) {
+      console.log('First record location data type:', typeof attendance[0].locationData);
+      console.log('First record location data:', attendance[0].locationData);
+    }
+
+    res.json({ 
+      success: true, 
+      data: attendance, // Return raw data without parsing
+      count: attendance.length,
+      date: targetDate
+    });
+  } catch (error) {
+    console.error('Error fetching today attendance:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Error fetching today attendance',
+      error: error.message 
+    });
+  }
+};
+
+// Get my attendance with location data
+exports.getMyAttendance = async (req, res) => {
+  try {
+    const { month, year } = req.query;
+    const employeeId = await getEmployeeId(req);
+
+    if (!employeeId) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Employee ID not found' 
+      });
+    }
+
+    const startDate = `${year}-${month.toString().padStart(2, '0')}-01`;
+    const endDate = new Date(year, month, 0).toISOString().split('T')[0];
+
+    console.log('Fetching my attendance for:', { employeeId, startDate, endDate });
+
+    const [attendance] = await db.query(`
+      SELECT 
+        id,
+        date,
+        status,
+        check_in as checkIn,
+        check_out as checkOut,
+        overtime_hours as overtimeHours,
+        overtime_amount as overtimeAmount,
+        remarks,
+        location_data as locationData
+      FROM attendance 
+      WHERE employee_id = ? 
+        AND date BETWEEN ? AND ?
+      ORDER BY date DESC
+    `, [employeeId, startDate, endDate]);
+
+    // Parse location data for each record
+    const attendanceWithLocation = attendance.map(record => {
+      if (record.locationData) {
+        try {
+          record.locationData = JSON.parse(record.locationData);
+        } catch (e) {
+          record.locationData = null;
+        }
+      }
+      return record;
+    });
+
+    res.json({
+      success: true,
+      data: attendanceWithLocation,
+      count: attendance.length
+    });
+  } catch (error) {
+    console.error('Get my attendance error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Server error while fetching attendance' 
+    });
+  }
+};
+
+// Get attendance by location (for reporting/analytics)
+exports.getAttendanceByLocation = async (req, res) => {
+  try {
+    const { date, latitude, longitude, radius = 1000 } = req.query; // radius in meters
+    
+    const targetDate = date ? new Date(date).toISOString().split('T')[0] : new Date().toISOString().split('T')[0];
+
+    // Get all attendance for the date
+    const [attendance] = await db.query(`
+      SELECT 
+        a.id,
+        a.employee_id,
+        a.status,
+        a.check_in,
+        a.check_out,
+        a.location_data,
+        e.name as employee_name,
+        e.department
+      FROM attendance a
+      JOIN employees e ON a.employee_id = e.id
+      WHERE DATE(a.date) = ?
+        AND a.location_data IS NOT NULL
+    `, [targetDate]);
+
+    // Filter by proximity if coordinates provided
+    let filteredAttendance = attendance;
+    if (latitude && longitude) {
+      filteredAttendance = attendance.filter(record => {
+        try {
+          const location = JSON.parse(record.location_data);
+          if (location.latitude && location.longitude) {
+            const distance = calculateDistance(
+              parseFloat(latitude),
+              parseFloat(longitude),
+              parseFloat(location.latitude),
+              parseFloat(location.longitude)
+            );
+            return distance <= (radius / 1000); // Convert to kilometers
+          }
+        } catch (e) {
+          return false;
+        }
+        return false;
+      });
+    }
+
+    // Parse location data
+    const attendanceWithLocation = filteredAttendance.map(record => {
+      if (record.location_data) {
+        try {
+          record.location_data = JSON.parse(record.location_data);
+        } catch (e) {
+          record.location_data = null;
+        }
+      }
+      return record;
+    });
+
+    res.json({
+      success: true,
+      data: attendanceWithLocation,
+      count: attendanceWithLocation.length
+    });
+  } catch (error) {
+    console.error('Error fetching attendance by location:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Server error while fetching attendance by location' 
+    });
+  }
+};
+
+// Helper function to calculate distance between two coordinates (Haversine formula)
+function calculateDistance(lat1, lon1, lat2, lon2) {
+  const R = 6371; // Earth's radius in kilometers
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a = 
+    Math.sin(dLat/2) * Math.sin(dLat/2) +
+    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * 
+    Math.sin(dLon/2) * Math.sin(dLon/2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  const distance = R * c; // Distance in kilometers
+  return distance;
+}
 
 // Backend routes for attendance settings
 exports.getAttendanceSettings = async (req, res) => {
@@ -495,47 +936,47 @@ exports.getEmployeePayroll = async (req, res) => {
 
 };
 
-exports.updateAttendance = async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { status, checkIn, checkOut, overtimeHours, remarks, date } = req.body;
+// exports.updateAttendance = async (req, res) => {
+//   try {
+//     const { id } = req.params;
+//     const { status, checkIn, checkOut, overtimeHours, remarks, date } = req.body;
 
-    console.log('Updating attendance:', { id, status, checkIn, checkOut, overtimeHours, remarks });
+//     console.log('Updating attendance:', { id, status, checkIn, checkOut, overtimeHours, remarks });
 
-    // Check if attendance record exists
-    const [existing] = await db.query(
-      "SELECT id FROM attendance WHERE id = ?",
-      [id]
-    );
+//     // Check if attendance record exists
+//     const [existing] = await db.query(
+//       "SELECT id FROM attendance WHERE id = ?",
+//       [id]
+//     );
 
-    if (existing.length === 0) {
-      return res.status(404).json({ success: false, message: 'Attendance record not found' });
-    }
+//     if (existing.length === 0) {
+//       return res.status(404).json({ success: false, message: 'Attendance record not found' });
+//     }
 
-    // Build update object with only provided fields
-    const updateFields = {
-      updated_at: new Date()
-    };
+//     // Build update object with only provided fields
+//     const updateFields = {
+//       updated_at: new Date()
+//     };
 
-    if (status) updateFields.status = status;
-    if (checkIn) updateFields.check_in = checkIn;
-    if (checkOut) updateFields.check_out = checkOut;
-    if (overtimeHours) updateFields.overtime_hours = overtimeHours;
-    if (remarks) updateFields.remarks = remarks;
+//     if (status) updateFields.status = status;
+//     if (checkIn) updateFields.check_in = checkIn;
+//     if (checkOut) updateFields.check_out = checkOut;
+//     if (overtimeHours) updateFields.overtime_hours = overtimeHours;
+//     if (remarks) updateFields.remarks = remarks;
 
-    await db.query(
-      `UPDATE attendance 
-       SET ?
-       WHERE id = ?`,
-      [updateFields, id]
-    );
+//     await db.query(
+//       `UPDATE attendance 
+//        SET ?
+//        WHERE id = ?`,
+//       [updateFields, id]
+//     );
 
-    res.json({ success: true, message: 'Attendance updated successfully' });
-  } catch (error) {
-    console.error('Error updating attendance:', error);
-    res.status(500).json({ success: false, message: 'Server error' });
-  }
-};
+//     res.json({ success: true, message: 'Attendance updated successfully' });
+//   } catch (error) {
+//     console.error('Error updating attendance:', error);
+//     res.status(500).json({ success: false, message: 'Server error' });
+//   }
+// };
 
 // Delete attendance record
 exports.deleteAttendance = async (req, res) => {
@@ -563,133 +1004,133 @@ exports.deleteAttendance = async (req, res) => {
   }
 };
 
-exports.todayAttendance = async (req, res) => {
-  try {
-    const { date } = req.query;
-    const targetDate = date ? new Date(date).toISOString().split('T')[0] : new Date().toISOString().split('T')[0];
+// exports.todayAttendance = async (req, res) => {
+//   try {
+//     const { date } = req.query;
+//     const targetDate = date ? new Date(date).toISOString().split('T')[0] : new Date().toISOString().split('T')[0];
 
-    console.log('Fetching today attendance for date:', targetDate);
+//     console.log('Fetching today attendance for date:', targetDate);
 
-    const [attendance] = await db.query(`
-      SELECT 
-        a.id as attendance_id,
-        a.employee_id,
-        a.status,
-        a.check_in,
-        a.check_out,
-        a.overtime_hours,
-        a.remarks,
-        a.date as attendance_date,
-        e.id as employee_id,
-        e.employeeName as employee_name,
-        e.department,
-        e.position,
-        e.phone,
-        e.balance,
-        e.last_month_due
-      FROM attendance a
-      JOIN employees e ON a.employee_id = e.id
-      WHERE DATE(a.date) = ?
-      ORDER BY e.employeeName
-    `, [targetDate]);
+//     const [attendance] = await db.query(`
+//       SELECT 
+//         a.id as attendance_id,
+//         a.employee_id,
+//         a.status,
+//         a.check_in,
+//         a.check_out,
+//         a.overtime_hours,
+//         a.remarks,
+//         a.date as attendance_date,
+//         e.id as employee_id,
+//         e.employeeName as employee_name,
+//         e.department,
+//         e.position,
+//         e.phone,
+//         e.balance,
+//         e.last_month_due
+//       FROM attendance a
+//       JOIN employees e ON a.employee_id = e.id
+//       WHERE DATE(a.date) = ?
+//       ORDER BY e.employeeName
+//     `, [targetDate]);
 
-    console.log(`Found ${attendance.length} attendance records for ${targetDate}`);
+//     console.log(`Found ${attendance.length} attendance records for ${targetDate}`);
 
-    res.json({ 
-      success: true, 
-      data: attendance,
-      count: attendance.length,
-      date: targetDate
-    });
-  } catch (error) {
-    console.error('Error fetching today attendance:', error);
-    res.status(500).json({ 
-      success: false, 
-      message: 'Error fetching today attendance',
-      error: error.message 
-    });
-  }
-};
+//     res.json({ 
+//       success: true, 
+//       data: attendance,
+//       count: attendance.length,
+//       date: targetDate
+//     });
+//   } catch (error) {
+//     console.error('Error fetching today attendance:', error);
+//     res.status(500).json({ 
+//       success: false, 
+//       message: 'Error fetching today attendance',
+//       error: error.message 
+//     });
+//   }
+// };
 
-exports.markAttendance = async (req, res) => {
-  try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
-    }
+// exports.markAttendance = async (req, res) => {
+//   try {
+//     const errors = validationResult(req);
+//     if (!errors.isEmpty()) {
+//       return res.status(400).json({ errors: errors.array() });
+//     }
 
-    const { employeeId, status, date, checkIn, checkOut, remarks = '' } = req.body;
+//     const { employeeId, status, date, checkIn, checkOut, remarks = '' } = req.body;
     
-    const targetDate = date ? new Date(date).toISOString().split('T')[0] : new Date().toISOString().split('T')[0];
+//     const targetDate = date ? new Date(date).toISOString().split('T')[0] : new Date().toISOString().split('T')[0];
 
-    console.log('Marking attendance for:', { employeeId, status, targetDate, checkIn, checkOut });
+//     console.log('Marking attendance for:', { employeeId, status, targetDate, checkIn, checkOut });
 
-    // Check if attendance already exists
-    const [existing] = await db.query(
-      "SELECT id, check_in, check_out FROM attendance WHERE employee_id = ? AND DATE(date) = ?",
-      [employeeId, targetDate]
-    );
+//     // Check if attendance already exists
+//     const [existing] = await db.query(
+//       "SELECT id, check_in, check_out FROM attendance WHERE employee_id = ? AND DATE(date) = ?",
+//       [employeeId, targetDate]
+//     );
 
-    let updateData = { status, remarks, updated_at: new Date() };
+//     let updateData = { status, remarks, updated_at: new Date() };
     
-    // Only update check_in if it's provided and not already set
-    if (checkIn && (!existing[0]?.check_in || existing[0]?.check_in === '00:00:00')) {
-      updateData.check_in = checkIn;
-    }
+//     // Only update check_in if it's provided and not already set
+//     if (checkIn && (!existing[0]?.check_in || existing[0]?.check_in === '00:00:00')) {
+//       updateData.check_in = checkIn;
+//     }
     
-    // Only update check_out if it's provided
-    if (checkOut) {
-      updateData.check_out = checkOut;
-    }
+//     // Only update check_out if it's provided
+//     if (checkOut) {
+//       updateData.check_out = checkOut;
+//     }
 
-    if (existing.length > 0) {
-      // Update existing attendance
-      await db.query(
-        `UPDATE attendance 
-         SET ? 
-         WHERE employee_id = ? AND DATE(date) = ?`,
-        [updateData, employeeId, targetDate]
-      );
+//     if (existing.length > 0) {
+//       // Update existing attendance
+//       await db.query(
+//         `UPDATE attendance 
+//          SET ? 
+//          WHERE employee_id = ? AND DATE(date) = ?`,
+//         [updateData, employeeId, targetDate]
+//       );
       
-      console.log('Updated existing attendance record');
-    } else {
-      // Create new attendance record
-      const newData = {
-        employee_id: employeeId,
-        date: targetDate,
-        status: status,
-        remarks: remarks,
-        created_at: new Date(),
-        updated_at: new Date()
-      };
+//       console.log('Updated existing attendance record');
+//     } else {
+//       // Create new attendance record
+//       const newData = {
+//         employee_id: employeeId,
+//         date: targetDate,
+//         status: status,
+//         remarks: remarks,
+//         created_at: new Date(),
+//         updated_at: new Date()
+//       };
       
-      if (checkIn) newData.check_in = checkIn;
-      if (checkOut) newData.check_out = checkOut;
+//       if (checkIn) newData.check_in = checkIn;
+//       if (checkOut) newData.check_out = checkOut;
       
-      await db.query(
-        `INSERT INTO attendance SET ?`,
-        [newData]
-      );
+//       await db.query(
+//         `INSERT INTO attendance SET ?`,
+//         [newData]
+//       );
       
-      console.log('Created new attendance record');
-    }
+//       console.log('Created new attendance record');
+//     }
 
-    // Update employee status in employees table
-    await db.query(
-      `UPDATE employees 
-       SET status = ?, updatedAt = NOW()
-       WHERE id = ?`,
-      [status, employeeId]
-    );
+//     // Update employee status in employees table
+//     await db.query(
+//       `UPDATE employees 
+//        SET status = ?, updatedAt = NOW()
+//        WHERE id = ?`,
+//       [status, employeeId]
+//     );
 
-    console.log('Updated employee status in employees table');
+//     console.log('Updated employee status in employees table');
 
-    res.json({ success: true, message: 'Attendance marked successfully' });
-  } catch (error) {
-    console.error('Error marking attendance:', error);
-    res.status(500).json({ success: false, message: 'Server error' });
-  }
-};
+//     res.json({ success: true, message: 'Attendance marked successfully' });
+//   } catch (error) {
+//     console.error('Error marking attendance:', error);
+//     res.status(500).json({ success: false, message: 'Server error' });
+//   }
+// };
 
 // Get attendance settings
 exports.getAttendanceSettings = async (req, res) => {

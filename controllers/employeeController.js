@@ -7,6 +7,7 @@ const multer = require('multer');
 const xlsx = require('xlsx');
 const csv = require('csv-parser');
 const stream = require('stream');
+const NotificationService = require('../services/notificationService');
 
 // Configure multer for file upload - FIXED VERSION
 const storage = multer.memoryStorage();
@@ -1191,6 +1192,188 @@ const completeInvitation = async (req, res) => {
   }
 };
 
+const checkAndSendReminderNotifications = async () => {
+  try {
+    console.log('🔔 Checking attendance settings for reminders...');
+    
+    // Get attendance settings
+    const [settings] = await db.query(
+      'SELECT * FROM attendance_settings ORDER BY created_at DESC LIMIT 1'
+    );
+    
+    if (settings.length === 0) {
+      console.log('No attendance settings found');
+      return {
+        success: false,
+        message: 'No attendance settings configured'
+      };
+    }
+    
+    const setting = settings[0];
+    const settingsData = setting.settings_data;
+    
+    console.log('📋 Attendance settings data:', settingsData);
+    
+    // Check if reminderTime exists in settings_data
+    if (!settingsData || !settingsData.reminderTime) {
+      console.log('No reminderTime configured in attendance settings');
+      return {
+        success: false,
+        message: 'No reminder time configured'
+      };
+    }
+    
+    const reminderTime = settingsData.reminderTime;
+    const currentTime = new Date();
+    const currentHours = currentTime.getHours();
+    const currentMinutes = currentTime.getMinutes();
+    
+    console.log(`⏰ Current time: ${currentHours}:${currentMinutes}, Reminder time: ${reminderTime}`);
+    
+    // Parse reminder time (assuming format like "09:00" or "9:00")
+    const [reminderHours, reminderMinutes] = reminderTime.split(':').map(Number);
+    
+    // Check if current time matches reminder time (within a 1-minute window)
+    const timeDifference = Math.abs(
+      (currentHours * 60 + currentMinutes) - (reminderHours * 60 + reminderMinutes)
+    );
+    
+    if (timeDifference > 1) {
+      console.log(`Current time doesn't match reminder time. Difference: ${timeDifference} minutes`);
+      return {
+        success: false,
+        message: 'Not yet time for reminder'
+      };
+    }
+    
+    console.log('✅ Time matched! Sending reminder notifications...');
+    
+    // Get today's date in YYYY-MM-DD format
+    const today = new Date().toISOString().split('T')[0];
+    
+    // Get all active staff users who haven't checked in today
+    const [users] = await db.query(`
+      SELECT DISTINCT u.id, u.name, u.email, u.employee_id, e.employeeName 
+      FROM users u 
+      LEFT JOIN employees e ON u.employee_id = e.id 
+      LEFT JOIN attendance a ON u.employee_id = a.employee_id AND a.date = ? 
+      WHERE u.role = 'staff' 
+      AND a.id IS NULL -- No attendance record for today
+    `, [today]);
+    
+    if (users.length === 0) {
+      console.log('No staff users found who haven\'t checked in today');
+      return {
+        success: false,
+        message: 'All staff members have already checked in today or no staff users found'
+      };
+    }
+    
+    console.log(`👥 Found ${users.length} staff users who haven't checked in today`);
+    
+    // Filter users who haven't received a reminder today
+    const usersToNotify = [];
+    const notificationPromises = [];
+    
+    for (const user of users) {
+      // Check if user already received a reminder today
+      const [existingNotifications] = await db.query(`
+        SELECT id FROM notifications 
+        WHERE user_id = ? 
+        AND type = 'attendance_reminder' 
+        AND DATE(created_at) = ? 
+        LIMIT 1
+      `, [user.id, today]);
+      
+      if (existingNotifications.length === 0) {
+        usersToNotify.push(user);
+        
+        // Create notification for this user
+        notificationPromises.push(
+          NotificationService.createNotification({
+            userIds: [user.id],
+            title: 'Attendance Reminder',
+            message: `⏰ Daily attendance reminder: Please mark your attendance for today.`,
+            type: 'attendance',
+            module: 'attendance',
+            moduleId: null
+          })
+        );
+      } else {
+        console.log(`ℹ️ User ${user.name} already received reminder today, skipping...`);
+      }
+    }
+    
+    if (usersToNotify.length === 0) {
+      console.log('All eligible users have already received reminders today');
+      return {
+        success: false,
+        message: 'All eligible staff members have already received reminders today'
+      };
+    }
+    
+    console.log(`📢 Sending reminders to ${usersToNotify.length} users...`);
+    
+    // Send all notifications
+    await Promise.all(notificationPromises);
+    
+    console.log('✅ Attendance reminder notifications sent successfully');
+    
+    return {
+      success: true,
+      message: `Reminder notifications sent to ${usersToNotify.length} staff members`,
+      usersNotified: usersToNotify.length,
+      reminderTime: reminderTime,
+      details: {
+        totalStaff: users.length,
+        notified: usersToNotify.length,
+        alreadyNotified: users.length - usersToNotify.length
+      }
+    };
+    
+  } catch (error) {
+    console.error('❌ Error in checkAndSendReminderNotifications:', error);
+    return {
+      success: false,
+      message: 'Failed to send reminder notifications',
+      error: error.message
+    };
+  }
+};
+
+const triggerReminderManually = async (req, res) => {
+  try {
+    const result = await checkAndSendReminderNotifications();
+    
+    if (result.success) {
+      res.json(result);
+    } else {
+      res.status(400).json(result);
+    }
+  } catch (error) {
+    console.error('Error triggering reminder manually:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to trigger reminder',
+      error: error.message
+    });
+  }
+};
+
+// Set up interval to run this function automatically
+const setupReminderInterval = () => {
+  // Check every minute (60000 milliseconds)
+  setInterval(async () => {
+    try {
+      await checkAndSendReminderNotifications();
+    } catch (error) {
+      console.error('Error in reminder interval:', error);
+    }
+  }, 60000); // 60 seconds
+  
+  console.log('⏰ Attendance reminder system started - checking every minute');
+};
+
 // Export all functions
 module.exports = {
   getAllEmployees,
@@ -1201,6 +1384,9 @@ module.exports = {
   sendStaffInvite,
   validateInvitation,
   completeInvitation,
+  checkAndSendReminderNotifications,
+  triggerReminderManually,
+  setupReminderInterval,
   importEmployees,
   upload
 };

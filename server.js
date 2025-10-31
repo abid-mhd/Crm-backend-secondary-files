@@ -4,8 +4,19 @@ const cors = require("cors");
 const bodyParser = require("body-parser");
 const db = require("./config/db");
 const path = require("path");
+const { setupReminderInterval } = require('./controllers/employeeController');
+
+setupReminderInterval();
 
 const app = express();
+
+const cron = require('node-cron');
+const { checkAndSendReminderNotifications } = require('./controllers/employeeController');
+
+cron.schedule('* * * * *', async () => {
+  console.log('🕒 Running attendance reminder check...');
+  await checkAndSendReminderNotifications();
+});
 
 /* -------------------- Middleware -------------------- */
 app.use(cors());
@@ -75,6 +86,7 @@ app.use("/api/auth", authRoutes);
 app.use('/api/leaves', leaveRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/staff', staffRoutes);
+
 
 /* -------------------- Settings Routes -------------------- */
 const profileRoutes = require("./routes/profileRoutes");
