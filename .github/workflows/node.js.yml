@@ -1,0 +1,34 @@
+name: Node.js CI
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+    strategy:
+      matrix:
+        node-version: [20.x]
+
+    steps:
+    - uses: actions/checkout@v4
+   
+    - name: Use Node.js ${{ matrix.node-version }}
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ matrix.node-version }}
+        cache: 'npm'
+   
+    - name: Install Fresh
+      run: |
+        cd /home/ubuntu/crm_backend/actions-runner/_work/Crm_updates_backend/Crm_updates_backend/
+        rm -rf node_modules
+        npm ci
+     
+    - name: Start PM2 as Root (Survives after deployment)
+      run: |
+        cd /home/ubuntu/crm_backend/actions-runner/_work/Crm_updates_backend/Crm_updates_backend/
+        sudo pm2 delete crm_backend || true
+        sudo pm2 start server.js --name "crm_backend"
+        sudo pm2 save 
