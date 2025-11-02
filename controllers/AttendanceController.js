@@ -573,6 +573,9 @@ exports.updateAttendance = async (req, res) => {
       [updateFields, id]
     );
 
+
+
+
     res.json({ 
       success: true, 
       message: 'Attendance updated successfully',
@@ -789,32 +792,94 @@ function calculateDistance(lat1, lon1, lat2, lon2) {
   return distance;
 }
 
-// Backend routes for attendance settings
 exports.getAttendanceSettings = async (req, res) => {
   try {
     const [settings] = await db.query(`
-      SELECT * FROM attendance_settings WHERE id = 1
+      SELECT * FROM attendance_settings 
+      ORDER BY created_at DESC, id DESC 
+      LIMIT 1
     `);
     
-    if (settings.length > 0) {
-      res.json(JSON.parse(settings[0].settings_data));
+    // Check if any settings exist
+    if (settings && settings.length > 0) {
+      try {
+        const latestSetting = settings[0];
+        
+        // Parse the settings_data if it's a JSON string
+        const settingsData = typeof latestSetting.settings_data === 'string' 
+          ? JSON.parse(latestSetting.settings_data)
+          : latestSetting.settings_data;
+        
+        res.json({
+          ...settingsData,
+          // Include metadata if needed
+          id: latestSetting.id,
+          created_at: latestSetting.created_at,
+          updated_at: latestSetting.updated_at
+        });
+      } catch (parseError) {
+        console.error('Error parsing settings data:', parseError);
+        // Return default settings if parsing fails
+        returnDefaultSettings(res);
+      }
     } else {
-      // Return default settings
-      const defaultSettings = {
-        enableDailyReminder: false,
-        reminderTime: '10:00',
-        markPresentByDefault: false,
-        workingHours: '08:00',
-        weeklyOff: {
-          sun: true, mon: false, tue: false, wed: false, 
-          thu: false, fri: false, sat: false
-        }
-      };
-      res.json(defaultSettings);
+      // Return default settings if no settings found
+      returnDefaultSettings(res);
     }
   } catch (error) {
     console.error('Error fetching attendance settings:', error);
-    res.status(500).json({ message: 'Server error' });
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+};
+
+// Helper function to return default settings
+function returnDefaultSettings(res) {
+  const defaultSettings = {
+    enableDailyReminder: false,
+    reminderTime: '08:55',
+    markPresentByDefault: false,
+    workingHours: '09:00',
+    weeklyOff: {
+      sun: true, 
+      mon: false, 
+      tue: false, 
+      wed: false, 
+      thu: false, 
+      fri: false, 
+      sat: false
+    }
+  };
+  res.json(defaultSettings);
+}
+
+exports.saveAttendanceSettings = async (req, res) => {
+  try {
+    const settings = req.body;
+    
+    // Check if settings already exist
+    const [existing] = await db.query(`
+      SELECT * FROM attendance_settings WHERE id = 1
+    `);
+    
+    if (existing && existing.length > 0) {
+      // Update existing settings
+      await db.query(`
+        UPDATE attendance_settings 
+        SET settings_data = ?, updated_at = NOW() 
+        WHERE id = 1
+      `, [JSON.stringify(settings)]);
+    } else {
+      // Insert new settings
+      await db.query(`
+        INSERT INTO attendance_settings (id, settings_data, created_at, updated_at)
+        VALUES (1, ?, NOW(), NOW())
+      `, [JSON.stringify(settings)]);
+    }
+    
+    res.json({ message: 'Settings saved successfully' });
+  } catch (error) {
+    console.error('Error saving attendance settings:', error);
+    res.status(500).json({ message: 'Server error', error: error.message });
   }
 };
 
@@ -1131,35 +1196,6 @@ exports.deleteAttendance = async (req, res) => {
 //     res.status(500).json({ success: false, message: 'Server error' });
 //   }
 // };
-
-// Get attendance settings
-exports.getAttendanceSettings = async (req, res) => {
-  try {
-    const [settings] = await db.query(`
-      SELECT * FROM attendance_settings WHERE id = 1
-    `);
-    
-    if (settings.length > 0) {
-      res.json(JSON.parse(settings[0].settings_data));
-    } else {
-      // Return default settings if none exist
-      const defaultSettings = {
-        enableDailyReminder: false,
-        reminderTime: '10:00',
-        markPresentByDefault: false,
-        workingHours: '08:00',
-        weeklyOff: {
-          sun: true, mon: false, tue: false, wed: false, 
-          thu: false, fri: false, sat: false
-        }
-      };
-      res.json(defaultSettings);
-    }
-  } catch (error) {
-    console.error('Error fetching attendance settings:', error);
-    res.status(500).json({ message: 'Server error' });
-  }
-};
 
 // Save attendance settings
 exports.saveAttendanceSettings = async (req, res) => {
