@@ -28,7 +28,7 @@ router.delete('/attendance/:id', attendanceController.deleteAttendance);
 router.get('/attendance/today',attendanceController.todayAttendance);
 
 // Attendance settings routes
-router.get('/attendance/settings', attendanceController.getAttendanceSettings);
+router.get('/settings', attendanceController.getAttendanceSettings);
 router.post('/attendance/settings', attendanceController.saveAttendanceSettings);
 
 router.get('/my-attendance', attendanceController.getMyAttendance);

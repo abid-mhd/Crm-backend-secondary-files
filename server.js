@@ -4,18 +4,46 @@ const cors = require("cors");
 const bodyParser = require("body-parser");
 const db = require("./config/db");
 const path = require("path");
-const { setupReminderInterval } = require('./controllers/employeeController');
-
-setupReminderInterval();
+const employeeController = require('./controllers/employeeController');
 
 const app = express();
 
 const cron = require('node-cron');
 const { checkAndSendReminderNotifications } = require('./controllers/employeeController');
 
+/* -------------------- Initialize Reminder System -------------------- */
+const initializeReminderSystem = async () => {
+  try {
+    console.log('🔄 Initializing reminder system...');
+    
+    // Start the Twilio reminder scheduler (check-in/check-out reminders)
+    employeeController.startReminderScheduler();
+    console.log('✅ Twilio reminder scheduler started');
+    
+    // Start the attendance notification interval
+    employeeController.setupReminderInterval();
+    console.log('✅ Attendance reminder interval started');
+    
+    // Test the reminder system status
+    // const status = await employeeController.getReminderStatus();
+    // console.log('📊 Reminder system status:', status);
+    
+  } catch (error) {
+    console.error('❌ Failed to initialize reminder system:', error);
+  }
+};
+
+// Initialize reminder system when server starts
+initializeReminderSystem();
+
+/* -------------------- Schedule Regular Attendance Reminder Checks -------------------- */
 cron.schedule('* * * * *', async () => {
   console.log('🕒 Running attendance reminder check...');
-  await checkAndSendReminderNotifications();
+  try {
+    await checkAndSendReminderNotifications();
+  } catch (error) {
+    console.error('❌ Error in attendance reminder check:', error);
+  }
 });
 
 /* -------------------- Middleware -------------------- */
@@ -63,8 +91,6 @@ const leaveRoutes = require('./routes/leaveRoutes');
 const notificationRoutes = require('./routes/notificationRoutes');
 const staffRoutes = require('./routes/staff');
 
-
-
 // app.use("/api/parties", partyRoutes);
 app.use("/api/employees", employeeRoutes);
 app.use("/api/billing", billingRoutes);
@@ -86,7 +112,7 @@ app.use("/api/auth", authRoutes);
 app.use('/api/leaves', leaveRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/staff', staffRoutes);
-
+app.use('/api/reminders', require('./routes/reminderRoutes'));
 
 /* -------------------- Settings Routes -------------------- */
 const profileRoutes = require("./routes/profileRoutes");
@@ -146,4 +172,10 @@ app.use((err, req, res, next) => {
 const PORT = process.env.PORT || 5001;
 app.listen(PORT, () => {
   console.log(`🚀 Icebergs CRM Backend running on http://localhost:${PORT}`);
+  console.log('⏰ Reminder System Features:');
+  console.log('   - Twilio SMS Notifications');
+  console.log('   - Check-in reminders (8:55 AM or from settings)');
+  console.log('   - Check-out reminders (5:55 PM)');
+  console.log('   - Panel notifications');
+  console.log('   - Manual trigger endpoints available');
 });

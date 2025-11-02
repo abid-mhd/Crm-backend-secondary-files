@@ -8,6 +8,8 @@ const xlsx = require('xlsx');
 const csv = require('csv-parser');
 const stream = require('stream');
 const NotificationService = require('../services/notificationService');
+const twilio = require('twilio');
+const cron = require('node-cron');
 
 // Configure multer for file upload - FIXED VERSION
 const storage = multer.memoryStorage();
@@ -53,6 +55,782 @@ const upload = multer({
     fileSize: 10 * 1024 * 1024 // 10MB limit
   }
 });
+
+// Initialize Twilio client
+const twilioClient = twilio(
+  process.env.TWILIO_ACCOUNT_SID,
+  process.env.TWILIO_AUTH_TOKEN
+);
+
+class ReminderScheduler {
+  constructor() {
+    this.isRunning = false;
+    this.checkinReminderTime = '8:55'; // Default fallback
+    this.checkoutReminderTime = '17:55'; // Default fallback (5:55 PM in 24h format)
+  }
+
+  // Get attendance settings from database
+  async getAttendanceSettings() {
+    try {
+      const [settings] = await db.query(`
+        SELECT * FROM attendance_settings WHERE id = 1
+      `);
+      
+      if (settings.length > 0) {
+        const settingsData = typeof settings[0].settings_data === 'string' 
+          ? JSON.parse(settings[0].settings_data) 
+          : settings[0].settings_data;
+        
+        return settingsData;
+      }
+      
+      // Return default settings if none exist
+      return {
+        reminderTime: '8:55',
+        enableDailyReminder: false,
+        markPresentByDefault: false,
+        workingHours: '09:00',
+        weeklyOff: {
+          sun: true, mon: false, tue: false, wed: false, 
+          thu: false, fri: false, sat: false
+        }
+      };
+    } catch (error) {
+      console.error('Error fetching attendance settings:', error);
+      return {
+        reminderTime: '8:55',
+        enableDailyReminder: false
+      };
+    }
+  }
+
+  // Parse time string to cron format
+  parseTimeToCron(timeString) {
+    try {
+      // Handle different time formats: "8:55", "08:55", "8:55 AM", "08:55 AM"
+      let time = timeString.trim().toUpperCase();
+      
+      // Remove AM/PM and any spaces
+      time = time.replace(/\s*(AM|PM)/, '');
+      
+      const [hours, minutes] = time.split(':').map(part => part.trim());
+      
+      let hoursNum = parseInt(hours);
+      const minutesNum = parseInt(minutes);
+      
+      // If time string had PM and it's not 12, add 12 hours
+      if (timeString.toUpperCase().includes('PM') && hoursNum !== 12) {
+        hoursNum += 12;
+      }
+      
+      // If time string had AM and it's 12, set to 0
+      if (timeString.toUpperCase().includes('AM') && hoursNum === 12) {
+        hoursNum = 0;
+      }
+      
+      // Validate hours and minutes
+      if (isNaN(hoursNum) || isNaN(minutesNum) || hoursNum < 0 || hoursNum > 23 || minutesNum < 0 || minutesNum > 59) {
+        console.warn(`Invalid time format: ${timeString}. Using default.`);
+        return { minutes: 55, hours: 8 }; // Default to 8:55 AM
+      }
+      
+      return { minutes: minutesNum, hours: hoursNum };
+    } catch (error) {
+      console.error('Error parsing time:', error);
+      return { minutes: 55, hours: 8 }; // Default to 8:55 AM
+    }
+  }
+
+  // Update reminder times from settings
+  async updateReminderTimes() {
+    try {
+      const settings = await this.getAttendanceSettings();
+      
+      // Update check-in reminder time from settings
+      if (settings.reminderTime && settings.reminderTime.trim() !== '') {
+        this.checkinReminderTime = settings.reminderTime;
+        console.log(`✅ Check-in reminder time set from settings: ${this.checkinReminderTime}`);
+      } else {
+        console.log('ℹ️ No reminder time in settings or empty value, using default: 8:55 AM');
+        this.checkinReminderTime = '8:55';
+      }
+      
+      // Check-out reminder remains fixed at 5:55 PM
+      this.checkoutReminderTime = '17:55';
+      
+      return {
+        checkinReminderTime: this.checkinReminderTime,
+        checkoutReminderTime: '5:55 PM'
+      };
+      
+    } catch (error) {
+      console.error('Error updating reminder times:', error);
+      // Keep default values on error
+      this.checkinReminderTime = '8:55';
+      this.checkoutReminderTime = '17:55';
+      return {
+        checkinReminderTime: this.checkinReminderTime,
+        checkoutReminderTime: '5:55 PM'
+      };
+    }
+  }
+
+  // Send email reminder
+  async sendEmailReminder(employee, reminderType, customMessage = null) {
+    try {
+      const { employeeName, email, position, department, employeeNo } = employee;
+      
+      if (!email || email.trim() === '') {
+        console.log(`No email address for ${employeeName}, skipping email`);
+        return false;
+      }
+
+      let subject = '';
+      let title = '';
+      let action = '';
+      let time = '';
+
+      if (reminderType === 'checkin') {
+        subject = 'Check-in Reminder - Icebergs India';
+        title = 'Check-in Reminder';
+        action = 'check in';
+        time = '9:00 AM';
+      } else if (reminderType === 'checkout') {
+        subject = 'Check-out Reminder - Icebergs India';
+        title = 'Check-out Reminder';
+        action = 'check out';
+        time = '6:00 PM';
+      }
+
+      // Create staff portal link
+      const staffPortalLink = process.env.FRONTEND_URL || 'http://16.16.110.203';
+      const loginLink = `${staffPortalLink}/login`;
+
+      // Email HTML with professional styling
+      const emailHtml = `<!DOCTYPE html>
+      <html lang="en">
+      <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+        <title>${title}</title>
+      </head>
+      <body style="font-family: Arial, sans-serif; background: #f7f7fb; margin: 0; padding: 0;">
+        <div style="max-width: 600px; margin: 30px auto; background: #fff; border-radius: 10px; padding: 30px; box-shadow: 0 4px 12px rgba(0,0,0,0.1);">
+          
+          <!-- Logo Section -->
+          <div style="text-align: center; margin-bottom: 30px;">
+            <img src="https://icebergsindia.com/wp-content/uploads/2020/01/4a4f2132b7-IMG_3970-1-e1743063706285.png" 
+                 alt="Icebergs India Logo" 
+                 style="max-width: 250px; height: auto;" />
+          </div>
+
+          <!-- Title -->
+          <h2 style="color: #091D78; margin-bottom: 20px; text-align: center; font-size: 24px;">
+            ${title}
+          </h2>
+
+          <!-- Welcome Message -->
+          <p style="font-size: 15px; color: #555; line-height: 1.6; margin-bottom: 20px;">
+            Hi <strong>${employeeName}</strong>,
+          </p>
+          
+          <p style="font-size: 15px; color: #555; line-height: 1.6; margin-bottom: 25px;">
+            ${customMessage || `This is a friendly reminder to ${action} for work today. Please remember to ${action} by ${time}.`}
+          </p>
+
+          <!-- Reminder Details Box -->
+          <div style="background: #f8fafc; border: 2px solid #091D78; border-radius: 8px; padding: 20px; margin-bottom: 25px;">
+            <h3 style="font-size: 18px; font-weight: 600; color: #091D78; margin: 0 0 15px 0; text-align: center;">
+              Reminder Details
+            </h3>
+            
+            <table style="width: 100%; border-collapse: collapse;">
+              <tr>
+                <td style="padding: 10px 0; border-bottom: 1px solid #e2e8f0;">
+                  <strong style="color: #374151;">Employee Name:</strong>
+                </td>
+                <td style="padding: 10px 0; border-bottom: 1px solid #e2e8f0; text-align: right;">
+                  <span style="color: #111827;">${employeeName}</span>
+                </td>
+              </tr>
+              <tr>
+                <td style="padding: 10px 0; border-bottom: 1px solid #e2e8f0;">
+                  <strong style="color: #374151;">Employee ID:</strong>
+                </td>
+                <td style="padding: 10px 0; border-bottom: 1px solid #e2e8f0; text-align: right;">
+                  <span style="color: #111827;">${employeeNo}</span>
+                </td>
+              </tr>
+              <tr>
+                <td style="padding: 10px 0; border-bottom: 1px solid #e2e8f0;">
+                  <strong style="color: #374151;">Position:</strong>
+                </td>
+                <td style="padding: 10px 0; border-bottom: 1px solid #e2e8f0; text-align: right;">
+                  <span style="color: #111827;">${position}</span>
+                </td>
+              </tr>
+              <tr>
+                <td style="padding: 10px 0;">
+                  <strong style="color: #374151;">Reminder Type:</strong>
+                </td>
+                <td style="padding: 10px 0; text-align: right;">
+                  <span style="color: #111827; text-transform: capitalize;">${action}</span>
+                </td>
+              </tr>
+            </table>
+          </div>
+
+          <!-- Action Button -->
+          <div style="text-align: center; margin: 30px 0;">
+            <a href="${loginLink}" 
+               style="display: inline-block; background: #091D78; color: #fff; padding: 14px 40px; 
+                      border-radius: 6px; text-decoration: none; font-weight: bold; font-size: 16px;">
+              Go to Staff Portal
+            </a>
+          </div>
+
+          <!-- Important Note -->
+          <div style="background: #fff3cd; border: 1px solid #ffc107; border-radius: 6px; padding: 15px; margin-bottom: 20px;">
+            <p style="margin: 0; color: #856404; font-size: 14px; line-height: 1.5;">
+              <strong>⏰ Important:</strong> Please ensure you ${action} on time to maintain accurate attendance records.
+            </p>
+          </div>
+
+          <!-- Footer -->
+          <div style="border-top: 2px solid #e2e8f0; padding-top: 20px; margin-top: 30px;">
+            <p style="font-size: 14px; color: #555; line-height: 1.6; margin: 0;">
+              If you have already ${action}ed, please ignore this reminder.
+            </p>
+            <p style="font-size: 14px; color: #555; margin: 15px 0 0 0;">
+              <strong>Best regards,</strong><br/>
+              The Icebergs HR Team
+            </p>
+          </div>
+
+          <!-- Contact Info -->
+          <div style="text-align: center; margin-top: 20px; padding-top: 20px; border-top: 1px solid #e2e8f0;">
+            <p style="font-size: 12px; color: #888; margin: 5px 0;">
+              <a href="https://icebergsindia.com" style="color: #091D78; text-decoration: none;">www.icebergsindia.com</a>
+            </p>
+            <p style="font-size: 12px; color: #888; margin: 5px 0;">
+              ${process.env.EMAIL_USER || 'garan6104@gmail.com'}
+            </p>
+          </div>
+
+        </div>
+      </body>
+      </html>`;
+
+      // Plain text version
+      const textVersion = `
+${title}
+
+Hi ${employeeName},
+
+${customMessage || `This is a friendly reminder to ${action} for work today. Please remember to ${action} by ${time}.`}
+
+Reminder Details:
+----------------
+Employee Name: ${employeeName}
+Employee ID: ${employeeNo}
+Position: ${position}
+Reminder Type: ${action}
+
+Staff Portal: ${loginLink}
+
+⏰ Important: Please ensure you ${action} on time to maintain accurate attendance records.
+
+If you have already ${action}ed, please ignore this reminder.
+
+Best regards,
+The Icebergs HR Team
+
+www.icebergsindia.com
+${process.env.EMAIL_USER || 'garan6104@gmail.com'}
+      `;
+
+      // Create Gmail transporter directly
+      const transporter = nodemailer.createTransport({
+        service: "gmail",
+        auth: {
+          user: process.env.EMAIL_USER,
+          pass: process.env.EMAIL_PASS,
+        },
+      });
+
+      // Email options
+      const mailOptions = {
+        from: `"Icebergs India - HR Department" <${process.env.EMAIL_USER}>`,
+        to: email,
+        subject: subject,
+        html: emailHtml,
+        text: textVersion
+      };
+
+      // Send email
+      const info = await transporter.sendMail(mailOptions);
+
+      console.log(`✅ ${title} email sent successfully to ${email}`);
+      console.log('Message ID:', info.messageId);
+      
+      return true;
+
+    } catch (error) {
+      console.error(`❌ Error sending email reminder to ${employee.employeeName}:`, error);
+      
+      if (error.code === 'EAUTH') {
+        console.error('Email authentication failed. Please check your Gmail credentials in .env file');
+      } else if (error.code === 'ECONNECTION' || error.code === 'ETIMEDOUT') {
+        console.error('Cannot connect to Gmail server. Please check your internet connection.');
+      } else if (error.responseCode === 535) {
+        console.error('Invalid Gmail credentials. Please verify EMAIL_USER and EMAIL_PASS in .env');
+      }
+      
+      return false;
+    }
+  }
+
+  async sendReminder(employeeId, reminderType, customMessage = null) {
+    try {
+      // Get employee details with user ID and phone
+      const [employees] = await db.query(`
+        SELECT e.*, u.id as user_id 
+        FROM employees e 
+        LEFT JOIN users u ON e.id = u.employee_id 
+        WHERE e.id = ? AND e.active = 1
+      `, [employeeId]);
+
+      if (employees.length === 0) {
+        console.log('Employee not found:', employeeId);
+        return;
+      }
+
+      const employee = employees[0];
+      
+      let title = '';
+      let message = '';
+
+      if (reminderType === 'checkin') {
+        title = 'Check-in Reminder';
+        // Ensure message is never empty
+        message = customMessage || `Dear ${employee.employeeName}, please remember to check in for work. Check-in time is 10:00 AM.`;
+      } else if (reminderType === 'checkout') {
+        title = 'Check-out Reminder';
+        // Ensure message is never empty
+        message = customMessage || `Dear ${employee.employeeName}, please remember to check out. Check-out time is 6:00 PM.`;
+      }
+
+      // Validate message is not empty
+      if (!message || message.trim() === '') {
+        console.error('Error: Message cannot be empty for employee:', employeeId);
+        message = `Reminder: Please ${reminderType === 'checkin' ? 'check in' : 'check out'} for work today.`;
+      }
+
+      console.log(`📱 Preparing to send ${reminderType} reminder to ${employee.employeeName}:`, {
+        phone: employee.phone,
+        email: employee.email,
+        message: message
+      });
+
+      const results = {
+        panelNotification: false,
+        smsSent: false,
+        emailSent: false,
+        employeeName: employee.employeeName,
+        phone: employee.phone,
+        email: employee.email
+      };
+
+      // Send panel notification if user exists
+      if (employee.user_id) {
+        try {
+          await NotificationService.createNotification({
+            userIds: [employee.user_id],
+            title: title,
+            message: message,
+            type: 'attendance',
+            module: 'attendance'
+          });
+          console.log(`✅ Panel notification sent to user ${employee.user_id}`);
+          results.panelNotification = true;
+        } catch (notificationError) {
+          console.error('Error sending panel notification:', notificationError);
+        }
+      }
+
+      // Send SMS if phone number exists and is valid
+      if (employee.phone && employee.phone.trim() !== '') {
+        try {
+          // Clean phone number - remove any non-digit characters except +
+          const cleanPhone = employee.phone.replace(/[^\d+]/g, '');
+          
+          // Validate phone number format (basic validation)
+          if (cleanPhone.length >= 10) {
+            const smsResult = await this.sendSMS(cleanPhone, message);
+            if (smsResult) {
+              console.log(`✅ SMS sent successfully to ${employee.employeeName} (${cleanPhone})`);
+              results.smsSent = true;
+            } else {
+              console.log(`❌ SMS failed for ${employee.employeeName} (${cleanPhone})`);
+            }
+          } else {
+            console.log(`⚠️ Invalid phone number for ${employee.employeeName}: ${employee.phone}`);
+          }
+        } catch (smsError) {
+          console.error(`❌ SMS error for ${employee.employeeName}:`, smsError.message);
+        }
+      } else {
+        console.log(`ℹ️ No phone number available for ${employee.employeeName}`);
+      }
+
+      // Send email reminder
+      if (employee.email && employee.email.trim() !== '') {
+        try {
+          const emailSent = await this.sendEmailReminder(employee, reminderType, customMessage);
+          results.emailSent = emailSent;
+          if (emailSent) {
+            console.log(`✅ Email reminder sent successfully to ${employee.employeeName} (${employee.email})`);
+          } else {
+            console.log(`❌ Email failed for ${employee.employeeName} (${employee.email})`);
+          }
+        } catch (emailError) {
+          console.error(`❌ Email error for ${employee.employeeName}:`, emailError.message);
+        }
+      } else {
+        console.log(`ℹ️ No email address available for ${employee.employeeName}`);
+      }
+
+      console.log(`✅ Reminder processed for employee ${employeeId}: ${reminderType}`, results);
+      
+      return results;
+    } catch (error) {
+      console.error('Error sending reminder:', error);
+      throw error;
+    }
+  }
+
+  // Replace the existing sendSMS method in ReminderScheduler class with this:
+
+async sendSMS(to, message) {
+  try {
+    if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN) {
+      console.log('Twilio not configured, skipping SMS');
+      return null;
+    }
+
+    // Validate message is not empty
+    if (!message || message.trim() === '') {
+      console.error('Error: Cannot send empty SMS message');
+      return null;
+    }
+
+    // Validate phone number
+    if (!to || to.trim() === '') {
+      console.error('Error: Cannot send SMS to empty phone number');
+      return null;
+    }
+
+    // Use the same Twilio client configuration as your OTP code
+    const twilioClient = twilio(
+      process.env.TWILIO_ACCOUNT_SID,
+      process.env.TWILIO_AUTH_TOKEN,
+      {
+        timeout: 120000, // 2 minutes
+        region: "us1",
+        edge: "ashburn",
+      }
+    );
+
+    // Use the same phone sanitization as your OTP code
+    const sanitizePhone = (phone) => phone.replace(/\D/g, "");
+    const sanitizedPhone = sanitizePhone(to);
+    
+    // Format phone number exactly like your OTP code
+    const formattedPhone = `+91${sanitizedPhone}`;
+
+    console.log(`📤 Sending SMS to ${formattedPhone}:`, message.substring(0, 50) + '...');
+
+    // OPTION 1: Try using Messaging Service SID if you have one
+    // This bypasses the phone number issue for Indian numbers
+    let attempts = 0;
+    let success = false;
+    let result = null;
+
+    while (!success && attempts < 2) {
+      try {
+        const messageOptions = {
+          body: message,
+          to: formattedPhone
+        };
+
+        // Try using Messaging Service SID first (if available)
+        if (process.env.TWILIO_MESSAGING_SERVICE_SID) {
+          messageOptions.messagingServiceSid = process.env.TWILIO_MESSAGING_SERVICE_SID;
+        } else if (process.env.TWILIO_PHONE_NUMBER) {
+          // Fallback to phone number (may not work for India to India)
+          messageOptions.from = process.env.TWILIO_PHONE_NUMBER;
+        } else {
+          throw new Error('Neither TWILIO_MESSAGING_SERVICE_SID nor TWILIO_PHONE_NUMBER is configured');
+        }
+
+        result = await twilioClient.messages.create(messageOptions);
+        success = true;
+      } catch (err) {
+        attempts++;
+        console.error(`Twilio SMS attempt ${attempts} failed:`, err.message);
+        
+        // If error is due to India restrictions, log specific message
+        if (err.code === 21659) {
+          console.error('⚠️ Indian phone number restrictions detected. Consider:');
+          console.error('   1. Using a US/Canadian Twilio number');
+          console.error('   2. Setting up a Messaging Service');
+          console.error('   3. Using Twilio Verify Service instead');
+        }
+        
+        if (attempts >= 2) throw err;
+      }
+    }
+
+    console.log('✅ SMS sent successfully:', result.sid);
+    console.log('📊 SMS Status:', result.status);
+    
+    return result;
+  } catch (error) {
+    console.error('❌ Error sending SMS:', error.message);
+    console.error('📞 Phone number attempted:', to);
+    console.error('🔧 Error code:', error.code);
+    
+    // More specific error handling
+    if (error.code === 21659) {
+      console.error('❌ Country/Region mismatch - Indian numbers cannot send to Indian numbers via standard SMS');
+      console.error('💡 Solution: Use Twilio Verify Service or get a non-Indian Twilio number');
+    } else if (error.code === 21211) {
+      console.error('❌ Invalid phone number format');
+    } else if (error.code === 21408) {
+      console.error('❌ Permission denied - check Twilio permissions');
+    } else if (error.code === 21610) {
+      console.error('❌ Phone number not SMS capable');
+    } else if (error.code === 21614) {
+      console.error('❌ Phone number is not a valid mobile number');
+    }
+    
+    return null;
+  }
+}
+
+  // Get employees who haven't checked in
+  async getEmployeesWithoutCheckin() {
+    try {
+      const today = new Date().toISOString().split('T')[0];
+      const [employees] = await db.query(`
+        SELECT e.* 
+        FROM employees e
+        WHERE e.active = 1 
+        AND NOT EXISTS (
+          SELECT 1 FROM attendance a 
+          WHERE a.employee_id = e.id 
+          AND DATE(a.date) = ? 
+          AND a.check_in IS NOT NULL
+        )
+      `, [today]);
+
+      return employees;
+    } catch (error) {
+      console.error('Error fetching employees without checkin:', error);
+      return [];
+    }
+  }
+
+  // Get employees who haven't checked out
+  async getEmployeesWithoutCheckout() {
+    try {
+      const today = new Date().toISOString().split('T')[0];
+      const [employees] = await db.query(`
+        SELECT e.* 
+        FROM employees e
+        WHERE e.active = 1 
+        AND EXISTS (
+          SELECT 1 FROM attendance a 
+          WHERE a.employee_id = e.id 
+          AND DATE(a.date) = ? 
+          AND a.check_in IS NOT NULL
+          AND a.check_out IS NULL
+        )
+      `, [today]);
+
+      return employees;
+    } catch (error) {
+      console.error('Error fetching employees without checkout:', error);
+      return [];
+    }
+  }
+
+  // Send check-in reminders
+  async sendCheckinReminders() {
+    try {
+      console.log('Sending check-in reminders...');
+      
+      const employees = await this.getEmployeesWithoutCheckin();
+      console.log(`Found ${employees.length} employees without check-in`);
+
+      const results = [];
+      
+      for (const employee of employees) {
+        try {
+          const result = await this.sendReminder(
+            employee.id, 
+            'checkin',
+            `Dear ${employee.employeeName}, please remember to check in for work. Check-in time is 10:00 AM.`
+          );
+          results.push({
+            employeeId: employee.id,
+            employeeName: employee.employeeName,
+            ...result
+          });
+        } catch (error) {
+          console.error(`Failed to send check-in reminder to ${employee.employeeName}:`, error);
+          results.push({
+            employeeId: employee.id,
+            employeeName: employee.employeeName,
+            error: error.message
+          });
+        }
+      }
+
+      console.log('Check-in reminders completed:', results);
+      return results;
+    } catch (error) {
+      console.error('Error in sendCheckinReminders:', error);
+      throw error;
+    }
+  }
+
+  // Send check-out reminders
+  async sendCheckoutReminders() {
+    try {
+      console.log('Sending check-out reminders...');
+      
+      const employees = await this.getEmployeesWithoutCheckout();
+      console.log(`Found ${employees.length} employees without check-out`);
+
+      const results = [];
+      
+      for (const employee of employees) {
+        try {
+          const result = await this.sendReminder(
+            employee.id, 
+            'checkout',
+            `Dear ${employee.employeeName}, please remember to check out. Check-out time is 6:00 PM.`
+          );
+          results.push({
+            employeeId: employee.id,
+            employeeName: employee.employeeName,
+            ...result
+          });
+        } catch (error) {
+          console.error(`Failed to send check-out reminder to ${employee.employeeName}:`, error);
+          results.push({
+            employeeId: employee.id,
+            employeeName: employee.employeeName,
+            error: error.message
+          });
+        }
+      }
+
+      console.log('Check-out reminders completed:', results);
+      return results;
+    } catch (error) {
+      console.error('Error in sendCheckoutReminders:', error);
+      throw error;
+    }
+  }
+
+  // Get current scheduler status
+  getSchedulerStatus() {
+    const checkinTime = this.parseTimeToCron(this.checkinReminderTime);
+    const checkoutTime = this.parseTimeToCron(this.checkoutReminderTime);
+    
+    return {
+      isRunning: this.isRunning,
+      checkinReminderTime: this.checkinReminderTime,
+      checkoutReminderTime: '5:55 PM',
+      checkinCron: `${checkinTime.minutes} ${checkinTime.hours} * * *`,
+      checkoutCron: `${checkoutTime.minutes} ${checkoutTime.hours} * * *`,
+      checkinFormatted: `${checkinTime.hours}:${checkinTime.minutes.toString().padStart(2, '0')}`,
+      checkoutFormatted: `${checkoutTime.hours}:${checkoutTime.minutes.toString().padStart(2, '0')}`
+    };
+  }
+
+  // Start the scheduler
+  async start() {
+    if (this.isRunning) {
+      console.log('Scheduler is already running');
+      return this.getSchedulerStatus();
+    }
+
+    console.log('Starting reminder scheduler...');
+
+    // Update reminder times from settings
+    const timeSettings = await this.updateReminderTimes();
+
+    // Parse times for cron
+    const checkinTime = this.parseTimeToCron(this.checkinReminderTime);
+    const checkoutTime = this.parseTimeToCron(this.checkoutReminderTime);
+
+    console.log('📅 Scheduled times:', {
+      checkin: `${checkinTime.hours}:${checkinTime.minutes.toString().padStart(2, '0')} (from settings: ${timeSettings.checkinReminderTime})`,
+      checkout: `${checkoutTime.hours}:${checkoutTime.minutes.toString().padStart(2, '0')} (fixed)`
+    });
+
+    // Schedule check-in reminder
+    cron.schedule(`${checkinTime.minutes} ${checkinTime.hours} * * *`, async () => {
+      console.log(`⏰ Running check-in reminder job at ${checkinTime.hours}:${checkinTime.minutes.toString().padStart(2, '0')}`);
+      try {
+        await this.sendCheckinReminders();
+      } catch (error) {
+        console.error('Check-in reminder job failed:', error);
+      }
+    }, {
+      timezone: "Asia/Kolkata"
+    });
+
+    // Schedule check-out reminder
+    cron.schedule(`${checkoutTime.minutes} ${checkoutTime.hours} * * *`, async () => {
+      console.log(`⏰ Running check-out reminder job at ${checkoutTime.hours}:${checkoutTime.minutes.toString().padStart(2, '0')}`);
+      try {
+        await this.sendCheckoutReminders();
+      } catch (error) {
+        console.error('Check-out reminder job failed:', error);
+      }
+    }, {
+      timezone: "Asia/Kolkata"
+    });
+
+    this.isRunning = true;
+    
+    const status = this.getSchedulerStatus();
+    console.log('✅ Reminder scheduler started successfully:', status);
+    
+    return status;
+  }
+
+  // Restart scheduler (useful when settings change)
+  async restart() {
+    console.log('🔄 Restarting reminder scheduler...');
+    this.stop();
+    return await this.start();
+  }
+
+  // Stop the scheduler
+  stop() {
+    this.isRunning = false;
+    console.log('🛑 Reminder scheduler stopped');
+    return this.getSchedulerStatus();
+  }
+}
+
+// Create global reminder scheduler instance
+const reminderScheduler = new ReminderScheduler();
 
 // Import employees from Excel
 const importEmployees = async (req, res) => {
@@ -160,7 +938,7 @@ const importEmployees = async (req, res) => {
           employeeName: row['NAME'] || row['NAME'] || '',
           position: row['DESIGNATION'] || row['DESIGNATION'] || '',
           department: '', // Default empty, you can map this later
-          email: row['Employee Personal Email ID'] || row['OFFICE MAIL ID'] || '',
+          email:  row['OFFICE MAIL ID'] ||  row['Employee Personal Email ID']|| '',
           phone: row['Mobile NUMBER'] || row['Mobile NUMBER'] || '',
           status: row['STATUS'] || row['STATUS'] || 'Active',
           active: 1, // Default to active
@@ -290,7 +1068,6 @@ const importEmployees = async (req, res) => {
     });
   }
 };
-
 
 // Generate secure token
 const generateSecureToken = () => {
@@ -1055,8 +1832,8 @@ ${process.env.EMAIL_USER || 'garan6104@gmail.com'}
     });
   }
 };
+
 // Validate invitation
-// In employeeController.js - Fixed validateInvitation
 const validateInvitation = async (req, res) => {
   try {
     const { invitation } = req.query;
@@ -1163,7 +1940,6 @@ const validateInvitation = async (req, res) => {
     });
   }
 };
-
 
 // Complete invitation
 const completeInvitation = async (req, res) => {
@@ -1374,6 +2150,142 @@ const setupReminderInterval = () => {
   console.log('⏰ Attendance reminder system started - checking every minute');
 };
 
+// NEW REMINDER FUNCTIONS
+
+// Start reminder scheduler
+const startReminderScheduler = () => {
+  reminderScheduler.start();
+};
+
+// Manual check-in reminder
+const sendCheckinReminder = async (req, res) => {
+  try {
+    const { employeeId } = req.body;
+
+    if (employeeId) {
+      // Send to specific employee
+      const result = await reminderScheduler.sendReminder(
+        employeeId, 
+        'checkin'
+      );
+      res.json({
+        success: true,
+        message: 'Check-in reminder sent successfully',
+        data: result
+      });
+    } else {
+      // Send to all employees without check-in
+      const results = await reminderScheduler.sendCheckinReminders();
+      res.json({
+        success: true,
+        message: 'Check-in reminders sent successfully',
+        data: results
+      });
+    }
+  } catch (error) {
+    console.error('Error sending check-in reminder:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to send check-in reminder'
+    });
+  }
+};
+
+// Manual check-out reminder
+const sendCheckoutReminder = async (req, res) => {
+  try {
+    const { employeeId } = req.body;
+
+    if (employeeId) {
+      // Send to specific employee
+      const result = await reminderScheduler.sendReminder(
+        employeeId, 
+        'checkout'
+      );
+      res.json({
+        success: true,
+        message: 'Check-out reminder sent successfully',
+        data: result
+      });
+    } else {
+      // Send to all employees without check-out
+      const results = await reminderScheduler.sendCheckoutReminders();
+      res.json({
+        success: true,
+        message: 'Check-out reminders sent successfully',
+        data: results
+      });
+    }
+  } catch (error) {
+    console.error('Error sending check-out reminder:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to send check-out reminder'
+    });
+  }
+};
+
+// Test SMS
+const testSMS = async (req, res) => {
+  try {
+    const { phone, message } = req.body;
+    
+    const result = await reminderScheduler.sendSMS(phone, message || 'Test message from attendance system');
+    
+    res.json({
+      success: true,
+      message: 'SMS sent successfully',
+      data: result
+    });
+  } catch (error) {
+    console.error('Error sending test SMS:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to send test SMS'
+    });
+  }
+};
+
+// Get reminder status
+const getReminderStatusInternal = async () => {
+  try {
+    const today = new Date().toISOString().split('T')[0];
+    
+    // Get employees without check-in
+    const employeesWithoutCheckin = await reminderScheduler.getEmployeesWithoutCheckin();
+    
+    // Get employees without check-out
+    const employeesWithoutCheckout = await reminderScheduler.getEmployeesWithoutCheckout();
+    
+    // Get scheduler status with actual times
+    const schedulerStatus = reminderScheduler.getSchedulerStatus();
+    
+    return {
+      success: true,
+      data: {
+        schedulerRunning: reminderScheduler.isRunning,
+        date: today,
+        employeesWithoutCheckin: employeesWithoutCheckin.length,
+        employeesWithoutCheckout: employeesWithoutCheckout.length,
+        checkinReminderTime: schedulerStatus.checkinReminderTime,
+        checkoutReminderTime: schedulerStatus.checkoutReminderTime,
+        actualSchedule: {
+          checkin: schedulerStatus.checkinFormatted,
+          checkout: schedulerStatus.checkoutFormatted
+        },
+        totalActiveEmployees: employeesWithoutCheckin.length + employeesWithoutCheckout.length
+      }
+    };
+  } catch (error) {
+    console.error('Error getting reminder status:', error);
+    return {
+      success: false,
+      message: 'Failed to get reminder status',
+      error: error.message
+    };
+  }
+};
+
 // Export all functions
 module.exports = {
   getAllEmployees,
@@ -1388,5 +2300,11 @@ module.exports = {
   triggerReminderManually,
   setupReminderInterval,
   importEmployees,
-  upload
+  upload,
+  // New reminder functions
+  startReminderScheduler,
+  sendCheckinReminder,
+  sendCheckoutReminder,
+  testSMS,
+  // getReminderStatus
 };
