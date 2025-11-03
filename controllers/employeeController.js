@@ -66,7 +66,7 @@ class ReminderScheduler {
   constructor() {
     this.isRunning = false;
     this.checkinReminderTime = '8:55'; // Default fallback
-    this.checkoutReminderTime = '17:55'; // Default fallback (5:55 PM in 24h format)
+    this.checkoutReminderTime = '18:55'; // Default fallback (6:55 PM in 24h format)
   }
 
   // Get attendance settings from database
@@ -155,8 +155,8 @@ class ReminderScheduler {
         this.checkinReminderTime = '8:55';
       }
       
-      // Check-out reminder remains fixed at 5:55 PM
-      this.checkoutReminderTime = '17:55';
+      // Check-out reminder remains fixed at 6:55 PM
+      this.checkoutReminderTime = '18:55';
       
       return {
         checkinReminderTime: this.checkinReminderTime,
@@ -167,7 +167,7 @@ class ReminderScheduler {
       console.error('Error updating reminder times:', error);
       // Keep default values on error
       this.checkinReminderTime = '8:55';
-      this.checkoutReminderTime = '17:55';
+      this.checkoutReminderTime = '18:55';
       return {
         checkinReminderTime: this.checkinReminderTime,
         checkoutReminderTime: '5:55 PM'
