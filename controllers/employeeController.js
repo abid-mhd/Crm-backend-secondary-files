@@ -194,12 +194,12 @@ class ReminderScheduler {
         subject = 'Check-in Reminder - Icebergs India';
         title = 'Check-in Reminder';
         action = 'check in';
-        time = '9:00 AM';
+        time = '10:00 AM';
       } else if (reminderType === 'checkout') {
         subject = 'Check-out Reminder - Icebergs India';
         title = 'Check-out Reminder';
         action = 'check out';
-        time = '6:00 PM';
+        time = '7:00 PM';
       }
 
       // Create staff portal link
@@ -417,7 +417,7 @@ ${process.env.EMAIL_USER || 'garan6104@gmail.com'}
       } else if (reminderType === 'checkout') {
         title = 'Check-out Reminder';
         // Ensure message is never empty
-        message = customMessage || `Dear ${employee.employeeName}, please remember to check out. Check-out time is 6:00 PM.`;
+        message = customMessage || `Dear ${employee.employeeName}, please remember to check out. Check-out time is 7:00 PM.`;
       }
 
       // Validate message is not empty
@@ -720,7 +720,7 @@ async sendSMS(to, message) {
           const result = await this.sendReminder(
             employee.id, 
             'checkout',
-            `Dear ${employee.employeeName}, please remember to check out. Check-out time is 6:00 PM.`
+            `Dear ${employee.employeeName}, please remember to check out. Check-out time is 7:00 PM.`
           );
           results.push({
             employeeId: employee.id,
