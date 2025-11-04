@@ -41,6 +41,39 @@ const validatePhone = (phone) => {
   return phoneRegex.test(phone);
 };
 
+// Add this function to validate JSON before saving
+const validateAndStringify = (value) => {
+  if (typeof value === 'string') {
+    // If it's already a string, try to parse it to validate it's proper JSON
+    try {
+      JSON.parse(value);
+      return value; // It's valid JSON string
+    } catch (error) {
+      // If it's not valid JSON, treat it as a regular string and wrap it
+      return JSON.stringify(value);
+    }
+  } else {
+    // For non-string values, stringify them
+    try {
+      return JSON.stringify(value);
+    } catch (error) {
+      console.error('Error stringifying value:', value, error);
+      throw new Error('Invalid value for JSON storage');
+    }
+  }
+};
+
+// Safe JSON parsing function
+const safeJsonParse = (str, defaultValue = null) => {
+  if (!str || str === 'null' || str === 'undefined') return defaultValue;
+  try {
+    return JSON.parse(str);
+  } catch (error) {
+    console.error('JSON parse error:', error, 'for string:', str);
+    return defaultValue;
+  }
+};
+
 // Check email uniqueness
 const checkEmailUnique = async (req, res) => {
   try {
@@ -100,11 +133,9 @@ const getUserSettings = async (req, res) => {
         organizedSettings[setting.setting_type] = {};
       }
       
-      try {
-        organizedSettings[setting.setting_type][setting.setting_key] = JSON.parse(setting.setting_value);
-      } catch (parseError) {
-        organizedSettings[setting.setting_type][setting.setting_key] = setting.setting_value;
-      }
+      // Use safe JSON parsing with fallback to raw value
+      const parsedValue = safeJsonParse(setting.setting_value, setting.setting_value);
+      organizedSettings[setting.setting_type][setting.setting_key] = parsedValue;
     });
 
     res.json({
@@ -145,11 +176,9 @@ const getSettingsByType = async (req, res) => {
 
     const settingsData = {};
     settings.forEach(setting => {
-      try {
-        settingsData[setting.setting_key] = JSON.parse(setting.setting_value);
-      } catch (parseError) {
-        settingsData[setting.setting_key] = setting.setting_value;
-      }
+      // Use safe JSON parsing with fallback to raw value
+      const parsedValue = safeJsonParse(setting.setting_value, setting.setting_value);
+      settingsData[setting.setting_key] = parsedValue;
     });
 
     res.json({
@@ -172,7 +201,7 @@ const updateSettings = async (req, res) => {
     const userId = getUserId(req);
     const { type, key, value } = req.body;
 
-    console.log('Updating settings for user ID:', userId, type, key);
+    console.log('Updating settings for user ID:', userId, type, key, value);
 
     if (!type || !key || value === undefined) {
       return res.status(400).json({
@@ -225,7 +254,8 @@ const updateSettings = async (req, res) => {
       [userId, type, key]
     );
 
-    const stringValue = typeof value === 'string' ? value : JSON.stringify(value);
+    // Use the validation function to ensure proper JSON
+    const stringValue = validateAndStringify(value);
 
     if (existing.length > 0) {
       await db.execute(
@@ -247,6 +277,15 @@ const updateSettings = async (req, res) => {
     });
   } catch (err) {
     console.error("Error updating settings:", err);
+    
+    if (err.message.includes('Invalid value for JSON storage')) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid data format. Please check your input.",
+        error: err.message
+      });
+    }
+    
     res.status(500).json({ 
       success: false, 
       message: "Database error", 
@@ -261,7 +300,7 @@ const updateMultipleSettings = async (req, res) => {
     const userId = getUserId(req);
     const { settings } = req.body;
 
-    console.log('Updating multiple settings for user ID:', userId);
+    console.log('Updating multiple settings for user ID:', userId, settings);
 
     if (!settings || typeof settings !== 'object') {
       return res.status(400).json({
@@ -274,8 +313,16 @@ const updateMultipleSettings = async (req, res) => {
     
     for (const [type, typeSettings] of Object.entries(settings)) {
       for (const [key, value] of Object.entries(typeSettings)) {
-        const stringValue = typeof value === 'string' ? value : JSON.stringify(value);
-        updates.push({ type, key, value: stringValue });
+        try {
+          const stringValue = validateAndStringify(value);
+          updates.push({ type, key, value: stringValue });
+        } catch (error) {
+          console.error(`Invalid value for ${type}.${key}:`, value);
+          return res.status(400).json({
+            success: false,
+            message: `Invalid value for ${key}: ${error.message}`
+          });
+        }
       }
     }
 
@@ -317,6 +364,15 @@ const updateMultipleSettings = async (req, res) => {
     }
   } catch (err) {
     console.error("Error updating multiple settings:", err);
+    
+    if (err.message.includes('Invalid JSON') || err.message.includes('JSON')) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid data format. Please check your input.",
+        error: err.message
+      });
+    }
+    
     res.status(500).json({ 
       success: false, 
       message: "Database error", 
@@ -360,12 +416,7 @@ const uploadAvatar = async (req, res) => {
     let personalInfo = {};
 
     if (existingSettings.length > 0) {
-      try {
-        personalInfo = JSON.parse(existingSettings[0].setting_value);
-      } catch (parseError) {
-        console.error('Error parsing existing personal_info:', parseError);
-        personalInfo = {};
-      }
+      personalInfo = safeJsonParse(existingSettings[0].setting_value, {});
     }
 
     // Update personal_info with new avatar (store as base64)
@@ -375,17 +426,19 @@ const uploadAvatar = async (req, res) => {
       avatarMimeType: mimeType
     };
 
+    const stringifiedPersonalInfo = validateAndStringify(updatedPersonalInfo);
+
     if (existingSettings.length > 0) {
       await db.execute(
         `UPDATE settings SET setting_value = ?, updated_at = NOW() 
          WHERE user_id = ? AND setting_type = 'profile' AND setting_key = 'personal_info'`,
-        [JSON.stringify(updatedPersonalInfo), userId]
+        [stringifiedPersonalInfo, userId]
       );
     } else {
       await db.execute(
         `INSERT INTO settings (user_id, setting_type, setting_key, setting_value, created_at, updated_at) 
          VALUES (?, 'profile', 'personal_info', ?, NOW(), NOW())`,
-        [userId, JSON.stringify(updatedPersonalInfo)]
+        [userId, stringifiedPersonalInfo]
       );
     }
 
@@ -450,19 +503,15 @@ const getUserAvatar = async (req, res) => {
     );
 
     if (settings.length > 0) {
-      try {
-        const personalInfo = JSON.parse(settings[0].setting_value);
-        if (personalInfo.avatar) {
-          return res.json({
-            success: true,
-            data: {
-              avatarUrl: personalInfo.avatar,
-              isBase64: personalInfo.avatar.startsWith('data:image/')
-            }
-          });
-        }
-      } catch (parseError) {
-        console.error('Error parsing personal_info:', parseError);
+      const personalInfo = safeJsonParse(settings[0].setting_value, {});
+      if (personalInfo.avatar) {
+        return res.json({
+          success: true,
+          data: {
+            avatarUrl: personalInfo.avatar,
+            isBase64: personalInfo.avatar.startsWith('data:image/')
+          }
+        });
       }
     }
 
@@ -523,19 +572,17 @@ const deleteAvatar = async (req, res) => {
     );
 
     if (settings.length > 0) {
-      try {
-        const personalInfo = JSON.parse(settings[0].setting_value);
-        delete personalInfo.avatar;
-        delete personalInfo.avatarMimeType;
+      const personalInfo = safeJsonParse(settings[0].setting_value, {});
+      delete personalInfo.avatar;
+      delete personalInfo.avatarMimeType;
 
-        await db.execute(
-          `UPDATE settings SET setting_value = ?, updated_at = NOW() 
-           WHERE user_id = ? AND setting_type = 'profile' AND setting_key = 'personal_info'`,
-          [JSON.stringify(personalInfo), userId]
-        );
-      } catch (parseError) {
-        console.error('Error updating settings:', parseError);
-      }
+      const stringifiedPersonalInfo = validateAndStringify(personalInfo);
+
+      await db.execute(
+        `UPDATE settings SET setting_value = ?, updated_at = NOW() 
+         WHERE user_id = ? AND setting_type = 'profile' AND setting_key = 'personal_info'`,
+        [stringifiedPersonalInfo, userId]
+      );
     }
 
     res.json({
@@ -551,8 +598,6 @@ const deleteAvatar = async (req, res) => {
     });
   }
 };
-
-
 
 // Multer middleware for file upload
 const uploadMiddleware = upload.single('avatar');
@@ -684,7 +729,7 @@ const updateSecuritySettings = async (req, res) => {
       [userId]
     );
 
-    const stringValue = JSON.stringify(twoFactorAuth);
+    const stringValue = validateAndStringify(twoFactorAuth);
 
     if (existing.length > 0) {
       await db.execute(
@@ -730,11 +775,7 @@ const getSecuritySettings = async (req, res) => {
 
     const securitySettings = {};
     settings.forEach(setting => {
-      try {
-        securitySettings[setting.setting_key] = JSON.parse(setting.setting_value);
-      } catch (parseError) {
-        securitySettings[setting.setting_key] = setting.setting_value;
-      }
+      securitySettings[setting.setting_key] = safeJsonParse(setting.setting_value, setting.setting_value);
     });
 
     res.json({
@@ -898,6 +939,97 @@ const checknameUnique = async (req, res) => {
   }
 };
 
+// Clean up invalid settings data (utility function)
+const cleanupInvalidSettings = async (req, res) => {
+  try {
+    console.log('Cleaning up invalid settings data...');
+    
+    // Find settings with invalid JSON
+    const [invalidSettings] = await db.execute(
+      `SELECT id, user_id, setting_type, setting_key, setting_value 
+       FROM settings 
+       WHERE setting_value IS NOT NULL 
+       AND setting_value != ''`
+    );
+
+    let fixedCount = 0;
+    let deletedCount = 0;
+
+    for (const setting of invalidSettings) {
+      try {
+        // Try to parse the setting value
+        safeJsonParse(setting.setting_value);
+        // If it parses successfully, it's valid
+      } catch (parseError) {
+        console.log(`Found invalid JSON in setting ${setting.id}:`, setting.setting_value);
+        
+        // Try to fix common issues
+        let fixedValue = setting.setting_value;
+        
+        // Remove any invalid characters at the start
+        fixedValue = fixedValue.replace(/^[^{[]*/, '');
+        
+        // Ensure it starts with { or [
+        if (!fixedValue.startsWith('{') && !fixedValue.startsWith('[')) {
+          // If it's a simple string value, wrap it in quotes
+          if (fixedValue && !fixedValue.includes('"')) {
+            fixedValue = `"${fixedValue}"`;
+          } else {
+            // If we can't fix it, delete the setting
+            await db.execute('DELETE FROM settings WHERE id = ?', [setting.id]);
+            console.log(`Deleted invalid setting ${setting.id}`);
+            deletedCount++;
+            continue;
+          }
+        }
+
+        try {
+          // Try to parse the fixed value
+          safeJsonParse(fixedValue);
+          
+          // Update with fixed value
+          await db.execute(
+            'UPDATE settings SET setting_value = ? WHERE id = ?',
+            [fixedValue, setting.id]
+          );
+          fixedCount++;
+          console.log(`Fixed setting ${setting.id}`);
+        } catch (secondError) {
+          // If still invalid, delete it
+          await db.execute('DELETE FROM settings WHERE id = ?', [setting.id]);
+          deletedCount++;
+          console.log(`Deleted invalid setting ${setting.id} after failed fix attempt`);
+        }
+      }
+    }
+
+    const result = {
+      success: true,
+      message: `Cleanup completed: ${fixedCount} settings fixed, ${deletedCount} settings deleted`,
+      fixedCount,
+      deletedCount
+    };
+
+    if (req && res) {
+      res.json(result);
+    } else {
+      return result;
+    }
+    
+  } catch (error) {
+    console.error('Error during cleanup:', error);
+    if (req && res) {
+      res.status(500).json({
+        success: false,
+        message: "Cleanup failed",
+        error: error.message
+      });
+    } else {
+      throw error;
+    }
+  }
+};
+
 // Export all functions
 module.exports = {
   checkEmailUnique,
@@ -915,5 +1047,8 @@ module.exports = {
   getSecuritySettings,
   getUserProfile,
   updateUserProfile,
-  checknameUnique
+  checknameUnique,
+  cleanupInvalidSettings,
+  validateAndStringify,
+  safeJsonParse
 };

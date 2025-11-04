@@ -33,9 +33,9 @@ exports.createItem = async (req, res) => {
     } = req.body;
 
     // Validation
-    if (!name  || !code || !measuringUnit || !hsnCode || !asOfDate) {
+    if (!name  || !code || !measuringUnit || !asOfDate) {
       return res.status(400).json({ 
-        message: "Required fields: name, code, measuringUnit, hsnCode, asOfDate" 
+        message: "Required fields: name, code, measuringUnit, asOfDate" 
       });
     }
 
@@ -118,9 +118,9 @@ exports.updateItem = async (req, res) => {
     } = req.body;
 
     // Validation
-    if (!name || !sellingPrice || !code || !measuringUnit || !hsnCode || !asOfDate) {
+    if (!name || !sellingPrice || !code || !measuringUnit || !asOfDate) {
       return res.status(400).json({ 
-        message: "Required fields: name, sellingPrice, code, measuringUnit, hsnCode, asOfDate" 
+        message: "Required fields: name, sellingPrice, code, measuringUnit, asOfDate" 
       });
     }
 
@@ -141,7 +141,7 @@ exports.updateItem = async (req, res) => {
         measuringUnit,
         parseInt(stock) || 0,
         code,
-        hsnCode,
+        hsnCode || '',
         asOfDate,
         description,
         req.params.id
