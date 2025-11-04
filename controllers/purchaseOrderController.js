@@ -41,7 +41,7 @@ function calculateItemAmounts(item, taxType = 'sgst_cgst') {
     taxAmount = igstAmount;
   }
 
-  const totalAmount = taxableAmount ;
+  const totalAmount = taxableAmount;
 
   return {
     baseAmount,
@@ -268,8 +268,11 @@ exports.create = async (req, res) => {
 
     console.log("Tax totals - totalTax:", totalTax, "sgstTotal:", sgstTotal, "cgstTotal:", cgstTotal, "igstTotal:", igstTotal);
     
-    const total = taxable + tcs + totalTax + sgstTotal + cgstTotal + igstTotal;
-    console.log("Final total:", total);
+    // Apply rounding if enabled
+    const calculatedTotal = taxable + tcs + totalTax + sgstTotal + cgstTotal + igstTotal;
+    const finalTotal = payload.roundingApplied ? Math.round(calculatedTotal) : calculatedTotal;
+    
+    console.log("Final total:", finalTotal, "Rounding applied:", payload.roundingApplied);
 
     // Create meta object for purchase order specific fields with tax type
     const meta = {
@@ -299,6 +302,12 @@ exports.create = async (req, res) => {
       cgstTotal: cgstTotal,
       igstTotal: igstTotal,
       totalTax: totalTax,
+      
+      // Rounding information
+      roundingApplied: payload.roundingApplied || false,
+      originalTotal: payload.originalTotal || calculatedTotal,
+      roundedTotal: payload.roundedTotal || finalTotal,
+      roundingDifference: payload.roundingDifference || (payload.roundingApplied ? (finalTotal - calculatedTotal) : 0),
       
       // Payment information
       amountReceived: payload.amountReceived || 0,
@@ -338,7 +347,7 @@ exports.create = async (req, res) => {
         subtotal,
         totalTax,
         payload.totalDiscountAmount || discountValue,
-        payload.total,
+        payload.total ?? calculatedTotal, // Use the final rounded total here
         JSON.stringify(payload.notes || []),
         payload.signature || null,
         'purchase_order',
@@ -406,7 +415,9 @@ exports.create = async (req, res) => {
       message: "Purchase order created", 
       id: orderId,
       orderNumber: payload.invoiceNumber,
-      taxType: taxType
+      taxType: taxType,
+      total: payload.total ?? calculatedTotal,
+      roundingApplied: payload.roundingApplied || false
     });
   } catch (err) {
     await conn.rollback();
@@ -483,7 +494,9 @@ exports.update = async (req, res) => {
       igstTotal += amounts.igstAmount;
     });
     
-    const total = taxable + tcs + totalTax + sgstTotal + cgstTotal + igstTotal;
+    // Apply rounding if enabled
+    const calculatedTotal = taxable + tcs + totalTax + sgstTotal + cgstTotal + igstTotal;
+    const finalTotal = payload.roundingApplied ? Math.round(calculatedTotal) : calculatedTotal;
 
     // Create meta object for purchase order with tax type
     const meta = {
@@ -502,6 +515,13 @@ exports.update = async (req, res) => {
       cgstTotal: cgstTotal,
       igstTotal: igstTotal,
       totalTax: totalTax,
+      
+      // Rounding information
+      roundingApplied: payload.roundingApplied || false,
+      originalTotal: payload.originalTotal || calculatedTotal,
+      roundedTotal: payload.roundedTotal || finalTotal,
+      roundingDifference: payload.roundingDifference || (payload.roundingApplied ? (finalTotal - calculatedTotal) : 0),
+      
       amountReceived: payload.amountReceived || 0,
       paymentMode: payload.paymentMode || "Cash",
       paymentTerms: payload.paymentTerms || "",
@@ -544,7 +564,7 @@ exports.update = async (req, res) => {
         subtotal,
         totalTax,
         payload.totalDiscountAmount || discountValue,
-        payload.total,
+        payload.total ?? calculatedTotal, // Use the final rounded total here
         JSON.stringify(payload.notes || []),
         payload.signature || null,
         JSON.stringify(meta),
@@ -597,7 +617,9 @@ exports.update = async (req, res) => {
       message: "Purchase order updated successfully",
       id: req.params.id,
       orderNumber: payload.invoiceNumber,
-      taxType: taxType
+      taxType: taxType,
+      total: payload.total ??calculatedTotal,
+      roundingApplied: payload.roundingApplied || false
     });
   } catch (err) {
     await conn.rollback();

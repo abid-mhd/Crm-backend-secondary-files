@@ -107,7 +107,10 @@ exports.createParty = async (req, res) => {
       return String(val);
     };
 
-    // Set default balanceType if not provided
+    // Preserve address formatting exactly as entered
+    const formattedBillingAddress = safeString(billingAddress);
+    const formattedShippingAddress = safeString(shippingAddress);
+
     const defaultBalanceType = balanceType || null;
 
     const [result] = await db.execute(
@@ -121,13 +124,13 @@ exports.createParty = async (req, res) => {
         safeString(mobile),
         safeString(email),
         safeNumber(balance, 0),
-        defaultBalanceType, // Use default if not provided
+        defaultBalanceType,
         safeString(gstin),
         safeString(pan),
         safeString(partyType),
         safeString(category),
-        safeString(billingAddress),
-        safeString(shippingAddress),
+        formattedBillingAddress,  // Preserve original format
+        formattedShippingAddress, // Preserve original format
         safeNumber(creditPeriodValue, 0),
         safeString(creditPeriodUnit),
         safeNumber(creditLimit, 0),
@@ -187,7 +190,10 @@ exports.updateParty = async (req, res) => {
       return String(val);
     };
 
-    // Use existing balanceType if not provided in update
+    // Preserve address formatting exactly as entered
+    const formattedBillingAddress = safeString(billingAddress);
+    const formattedShippingAddress = safeString(shippingAddress);
+
     const finalBalanceType = balanceType || rows[0].balanceType;
 
     await db.execute(
@@ -207,8 +213,8 @@ exports.updateParty = async (req, res) => {
         safeString(pan),
         safeString(partyType),
         safeString(category),
-        safeString(billingAddress),
-        safeString(shippingAddress),
+        formattedBillingAddress,  // Preserve original format
+        formattedShippingAddress, // Preserve original format
         safeNumber(creditPeriodValue, 0),
         safeString(creditPeriodUnit),
         safeNumber(creditLimit, 0),
