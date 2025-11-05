@@ -1425,3 +1425,93 @@ exports.getMyAttendanceStats = async (req, res) => {
     });
   }
 };
+
+exports.getAttendanceByPeriod = async (req, res) => {
+  try {
+    const { period, startDate, endDate } = req.query;
+
+    if (!startDate || !endDate) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Start date and end date are required' 
+      });
+    }
+
+    console.log('Fetching attendance for period:', { period, startDate, endDate });
+
+    // Get attendance records for the date range
+    const [attendance] = await db.query(`
+      SELECT 
+        a.id as attendance_id,
+        a.employee_id,
+        a.status,
+        a.check_in,
+        a.check_out,
+        a.overtime_hours,
+        a.remarks,
+        a.location_data as locationData,
+        a.date as attendance_date,
+        e.id as employee_id,
+        e.employeeName as employee_name,
+        e.department,
+        e.position,
+        e.phone,
+        e.balance,
+        e.last_month_due
+      FROM attendance a
+      JOIN employees e ON a.employee_id = e.id
+      WHERE a.date BETWEEN ? AND ?
+      ORDER BY a.date DESC, e.employeeName
+    `, [startDate, endDate]);
+
+    // Calculate summary statistics
+    const [summary] = await db.query(`
+      SELECT 
+        COUNT(CASE WHEN status = 'Present' THEN 1 END) as present,
+        COUNT(CASE WHEN status = 'Absent' THEN 1 END) as absent,
+        COUNT(CASE WHEN status = 'Half Day' THEN 1 END) as halfDay,
+        COUNT(CASE WHEN status = 'Paid Leave' THEN 1 END) as paidLeave,
+        COUNT(CASE WHEN status = 'Weekly Off' THEN 1 END) as weeklyOff,
+        COUNT(*) as total
+      FROM attendance 
+      WHERE date BETWEEN ? AND ?
+    `, [startDate, endDate]);
+
+    // Parse location data
+    const attendanceWithLocation = attendance.map(record => {
+      if (record.locationData) {
+        try {
+          record.locationData = JSON.parse(record.locationData);
+        } catch (e) {
+          record.locationData = null;
+        }
+      }
+      return record;
+    });
+
+    res.json({
+      success: true,
+      data: attendanceWithLocation,
+      summary: {
+        present: summary[0]?.present || 0,
+        absent: summary[0]?.absent || 0,
+        halfDay: summary[0]?.halfDay || 0,
+        paidLeave: summary[0]?.paidLeave || 0,
+        weeklyOff: summary[0]?.weeklyOff || 0,
+        total: summary[0]?.total || 0
+      },
+      period: {
+        type: period,
+        startDate,
+        endDate
+      },
+      count: attendance.length
+    });
+  } catch (error) {
+    console.error('Error fetching attendance by period:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Server error while fetching attendance by period' 
+    });
+  }
+};

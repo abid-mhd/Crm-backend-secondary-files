@@ -26,6 +26,7 @@ router.delete('/attendance/:id', attendanceController.deleteAttendance);
 
 // Add to your backend routes
 router.get('/attendance/today',attendanceController.todayAttendance);
+router.get('/by-period', attendanceController.getAttendanceByPeriod);
 
 // Attendance settings routes
 router.get('/settings', attendanceController.getAttendanceSettings);
@@ -34,5 +35,6 @@ router.post('/attendance/settings', attendanceController.saveAttendanceSettings)
 router.get('/my-attendance', attendanceController.getMyAttendance);
 router.get('/my-summary',  attendanceController.getMyAttendanceSummary);
 router.get('/my-stats',  attendanceController.getMyAttendanceStats);
+
 
 module.exports = router;
