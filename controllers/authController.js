@@ -535,68 +535,34 @@ exports.getCurrentUser = async (req, res) => {
 
     const userId = req.user.id;
 
-    const [results] = await pool.query(
-      `SELECT u.*, e.* 
-       FROM users u 
-       LEFT JOIN employees e ON u.id = e.user_id 
-       WHERE u.id = ?`,
+    const [users] = await pool.query(
+      "SELECT id, name, email, role, meta, photo,employee_id, createdAt, updatedAt FROM users WHERE id = ?",
       [userId]
     );
 
-    if (results.length === 0) {
+    if (users.length === 0) {
       return res.status(404).json({
         success: false,
         message: "User not found"
       });
     }
 
-    const userData = results[0];
+    const user = users[0];
     
-    // Parse meta fields if they are strings
-    if (typeof userData.meta === 'string') {
+    // Parse meta if it's a string
+    if (typeof user.meta === 'string') {
       try {
-        userData.meta = JSON.parse(userData.meta);
+        user.meta = JSON.parse(user.meta);
       } catch (parseError) {
         console.error('Error parsing user meta:', parseError);
-        userData.meta = {};
+        user.meta = {};
       }
     }
 
-    // Remove employee-specific fields from user object
-    const user = {};
-    const employee = {};
-    
-    // Separate user and employee data
-    Object.keys(userData).forEach(key => {
-      if (key.startsWith('user_') || 
-          ['id', 'name', 'email', 'role', 'meta', 'photo', 'employee_id', 'createdAt', 'updatedAt'].includes(key)) {
-        user[key] = userData[key];
-      } else if (!['user_id'].includes(key)) {
-        employee[key] = userData[key];
-      }
-    });
-
-    // Parse employee meta if it exists
-    if (typeof employee.meta === 'string') {
-      try {
-        employee.meta = JSON.parse(employee.meta);
-      } catch (parseError) {
-        console.error('Error parsing employee meta:', parseError);
-        employee.meta = {};
-      }
-    }
-
-    const response = {
+    res.json({
       success: true,
       user: user
-    };
-
-    // Add employee data if employee record exists
-    if (employee.id) {
-      response.employee = employee;
-    }
-
-    res.json(response);
+    });
   } catch (err) {
     console.error("Get current user error:", err);
     res.status(500).json({

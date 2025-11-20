@@ -114,16 +114,6 @@ const applyLeave = async (req, res) => {
       days
     } = req.body;
     
-    // Validate leave type
-    const validLeaveTypes = ['Casual Leave', 'Sick Leave', 'Permission', 'Women Special'];
-    if (!validLeaveTypes.includes(leaveType)) {
-      await connection.rollback();
-      return res.status(400).json({
-        success: false,
-        message: `Invalid leave type. Allowed types: ${validLeaveTypes.join(', ')}`
-      });
-    }
-    
     // Get employee_id and details from users and employees tables
     const [users] = await connection.query(
       'SELECT employee_id FROM users WHERE id = ?',
@@ -176,7 +166,7 @@ const applyLeave = async (req, res) => {
     if (balance.length === 0) {
       // Initialize balance with NULL values for unlimited leaves
       await connection.query(
-        'INSERT INTO leave_balance (employee_id, total_leave, casual_leave, sick_leave, permission, women_special) VALUES (?, NULL, NULL, NULL, NULL, NULL)',
+        'INSERT INTO leave_balance (employee_id, total_leave, casual_leave, sick_leave, permission) VALUES (?, NULL, NULL, NULL, NULL)',
         [employeeId]
       );
       
@@ -194,40 +184,31 @@ const applyLeave = async (req, res) => {
     
     // Validate leave balance only if employee has configured leave balance
     if (hasLeaveBalance) {
-  const leaveTypeMap = {
-  'Casual Leave': 'casual_leave',
-  'Sick Leave': 'sick_leave',
-  'Permission': 'permission',
-  'Women Special': 'women_special',
-  'Woman Special': 'women_special', // Add this for consistency
-  'Women Special': 'women_special' // Add this for consistency
-};
-  
-  const leaveTypeKey = leaveTypeMap[leaveType];
-  const availableBalance = currentBalance[leaveTypeKey];
-  
-  // Check if the specific leave type has balance configured (not NULL)
-  const hasSpecificBalance = availableBalance !== null && availableBalance !== undefined && availableBalance !== '';
-  
-  if (hasSpecificBalance && availableBalance < daysRequested) {
-    await connection.rollback();
-    return res.status(400).json({
-      success: false,
-      message: `Insufficient ${leaveType} balance. Available: ${availableBalance} days`
-    });
-  }
-} else {
-  // For unlimited leaves (NULL values), apply reasonable limits
-  const maxAllowedDays = 30; // Maximum days allowed per application for unlimited leaves
-  
-  if (daysRequested > maxAllowedDays) {
-    await connection.rollback();
-    return res.status(400).json({
-      success: false,
-      message: `For flexible leave policy, maximum ${maxAllowedDays} days are allowed per application`
-    });
-  }
-}
+      const leaveTypeKey = leaveType.toLowerCase().replace(' ', '_');
+      const availableBalance = currentBalance[leaveTypeKey];
+      
+      // Check if the specific leave type has balance configured
+      const hasSpecificBalance = availableBalance !== null && availableBalance !== undefined && availableBalance !== '';
+      
+      if (hasSpecificBalance && availableBalance < daysRequested) {
+        await connection.rollback();
+        return res.status(400).json({
+          success: false,
+          message: `Insufficient ${leaveType} balance. Available: ${availableBalance} days`
+        });
+      }
+    } else {
+      // For unlimited leaves, apply reasonable limits
+      const maxAllowedDays = 30; // Maximum days allowed per application for unlimited leaves
+      
+      if (daysRequested > maxAllowedDays) {
+        await connection.rollback();
+        return res.status(400).json({
+          success: false,
+          message: `For flexible leave policy, maximum ${maxAllowedDays} days are allowed per application`
+        });
+      }
+    }
     
     // Validate permission (only half day) - applies to both limited and unlimited leaves
     if (leaveType === 'Permission' && daysRequested !== 0.5) {
@@ -296,15 +277,6 @@ const applyLeave = async (req, res) => {
   } catch (error) {
     await connection.rollback();
     console.error('Error applying leave:', error);
-    
-    // Handle specific database errors
-    if (error.code === 'WARN_DATA_TRUNCATED' && error.sqlMessage.includes('leave_type')) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid leave type. Please contact administrator to update available leave types.'
-      });
-    }
-    
     res.status(500).json({
       success: false,
       message: 'Failed to apply for leave'
@@ -561,9 +533,6 @@ const updateLeaveStatus = async (req, res) => {
     
     const leave = leaves[0];
     
-    // Debug: Log the actual leave type from database
-    console.log('Leave type from DB:', leave.leave_type);
-    
     // Update leave status
     await connection.query(
       `UPDATE leaves 
@@ -574,96 +543,30 @@ const updateLeaveStatus = async (req, res) => {
     
     // If approved, deduct from leave balance
     if (status === 'Approved') {
-      // Map leave type to database column name - handle both cases
-      const leaveTypeMap = {
-        'Casual Leave': 'casual_leave',
-        'Sick Leave': 'sick_leave',
-        'Permission': 'permission',
-        'Women Special': 'women_special',
-        'Woman Special': 'women_special',
-        'Women Special': 'women_special' // Add this line to handle potential mismatch
-      };
+      const leaveTypeKey = leave.leave_type.toLowerCase().replace(' ', '_');
       
-      const leaveTypeKey = leaveTypeMap[leave.leave_type];
-      
-      if (!leaveTypeKey) {
-        await connection.rollback();
-        return res.status(400).json({
-          success: false,
-          message: `Invalid leave type: ${leave.leave_type}. Valid types are: ${Object.keys(leaveTypeMap).join(', ')}`
-        });
-      }
-      
-      // Check if the employee has a leave balance record and if the specific leave type has balance configured
-      const [balanceCheck] = await connection.query(
-        'SELECT * FROM leave_balance WHERE employee_id = ?',
-        [leave.employee_id]
+      await connection.query(
+        `UPDATE leave_balance 
+         SET ${leaveTypeKey} = ${leaveTypeKey} - ?, 
+             total_leave = total_leave - ?,
+             updated_at = NOW()
+         WHERE employee_id = ?`,
+        [leave.days, leave.days, leave.employee_id]
       );
-      
-      if (balanceCheck.length > 0) {
-        const currentBalance = balanceCheck[0];
-        
-        // Only deduct if the specific leave type has a configured balance (not NULL)
-        if (currentBalance[leaveTypeKey] !== null && currentBalance[leaveTypeKey] !== undefined) {
-          await connection.query(
-            `UPDATE leave_balance 
-             SET ${leaveTypeKey} = ${leaveTypeKey} - ?, 
-                 total_leave = total_leave - ?,
-                 updated_at = NOW()
-             WHERE employee_id = ?`,
-            [leave.days, leave.days, leave.employee_id]
-          );
-        } else {
-          console.log(`No balance configured for ${leave.leave_type}, skipping deduction`);
-        }
-      }
     }
     
     // If rejected and was previously approved, restore balance
     if (status === 'Rejected' && leave.status === 'Approved') {
-      // Map leave type to database column name - handle both cases
-      const leaveTypeMap = {
-        'Casual Leave': 'casual_leave',
-        'Sick Leave': 'sick_leave',
-        'Permission': 'permission',
-        'Women Special': 'women_special',
-        'Woman Special': 'women_special',
-        'Women Special': 'women_special' // Add this line to handle potential mismatch
-      };
+      const leaveTypeKey = leave.leave_type.toLowerCase().replace(' ', '_');
       
-      const leaveTypeKey = leaveTypeMap[leave.leave_type];
-      
-      if (!leaveTypeKey) {
-        await connection.rollback();
-        return res.status(400).json({
-          success: false,
-          message: `Invalid leave type: ${leave.leave_type}. Valid types are: ${Object.keys(leaveTypeMap).join(', ')}`
-        });
-      }
-      
-      // Check if the employee has a leave balance record and if the specific leave type had balance configured
-      const [balanceCheck] = await connection.query(
-        'SELECT * FROM leave_balance WHERE employee_id = ?',
-        [leave.employee_id]
+      await connection.query(
+        `UPDATE leave_balance 
+         SET ${leaveTypeKey} = ${leaveTypeKey} + ?, 
+             total_leave = total_leave + ?,
+             updated_at = NOW()
+         WHERE employee_id = ?`,
+        [leave.days, leave.days, leave.employee_id]
       );
-      
-      if (balanceCheck.length > 0) {
-        const currentBalance = balanceCheck[0];
-        
-        // Only restore if the specific leave type has a configured balance (not NULL)
-        if (currentBalance[leaveTypeKey] !== null && currentBalance[leaveTypeKey] !== undefined) {
-          await connection.query(
-            `UPDATE leave_balance 
-             SET ${leaveTypeKey} = ${leaveTypeKey} + ?, 
-                 total_leave = total_leave + ?,
-                 updated_at = NOW()
-             WHERE employee_id = ?`,
-            [leave.days, leave.days, leave.employee_id]
-          );
-        } else {
-          console.log(`No balance configured for ${leave.leave_type}, skipping restoration`);
-        }
-      }
     }
 
     // Send notification to the employee about leave status update
@@ -679,19 +582,9 @@ const updateLeaveStatus = async (req, res) => {
   } catch (error) {
     await connection.rollback();
     console.error('Error updating leave status:', error);
-    
-    // More detailed error logging
-    console.error('Error details:', {
-      message: error.message,
-      code: error.code,
-      sql: error.sql,
-      sqlMessage: error.sqlMessage
-    });
-    
     res.status(500).json({
       success: false,
-      message: 'Failed to update leave status',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+      message: 'Failed to update leave status'
     });
   } finally {
     connection.release();
@@ -856,11 +749,20 @@ const setLeaveBalanceForAll = async (req, res) => {
   try {
     await connection.beginTransaction();
     
-    const { total_leave, casual_leave, sick_leave, permission, women_special } = req.body;
+    const { total_leave, casual_leave, sick_leave, permission } = req.body;
+    
+    // Validate input
+    if (!total_leave || !casual_leave || !sick_leave || !permission) {
+      await connection.rollback();
+      return res.status(400).json({
+        success: false,
+        message: 'All leave balance fields are required'
+      });
+    }
     
     // Get all employee IDs
     const [employees] = await connection.query(
-      'SELECT id FROM employees'
+      'SELECT id FROM employees '
     );
     
     if (employees.length === 0) {
@@ -884,14 +786,14 @@ const setLeaveBalanceForAll = async (req, res) => {
       if (existingBalance.length > 0) {
         // Update existing balance
         await connection.query(
-          'UPDATE leave_balance SET total_leave = ?, casual_leave = ?, sick_leave = ?, permission = ?, women_special = ? WHERE employee_id = ?',
-          [total_leave, casual_leave, sick_leave, permission, women_special, employeeId]
+          'UPDATE leave_balance SET total_leave = ?, casual_leave = ?, sick_leave = ?, permission = ? WHERE employee_id = ?',
+          [total_leave, casual_leave, sick_leave, permission, employeeId]
         );
       } else {
         // Insert new balance
         await connection.query(
-          'INSERT INTO leave_balance (employee_id, total_leave, casual_leave, sick_leave, permission, women_special) VALUES (?, ?, ?, ?, ?, ?)',
-          [employeeId, total_leave, casual_leave, sick_leave, permission, women_special]
+          'INSERT INTO leave_balance (employee_id, total_leave, casual_leave, sick_leave, permission) VALUES (?, ?, ?, ?, ?)',
+          [employeeId, total_leave, casual_leave, sick_leave, permission]
         );
       }
     }
@@ -907,8 +809,7 @@ const setLeaveBalanceForAll = async (req, res) => {
           total_leave,
           casual_leave,
           sick_leave,
-          permission,
-          women_special
+          permission
         }
       }
     });
@@ -933,14 +834,12 @@ const getExistingLeaveBalance = async (req, res) => {
         total_leave,
         casual_leave,
         sick_leave,
-        permission,
-        women_special
+        permission
       FROM leave_balance 
       WHERE total_leave IS NOT NULL 
       OR casual_leave IS NOT NULL 
       OR sick_leave IS NOT NULL 
       OR permission IS NOT NULL
-      OR women_special IS NOT NULL
       LIMIT 1
     `);
     
@@ -965,74 +864,6 @@ const getExistingLeaveBalance = async (req, res) => {
   }
 };
 
-// Add this function to your leaveController.js
-const clearLeaveBalanceForAll = async (req, res) => {
-  const connection = await db.getConnection();
-  
-  try {
-    await connection.beginTransaction();
-    
-    // Get all employee IDs
-    const [employees] = await connection.query(
-      'SELECT id FROM employees'
-    );
-    
-    if (employees.length === 0) {
-      await connection.rollback();
-      return res.status(404).json({
-        success: false,
-        message: 'No active employees found'
-      });
-    }
-    
-    // Set all leave balances to NULL for each employee
-    for (const employee of employees) {
-      const employeeId = employee.id;
-      
-      // Check if balance exists
-      const [existingBalance] = await connection.query(
-        'SELECT id FROM leave_balance WHERE employee_id = ?',
-        [employeeId]
-      );
-      
-      if (existingBalance.length > 0) {
-        // Update existing balance to NULL values (unlimited leaves)
-        await connection.query(
-          'UPDATE leave_balance SET total_leave = NULL, casual_leave = NULL, sick_leave = NULL, permission = NULL, women_special = NULL WHERE employee_id = ?',
-          [employeeId]
-        );
-      } else {
-        // Insert new balance with NULL values (unlimited leaves)
-        await connection.query(
-          'INSERT INTO leave_balance (employee_id, total_leave, casual_leave, sick_leave, permission, women_special) VALUES (?, NULL, NULL, NULL, NULL, NULL)',
-          [employeeId]
-        );
-      }
-    }
-    
-    await connection.commit();
-    
-    res.status(200).json({
-      success: true,
-      message: `Leave balance cleared successfully for ${employees.length} employees. Employees now have unlimited leaves.`,
-      data: {
-        employeesUpdated: employees.length,
-        balance: null
-      }
-    });
-    
-  } catch (error) {
-    await connection.rollback();
-    console.error('Error clearing leave balance:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to clear leave balance'
-    });
-  } finally {
-    connection.release();
-  }
-};
-
 module.exports = {
   getMyLeaves,
   getMyLeaveBalance,
@@ -1043,6 +874,5 @@ module.exports = {
   updateLeaveStatus,
   getLeaveStatistics,
   setLeaveBalanceForAll,
-  getExistingLeaveBalance,
-  clearLeaveBalanceForAll
+  getExistingLeaveBalance
 };

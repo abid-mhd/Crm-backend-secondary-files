@@ -12,7 +12,6 @@ router.delete('/cancel/:id', auth, leaveController.cancelLeave);
 router.get('/statistics', auth, leaveController.getLeaveStatistics);
 router.get('/existing-balance', auth, leaveController.getExistingLeaveBalance);
 router.post('/set-balance-all', auth, leaveController.setLeaveBalanceForAll);
-router.delete('/balance/clear', auth, leaveController.clearLeaveBalanceForAll);
 
 // Admin routes (require admin role)
 router.get('/all', auth, leaveController.getAllLeaves);

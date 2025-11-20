@@ -147,71 +147,6 @@ exports.list = async (req, res) => {
   }
 };
 
-// Get purchase orders by project
-exports.getPurchaseOrdersByProject = async (req, res) => {
-  try {
-    const { projectId } = req.params;
-    
-    const [orders] = await db.execute(`
-      SELECT i.*, p.partyName as supplierName
-      FROM invoices i
-      LEFT JOIN parties p ON i.clientId = p.id
-      WHERE i.type = 'purchase_order' AND i.project_id = ?
-      ORDER BY i.createdAt DESC
-    `, [projectId]);
-
-    for (const order of orders) {
-      const [items] = await db.execute(
-        "SELECT * FROM invoice_items WHERE invoiceId = ?",
-        [order.id]
-      );
-      
-      // Parse meta data for order
-      if (order.meta && typeof order.meta === 'string') {
-        try {
-          order.meta = JSON.parse(order.meta);
-        } catch (e) {
-          console.error("Error parsing order meta:", e);
-          order.meta = {};
-        }
-      } else if (!order.meta) {
-        order.meta = {};
-      }
-
-      // Parse meta data for each item
-      order.items = items.map(item => {
-        if (item.meta) {
-          if (typeof item.meta === 'string') {
-            try {
-              item.meta = JSON.parse(item.meta);
-            } catch (e) {
-              console.error("Error parsing item meta:", e);
-              item.meta = {};
-            }
-          }
-          if (typeof item.meta === 'object' && item.meta !== null) {
-            item.sgst = item.meta.sgst || 9;
-            item.cgst = item.meta.cgst || 9;
-            item.igst = item.meta.igst || 18;
-            item.sgstAmount = item.meta.sgstAmount || 0;
-            item.cgstAmount = item.meta.cgstAmount || 0;
-            item.igstAmount = item.meta.igstAmount || 0;
-            item.taxType = item.meta.taxType || 'sgst_cgst';
-          }
-        } else {
-          item.meta = {};
-        }
-        return item;
-      });
-    }
-
-    res.json({ purchaseOrders: orders });
-  } catch (err) {
-    console.error("Error fetching project purchase orders:", err);
-    res.status(500).json({ message: "Database error" });
-  }
-};
-
 // Get single PURCHASE ORDER by ID
 exports.get = async (req, res) => {
   try {
@@ -290,7 +225,6 @@ exports.create = async (req, res) => {
     await conn.beginTransaction();
 
     console.log("Creating purchase order with tax type:", payload.taxType);
-    console.log("Project ID:", payload.projectId);
 
     // Get tax type from payload or determine from supplier address
     let taxType = payload.taxType || 'sgst_cgst';
@@ -397,17 +331,13 @@ exports.create = async (req, res) => {
       
       // Order status
       orderStatus: payload.orderStatus || "draft",
-      priority: payload.priority || "medium",
-
-      // Project information (also stored in meta for easy access)
-      projectId: payload.projectId || null,
-      projectName: payload.projectName || null
+      priority: payload.priority || "medium"
     };
 
     const [result] = await conn.execute(
       `INSERT INTO invoices 
-      (invoiceNumber, date, dueDate, clientId, status, subTotal, tax, discount, total, notes, signature, type, meta, project_id, createdAt, updatedAt) 
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+      (invoiceNumber, date, dueDate, clientId, status, subTotal, tax, discount, total, notes, signature, type, meta, createdAt, updatedAt) 
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
       [
         payload.invoiceNumber,
         payload.date,
@@ -421,8 +351,7 @@ exports.create = async (req, res) => {
         JSON.stringify(payload.notes || []),
         payload.signature || null,
         'purchase_order',
-        JSON.stringify(meta),
-        payload.projectId || null // Store projectId in the main table
+        JSON.stringify(meta)
       ]
     );
 
@@ -488,8 +417,7 @@ exports.create = async (req, res) => {
       orderNumber: payload.invoiceNumber,
       taxType: taxType,
       total: payload.total ?? calculatedTotal,
-      roundingApplied: payload.roundingApplied || false,
-      projectId: payload.projectId || null
+      roundingApplied: payload.roundingApplied || false
     });
   } catch (err) {
     await conn.rollback();
@@ -607,11 +535,7 @@ exports.update = async (req, res) => {
       shippingMethod: payload.shippingMethod || "",
       notes: payload.notes || [],
       orderStatus: payload.orderStatus || "draft",
-      priority: payload.priority || "medium",
-
-      // Project information (also stored in meta for easy access)
-      projectId: payload.projectId || null,
-      projectName: payload.projectName || null
+      priority: payload.priority || "medium"
     };
 
     // Update main order record
@@ -629,7 +553,6 @@ exports.update = async (req, res) => {
         notes=?, 
         signature=?, 
         meta=?, 
-        project_id=?,
         updatedAt=NOW() 
       WHERE id=? AND type='purchase_order'`,
       [
@@ -645,7 +568,6 @@ exports.update = async (req, res) => {
         JSON.stringify(payload.notes || []),
         payload.signature || null,
         JSON.stringify(meta),
-        payload.projectId || null, // Update projectId in the main table
         req.params.id,
       ]
     );
@@ -696,9 +618,8 @@ exports.update = async (req, res) => {
       id: req.params.id,
       orderNumber: payload.invoiceNumber,
       taxType: taxType,
-      total: payload.total ?? calculatedTotal,
-      roundingApplied: payload.roundingApplied || false,
-      projectId: payload.projectId || null
+      total: payload.total ??calculatedTotal,
+      roundingApplied: payload.roundingApplied || false
     });
   } catch (err) {
     await conn.rollback();
