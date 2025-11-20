@@ -62,11 +62,109 @@ const twilioClient = twilio(
   process.env.TWILIO_AUTH_TOKEN
 );
 
+// Utility functions for time calculations
+const parseTimeToMinutes = (timeString) => {
+  if (!timeString) return 9 * 60; // Default to 9 hours
+  
+  try {
+    // Handle different formats: "09:30", "9:30", "9.5", 9.5
+    if (typeof timeString === 'string') {
+      if (timeString.includes(':')) {
+        // HH:MM format
+        const [hours, minutes] = timeString.split(':').map(Number);
+        return (hours || 0) * 60 + (minutes || 0);
+      } else {
+        // Decimal format or number string
+        const decimalValue = parseFloat(timeString);
+        if (!isNaN(decimalValue)) {
+          return Math.floor(decimalValue) * 60 + Math.round((decimalValue % 1) * 60);
+        }
+      }
+    } else if (typeof timeString === 'number') {
+      // Number format (assumed to be hours)
+      return Math.floor(timeString) * 60 + Math.round((timeString % 1) * 60);
+    }
+  } catch (error) {
+    console.error('Error parsing time:', error);
+  }
+  
+  // Default fallback: 9 hours
+  return 9 * 60;
+};
+
+const formatMinutesToTime = (totalMinutes) => {
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`;
+};
+
+const formatMinutesToReadable = (totalMinutes) => {
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  
+  if (hours > 0 && minutes > 0) {
+    return `${hours}h ${minutes}m`;
+  } else if (hours > 0) {
+    return `${hours}h`;
+  } else {
+    return `${minutes}m`;
+  }
+};
+
+// Calculate overtime hours based on check-in time and required checkout time
+const calculateOvertime = (checkinTime, actualCheckoutTime, requiredCheckoutTime) => {
+  try {
+    if (!checkinTime || !actualCheckoutTime || !requiredCheckoutTime) {
+      return { overtimeHours: 0, overtimeMinutes: 0 };
+    }
+
+    // Parse times to minutes
+    const parseTime = (timeStr) => {
+      const [hours, minutes] = timeStr.split(':').map(Number);
+      return hours * 60 + minutes;
+    };
+
+    const checkinMinutes = parseTime(checkinTime);
+    const actualCheckoutMinutes = parseTime(actualCheckoutTime);
+    const requiredCheckoutMinutes = parseTime(requiredCheckoutTime);
+
+    // Calculate total worked minutes
+    const totalWorkedMinutes = actualCheckoutMinutes - checkinMinutes;
+    
+    // Calculate required working minutes
+    const requiredWorkingMinutes = requiredCheckoutMinutes - checkinMinutes;
+    
+    // Calculate overtime (only if worked more than required)
+    let overtimeMinutes = totalWorkedMinutes - requiredWorkingMinutes;
+    
+    // Only count overtime if it's positive and more than 15 minutes
+    if (overtimeMinutes < 15) {
+      return { overtimeHours: 0, overtimeMinutes: 0 };
+    }
+
+    // Convert to hours with 2 decimal places
+    const overtimeHours = parseFloat((overtimeMinutes / 60).toFixed(2));
+
+    return {
+      overtimeHours: overtimeHours,
+      overtimeMinutes: overtimeMinutes,
+      overtimeFormatted: formatMinutesToReadable(overtimeMinutes)
+    };
+  } catch (error) {
+    console.error('Error calculating overtime:', error);
+    return { overtimeHours: 0, overtimeMinutes: 0 };
+  }
+};
+
 class ReminderScheduler {
   constructor() {
     this.isRunning = false;
     this.checkinReminderTime = '8:55'; // Default fallback
-    this.checkoutReminderTime = '18:55'; // Default fallback (6:55 PM in 24h format)
+    this.workingHours = '09:00'; // Default as string with minutes
+    this.reminderBufferMinutes = 5; // 5 minutes before checkout
+    this.absentCheckMinutes = 10; // 10 minutes after checkout to check for absence
+    this.finalReminderMinutes = 120; // 120 minutes after checkout for final reminder
+    this.endOfDayTime = '23:59'; // End of day for auto absent marking
   }
 
   // Get attendance settings from database
@@ -99,7 +197,8 @@ class ReminderScheduler {
       console.error('Error fetching attendance settings:', error);
       return {
         reminderTime: '8:55',
-        enableDailyReminder: false
+        enableDailyReminder: false,
+        workingHours: '09:00'
       };
     }
   }
@@ -141,6 +240,106 @@ class ReminderScheduler {
     }
   }
 
+  // Convert working hours string to total minutes
+  workingHoursToMinutes(workingHours) {
+    return parseTimeToMinutes(workingHours);
+  }
+
+  // Format minutes to HH:MM string
+  minutesToTimeString(totalMinutes) {
+    try {
+      let hours = Math.floor(totalMinutes / 60);
+      const minutes = totalMinutes % 60;
+      
+      // Handle overflow to next day
+      if (hours >= 24) {
+        hours -= 24;
+      }
+      
+      return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`;
+    } catch (error) {
+      console.error('Error formatting minutes to time:', error);
+      return '19:00'; // Fallback
+    }
+  }
+
+  // Calculate checkout time based on check-in time and working hours
+  calculateCheckoutTime(checkinTime, workingHours = '09:00') {
+    try {
+      if (!checkinTime) {
+        // Fallback to fixed checkout time if no check-in time
+        const defaultWorkingMinutes = this.workingHoursToMinutes(workingHours);
+        return this.minutesToTimeString(defaultWorkingMinutes);
+      }
+
+      // Parse check-in time
+      const [checkinHours, checkinMinutes] = checkinTime.split(':').map(Number);
+      const totalCheckinMinutes = checkinHours * 60 + checkinMinutes;
+      
+      // Convert working hours to minutes
+      const workingMinutes = this.workingHoursToMinutes(workingHours);
+      
+      // Calculate checkout time
+      const totalCheckoutMinutes = totalCheckinMinutes + workingMinutes;
+      
+      return this.minutesToTimeString(totalCheckoutMinutes);
+    } catch (error) {
+      console.error('Error calculating checkout time:', error);
+      return '19:00'; // Fallback to 7:00 PM
+    }
+  }
+
+  // Calculate reminder times based on checkout time
+  calculateReminderTimes(checkoutTime) {
+    try {
+      const [checkoutHours, checkoutMinutes] = checkoutTime.split(':').map(Number);
+      const totalCheckoutMinutes = checkoutHours * 60 + checkoutMinutes;
+      
+      // Reminder 5 minutes before checkout
+      const reminderBeforeMinutes = totalCheckoutMinutes - this.reminderBufferMinutes;
+      
+      // Check for absence 10 minutes after checkout
+      const absentCheckMinutes = totalCheckoutMinutes + this.absentCheckMinutes;
+      
+      // Final reminder 120 minutes after checkout
+      const finalReminderMinutes = totalCheckoutMinutes + this.finalReminderMinutes;
+      
+      return {
+        checkoutTime: checkoutTime,
+        reminderBefore: this.minutesToTimeString(reminderBeforeMinutes),
+        absentCheck: this.minutesToTimeString(absentCheckMinutes),
+        finalReminder: this.minutesToTimeString(finalReminderMinutes)
+      };
+    } catch (error) {
+      console.error('Error calculating reminder times:', error);
+      return {
+        checkoutTime: '19:00',
+        reminderBefore: '18:55',
+        absentCheck: '19:10',
+        finalReminder: '21:00'
+      };
+    }
+  }
+
+  // Get employee's today check-in time
+  async getEmployeeCheckinTime(employeeId) {
+    try {
+      const today = new Date().toISOString().split('T')[0];
+      const [attendance] = await db.query(`
+        SELECT check_in FROM attendance 
+        WHERE employee_id = ? AND DATE(date) = ? AND check_in IS NOT NULL
+      `, [employeeId, today]);
+
+      if (attendance.length > 0 && attendance[0].check_in) {
+        return attendance[0].check_in;
+      }
+      return null;
+    } catch (error) {
+      console.error('Error getting employee check-in time:', error);
+      return null;
+    }
+  }
+
   // Update reminder times from settings
   async updateReminderTimes() {
     try {
@@ -155,28 +354,37 @@ class ReminderScheduler {
         this.checkinReminderTime = '8:55';
       }
       
-      // Check-out reminder remains fixed at 6:55 PM
-      this.checkoutReminderTime = '18:55';
+      // Update working hours from settings
+      if (settings.workingHours) {
+        this.workingHours = settings.workingHours;
+        const workingMinutes = this.workingHoursToMinutes(this.workingHours);
+        console.log(`✅ Working hours set from settings: ${this.workingHours} (${Math.floor(workingMinutes/60)}h ${workingMinutes%60}m)`);
+      } else {
+        this.workingHours = '09:00';
+        console.log('ℹ️ No working hours in settings, using default: 09:00');
+      }
       
       return {
         checkinReminderTime: this.checkinReminderTime,
-        checkoutReminderTime: '5:55 PM'
+        workingHours: this.workingHours,
+        workingMinutes: this.workingHoursToMinutes(this.workingHours)
       };
       
     } catch (error) {
       console.error('Error updating reminder times:', error);
       // Keep default values on error
       this.checkinReminderTime = '8:55';
-      this.checkoutReminderTime = '18:55';
+      this.workingHours = '09:00';
       return {
         checkinReminderTime: this.checkinReminderTime,
-        checkoutReminderTime: '5:55 PM'
+        workingHours: this.workingHours,
+        workingMinutes: this.workingHoursToMinutes(this.workingHours)
       };
     }
   }
 
   // Send email reminder
-  async sendEmailReminder(employee, reminderType, customMessage = null) {
+  async sendEmailReminder(employee, reminderType, customMessage = null, checkoutTime = null) {
     try {
       const { employeeName, email, position, department, employeeNo } = employee;
       
@@ -195,11 +403,26 @@ class ReminderScheduler {
         title = 'Check-in Reminder';
         action = 'check in';
         time = '10:00 AM';
-      } else if (reminderType === 'checkout') {
+      } else if (reminderType === 'checkout_before') {
         subject = 'Check-out Reminder - Icebergs India';
         title = 'Check-out Reminder';
         action = 'check out';
-        time = '7:00 PM';
+        time = checkoutTime || '6:55 PM';
+      } else if (reminderType === 'checkout_overdue') {
+        subject = 'URGENT: Check-out Time Over - Icebergs India';
+        title = 'Check-out Time Overdue';
+        action = 'check out immediately';
+        time = checkoutTime || '7:10 PM';
+      } else if (reminderType === 'checkout_final') {
+        subject = 'FINAL: Attendance Status Alert - Icebergs India';
+        title = 'Final Attendance Alert';
+        action = 'contact HR';
+        time = checkoutTime || '9:00 PM';
+      } else if (reminderType === 'auto_absent_warning') {
+        subject = 'IMPORTANT: Auto Absent Warning - Icebergs India';
+        title = 'Auto Absent Warning';
+        action = 'check out immediately';
+        time = 'End of Day';
       }
 
       // Create staff portal link
@@ -390,7 +613,7 @@ ${process.env.EMAIL_USER || 'garan6104@gmail.com'}
     }
   }
 
-  async sendReminder(employeeId, reminderType, customMessage = null) {
+  async sendReminder(employeeId, reminderType, customMessage = null, checkoutTime = null) {
     try {
       // Get employee details with user ID and phone
       const [employees] = await db.query(`
@@ -412,12 +635,21 @@ ${process.env.EMAIL_USER || 'garan6104@gmail.com'}
 
       if (reminderType === 'checkin') {
         title = 'Check-in Reminder';
-        // Ensure message is never empty
         message = customMessage || `Dear ${employee.employeeName}, please remember to check in for work. Check-in time is 10:00 AM.`;
-      } else if (reminderType === 'checkout') {
+      } else if (reminderType === 'checkout_before') {
         title = 'Check-out Reminder';
-        // Ensure message is never empty
-        message = customMessage || `Dear ${employee.employeeName}, please remember to check out. Check-out time is 7:00 PM.`;
+        const workingMinutes = this.workingHoursToMinutes(this.workingHours);
+        const workingHoursReadable = formatMinutesToReadable(workingMinutes);
+        message = customMessage || `Dear ${employee.employeeName}, please remember to check out. Your calculated checkout time is ${checkoutTime} (based on ${workingHoursReadable} working hours).`;
+      } else if (reminderType === 'checkout_overdue') {
+        title = 'Check-out Time Overdue';
+        message = customMessage || `Dear ${employee.employeeName}, your checkout time (${checkoutTime}) has passed. Please check out immediately to avoid being marked absent.`;
+      } else if (reminderType === 'checkout_final') {
+        title = 'Final Attendance Alert';
+        message = customMessage || `Dear ${employee.employeeName}, you have not checked out. Today will be marked as absent unless you contact HR for approval.`;
+      } else if (reminderType === 'auto_absent_warning') {
+        title = 'Auto Absent Warning';
+        message = customMessage || `Dear ${employee.employeeName}, you have not checked out today. If you don't check out by end of day (11:59 PM), you will be automatically marked as absent.`;
       }
 
       // Validate message is not empty
@@ -486,7 +718,7 @@ ${process.env.EMAIL_USER || 'garan6104@gmail.com'}
       // Send email reminder
       if (employee.email && employee.email.trim() !== '') {
         try {
-          const emailSent = await this.sendEmailReminder(employee, reminderType, customMessage);
+          const emailSent = await this.sendEmailReminder(employee, reminderType, customMessage, checkoutTime);
           results.emailSent = emailSent;
           if (emailSent) {
             console.log(`✅ Email reminder sent successfully to ${employee.employeeName} (${employee.email})`);
@@ -509,114 +741,112 @@ ${process.env.EMAIL_USER || 'garan6104@gmail.com'}
     }
   }
 
-  // Replace the existing sendSMS method in ReminderScheduler class with this:
-
-async sendSMS(to, message) {
-  try {
-    if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN) {
-      console.log('Twilio not configured, skipping SMS');
-      return null;
-    }
-
-    // Validate message is not empty
-    if (!message || message.trim() === '') {
-      console.error('Error: Cannot send empty SMS message');
-      return null;
-    }
-
-    // Validate phone number
-    if (!to || to.trim() === '') {
-      console.error('Error: Cannot send SMS to empty phone number');
-      return null;
-    }
-
-    // Use the same Twilio client configuration as your OTP code
-    const twilioClient = twilio(
-      process.env.TWILIO_ACCOUNT_SID,
-      process.env.TWILIO_AUTH_TOKEN,
-      {
-        timeout: 120000, // 2 minutes
-        region: "us1",
-        edge: "ashburn",
+  async sendSMS(to, message) {
+    try {
+      if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN) {
+        console.log('Twilio not configured, skipping SMS');
+        return null;
       }
-    );
 
-    // Use the same phone sanitization as your OTP code
-    const sanitizePhone = (phone) => phone.replace(/\D/g, "");
-    const sanitizedPhone = sanitizePhone(to);
-    
-    // Format phone number exactly like your OTP code
-    const formattedPhone = `+91${sanitizedPhone}`;
-
-    console.log(`📤 Sending SMS to ${formattedPhone}:`, message.substring(0, 50) + '...');
-
-    // OPTION 1: Try using Messaging Service SID if you have one
-    // This bypasses the phone number issue for Indian numbers
-    let attempts = 0;
-    let success = false;
-    let result = null;
-
-    while (!success && attempts < 2) {
-      try {
-        const messageOptions = {
-          body: message,
-          to: formattedPhone
-        };
-
-        // Try using Messaging Service SID first (if available)
-        if (process.env.TWILIO_MESSAGING_SERVICE_SID) {
-          messageOptions.messagingServiceSid = process.env.TWILIO_MESSAGING_SERVICE_SID;
-        } else if (process.env.TWILIO_PHONE_NUMBER) {
-          // Fallback to phone number (may not work for India to India)
-          messageOptions.from = process.env.TWILIO_PHONE_NUMBER;
-        } else {
-          throw new Error('Neither TWILIO_MESSAGING_SERVICE_SID nor TWILIO_PHONE_NUMBER is configured');
-        }
-
-        result = await twilioClient.messages.create(messageOptions);
-        success = true;
-      } catch (err) {
-        attempts++;
-        console.error(`Twilio SMS attempt ${attempts} failed:`, err.message);
-        
-        // If error is due to India restrictions, log specific message
-        if (err.code === 21659) {
-          console.error('⚠️ Indian phone number restrictions detected. Consider:');
-          console.error('   1. Using a US/Canadian Twilio number');
-          console.error('   2. Setting up a Messaging Service');
-          console.error('   3. Using Twilio Verify Service instead');
-        }
-        
-        if (attempts >= 2) throw err;
+      // Validate message is not empty
+      if (!message || message.trim() === '') {
+        console.error('Error: Cannot send empty SMS message');
+        return null;
       }
-    }
 
-    console.log('✅ SMS sent successfully:', result.sid);
-    console.log('📊 SMS Status:', result.status);
-    
-    return result;
-  } catch (error) {
-    console.error('❌ Error sending SMS:', error.message);
-    console.error('📞 Phone number attempted:', to);
-    console.error('🔧 Error code:', error.code);
-    
-    // More specific error handling
-    if (error.code === 21659) {
-      console.error('❌ Country/Region mismatch - Indian numbers cannot send to Indian numbers via standard SMS');
-      console.error('💡 Solution: Use Twilio Verify Service or get a non-Indian Twilio number');
-    } else if (error.code === 21211) {
-      console.error('❌ Invalid phone number format');
-    } else if (error.code === 21408) {
-      console.error('❌ Permission denied - check Twilio permissions');
-    } else if (error.code === 21610) {
-      console.error('❌ Phone number not SMS capable');
-    } else if (error.code === 21614) {
-      console.error('❌ Phone number is not a valid mobile number');
+      // Validate phone number
+      if (!to || to.trim() === '') {
+        console.error('Error: Cannot send SMS to empty phone number');
+        return null;
+      }
+
+      // Use the same Twilio client configuration as your OTP code
+      const twilioClient = twilio(
+        process.env.TWILIO_ACCOUNT_SID,
+        process.env.TWILIO_AUTH_TOKEN,
+        {
+          timeout: 120000, // 2 minutes
+          region: "us1",
+          edge: "ashburn",
+        }
+      );
+
+      // Use the same phone sanitization as your OTP code
+      const sanitizePhone = (phone) => phone.replace(/\D/g, "");
+      const sanitizedPhone = sanitizePhone(to);
+      
+      // Format phone number exactly like your OTP code
+      const formattedPhone = `+91${sanitizedPhone}`;
+
+      console.log(`📤 Sending SMS to ${formattedPhone}:`, message.substring(0, 50) + '...');
+
+      // OPTION 1: Try using Messaging Service SID if you have one
+      // This bypasses the phone number issue for Indian numbers
+      let attempts = 0;
+      let success = false;
+      let result = null;
+
+      while (!success && attempts < 2) {
+        try {
+          const messageOptions = {
+            body: message,
+            to: formattedPhone
+          };
+
+          // Try using Messaging Service SID first (if available)
+          if (process.env.TWILIO_MESSAGING_SERVICE_SID) {
+            messageOptions.messagingServiceSid = process.env.TWILIO_MESSAGING_SERVICE_SID;
+          } else if (process.env.TWILIO_PHONE_NUMBER) {
+            // Fallback to phone number (may not work for India to India)
+            messageOptions.from = process.env.TWILIO_PHONE_NUMBER;
+          } else {
+            throw new Error('Neither TWILIO_MESSAGING_SERVICE_SID nor TWILIO_PHONE_NUMBER is configured');
+          }
+
+          result = await twilioClient.messages.create(messageOptions);
+          success = true;
+        } catch (err) {
+          attempts++;
+          console.error(`Twilio SMS attempt ${attempts} failed:`, err.message);
+          
+          // If error is due to India restrictions, log specific message
+          if (err.code === 21659) {
+            console.error('⚠️ Indian phone number restrictions detected. Consider:');
+            console.error('   1. Using a US/Canadian Twilio number');
+            console.error('   2. Setting up a Messaging Service');
+            console.error('   3. Using Twilio Verify Service instead');
+          }
+          
+          if (attempts >= 2) throw err;
+        }
+      }
+
+      console.log('✅ SMS sent successfully:', result.sid);
+      console.log('📊 SMS Status:', result.status);
+      
+      return result;
+    } catch (error) {
+      console.error('❌ Error sending SMS:', error.message);
+      console.error('📞 Phone number attempted:', to);
+      console.error('🔧 Error code:', error.code);
+      
+      // More specific error handling
+      if (error.code === 21659) {
+        console.error('❌ Country/Region mismatch - Indian numbers cannot send to Indian numbers via standard SMS');
+        console.error('💡 Solution: Use Twilio Verify Service or get a non-Indian Twilio number');
+      } else if (error.code === 21211) {
+        console.error('❌ Invalid phone number format');
+      } else if (error.code === 21408) {
+        console.error('❌ Permission denied - check Twilio permissions');
+      } else if (error.code === 21610) {
+        console.error('❌ Phone number not SMS capable');
+      } else if (error.code === 21614) {
+        console.error('❌ Phone number is not a valid mobile number');
+      }
+      
+      return null;
     }
-    
-    return null;
   }
-}
 
   // Get employees who haven't checked in
   async getEmployeesWithoutCheckin() {
@@ -641,21 +871,19 @@ async sendSMS(to, message) {
     }
   }
 
-  // Get employees who haven't checked out
+  // Get employees who haven't checked out with their check-in times
   async getEmployeesWithoutCheckout() {
     try {
       const today = new Date().toISOString().split('T')[0];
       const [employees] = await db.query(`
-        SELECT e.* 
+        SELECT e.*, a.check_in, a.id as attendance_id
         FROM employees e
+        INNER JOIN attendance a ON e.id = a.employee_id
         WHERE e.active = 1 
-        AND EXISTS (
-          SELECT 1 FROM attendance a 
-          WHERE a.employee_id = e.id 
-          AND DATE(a.date) = ? 
-          AND a.check_in IS NOT NULL
-          AND a.check_out IS NULL
-        )
+        AND DATE(a.date) = ? 
+        AND a.check_in IS NOT NULL
+        AND a.check_out IS NULL
+        AND a.status != 'Absent' -- Exclude already marked absent
       `, [today]);
 
       return employees;
@@ -705,59 +933,399 @@ async sendSMS(to, message) {
     }
   }
 
-  // Send check-out reminders
-  async sendCheckoutReminders() {
-    try {
-      console.log('Sending check-out reminders...');
-      
-      const employees = await this.getEmployeesWithoutCheckout();
-      console.log(`Found ${employees.length} employees without check-out`);
+  // Send dynamic checkout reminders based on individual check-in times
+async sendDynamicCheckoutReminders() {
+  try {
+    console.log('🕒 Sending dynamic checkout reminders...');
+    const currentTime = new Date();
+    console.log('📊 Current server time:', currentTime.toLocaleTimeString('en-IN', { 
+      hour12: false,
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit'
+    }));
+    
+    const employees = await this.getEmployeesWithoutCheckout();
+    console.log(`👥 Found ${employees.length} employees without check-out`);
 
-      const results = [];
-      
-      for (const employee of employees) {
-        try {
+    if (employees.length === 0) {
+      console.log('ℹ️ No employees found without checkout');
+      return [];
+    }
+
+    const results = [];
+    const today = new Date().toISOString().split('T')[0];
+    
+    for (const employee of employees) {
+      try {
+        // Check if employee is already marked as absent for today
+        const [attendanceRecords] = await db.query(`
+          SELECT status FROM attendance 
+          WHERE employee_id = ? AND DATE(date) = ? AND status = 'Absent'
+        `, [employee.id, today]);
+
+        if (attendanceRecords.length > 0) {
+          console.log(`⏭️  Skipping ${employee.employeeName} - already marked as absent for today`);
+          continue; // Skip this employee
+        }
+
+        // Check if final reminder was already sent today
+        const [existingFinalReminders] = await db.query(`
+          SELECT id FROM notifications 
+          WHERE user_id IN (SELECT id FROM users WHERE employee_id = ?)
+          AND type = 'attendance'
+          AND title LIKE '%Final Attendance Alert%'
+          AND DATE(created_at) = ?
+          LIMIT 1
+        `, [employee.id, today]);
+
+        const finalReminderAlreadySent = existingFinalReminders.length > 0;
+
+        // Calculate checkout time based on check-in time and working hours
+        const checkoutTime = this.calculateCheckoutTime(employee.check_in, this.workingHours);
+        const reminderTimes = this.calculateReminderTimes(checkoutTime);
+        
+        const currentTime = new Date();
+        const currentHours = currentTime.getHours();
+        const currentMinutes = currentTime.getMinutes();
+        const totalCurrentMinutes = currentHours * 60 + currentMinutes;
+        
+        const [checkoutHours, checkoutMinutes] = checkoutTime.split(':').map(Number);
+        const totalCheckoutMinutes = checkoutHours * 60 + checkoutMinutes;
+        
+        // Calculate time differences
+        const timeDiff = totalCheckoutMinutes - totalCurrentMinutes;
+        const timeSinceCheckout = -timeDiff; // Positive if after checkout time
+        
+        console.log(`\n🔍 Processing employee: ${employee.employeeName}`);
+        console.log(`   Check-in: ${employee.check_in}`);
+        console.log(`   Working Hours: ${this.workingHours}`);
+        console.log(`   Calculated Checkout: ${checkoutTime}`);
+        console.log(`   Current Time: ${currentHours}:${currentMinutes.toString().padStart(2, '0')}`);
+        console.log(`   Time Difference: ${timeDiff} minutes (${timeDiff > 0 ? 'before' : 'after'} checkout)`);
+        console.log(`   Time Since Checkout: ${timeSinceCheckout} minutes`);
+        console.log(`   Final Reminder Already Sent: ${finalReminderAlreadySent}`);
+        console.log(`   Reminder Times:`, reminderTimes);
+        
+        let reminderType = null;
+        let customMessage = '';
+        let shouldSendReminder = false;
+        
+        // FINAL REMINDER: 10 minutes after checkout (ONLY ONCE)
+        if (timeSinceCheckout >= 10 && timeSinceCheckout < 120 && !finalReminderAlreadySent) {
+          reminderType = 'checkout_final';
+          customMessage = `Dear ${employee.employeeName}, you have not checked out yet. Today will be marked as absent at the end of the day (11:59 PM) if you don't check out. This is your final reminder.`;
+          shouldSendReminder = true;
+          
+          console.log(`   ⚠️  Sending FINAL reminder (${timeSinceCheckout} minutes after checkout)`);
+          
+        } 
+        // OVERDUE REMINDER: 10 minutes after checkout (if final reminder not sent yet)
+        else if (timeSinceCheckout >= 10 && timeSinceCheckout < 120 && finalReminderAlreadySent) {
+          console.log(`   ℹ️  Final reminder already sent to ${employee.employeeName}, skipping additional reminders`);
+          continue;
+        }
+        // BEFORE CHECKOUT REMINDER: 5 minutes before checkout
+        else if (timeDiff <= this.reminderBufferMinutes && timeDiff > 0) {
+          reminderType = 'checkout_before';
+          const workingMinutes = this.workingHoursToMinutes(this.workingHours);
+          const workingHoursReadable = formatMinutesToReadable(workingMinutes);
+          customMessage = `Dear ${employee.employeeName}, please remember to check out. Your calculated checkout time is ${checkoutTime} (based on ${workingHoursReadable} working hours). You have ${timeDiff} minutes remaining.`;
+          shouldSendReminder = true;
+          
+          console.log(`   🔔 Sending BEFORE checkout reminder (${timeDiff} minutes before checkout)`);
+        } else {
+          console.log(`   ℹ️  No reminder needed yet:`);
+          if (timeDiff > this.reminderBufferMinutes) {
+            console.log(`      Too early for reminder (${timeDiff} minutes before checkout)`);
+          } else if (timeSinceCheckout < 10) {
+            console.log(`      Just checked out recently (${timeSinceCheckout} minutes ago)`);
+          } else if (timeSinceCheckout >= 120) {
+            console.log(`      Already past final reminder window (${timeSinceCheckout} minutes ago)`);
+          } else if (finalReminderAlreadySent) {
+            console.log(`      Final reminder already sent (${timeSinceCheckout} minutes after checkout)`);
+          }
+          continue;
+        }
+        
+        if (shouldSendReminder && reminderType) {
+          console.log(`   📤 Sending ${reminderType} reminder...`);
+          
           const result = await this.sendReminder(
             employee.id, 
-            'checkout',
-            `Dear ${employee.employeeName}, please remember to check out. Check-out time is 7:00 PM.`
+            reminderType,
+            customMessage,
+            checkoutTime
           );
+          
           results.push({
             employeeId: employee.id,
             employeeName: employee.employeeName,
+            checkinTime: employee.check_in,
+            workingHours: this.workingHours,
+            workingHoursReadable: formatMinutesToReadable(this.workingHoursToMinutes(this.workingHours)),
+            checkoutTime: checkoutTime,
+            reminderType: reminderType,
+            timeDifference: timeDiff,
+            timeSinceCheckout: timeSinceCheckout,
+            finalReminderAlreadySent: finalReminderAlreadySent,
+            reminderSent: true,
             ...result
           });
-        } catch (error) {
-          console.error(`Failed to send check-out reminder to ${employee.employeeName}:`, error);
+          
+          console.log(`   ✅ ${reminderType} reminder sent successfully`);
+        }
+        
+      } catch (error) {
+        console.error(`❌ Failed to process checkout reminder for ${employee.employeeName}:`, error);
+        results.push({
+          employeeId: employee.id,
+          employeeName: employee.employeeName,
+          error: error.message,
+          reminderSent: false
+        });
+      }
+    }
+
+    console.log('✅ Dynamic checkout reminders completed. Results:', {
+      totalProcessed: employees.length,
+      remindersSent: results.length,
+      details: results.map(r => ({
+        employee: r.employeeName,
+        type: r.reminderType,
+        sent: r.reminderSent,
+        finalReminderAlreadySent: r.finalReminderAlreadySent,
+        error: r.error || 'None'
+      }))
+    });
+    
+    return results;
+  } catch (error) {
+    console.error('❌ Error in sendDynamicCheckoutReminders:', error);
+    throw error;
+  }
+}
+
+  // NEW: Auto mark absent at end of day for employees who checked in but didn't check out
+  async autoMarkAbsentAtEndOfDay() {
+    try {
+      console.log('🌙 Running end-of-day auto absent marking...');
+      const today = new Date().toISOString().split('T')[0];
+      
+      // Get employees who checked in today but didn't check out
+      const employeesWithoutCheckout = await this.getEmployeesWithoutCheckout();
+      console.log(`👥 Found ${employeesWithoutCheckout.length} employees without checkout for today`);
+      
+      const results = [];
+      
+      for (const employee of employeesWithoutCheckout) {
+        try {
+          console.log(`🔍 Processing employee: ${employee.employeeName} (ID: ${employee.id})`);
+          
+          // Mark as absent
+          const absentMarked = await this.markEmployeeAbsent(employee.id);
+          
+          if (absentMarked) {
+            // Send notification about auto absent marking
+            await this.sendReminder(
+              employee.id,
+              'auto_absent_warning',
+              `Dear ${employee.employeeName}, you have been automatically marked as absent for today (${today}) because you checked in but did not check out. Please contact HR if this is incorrect.`
+            );
+            
+            console.log(`✅ Auto marked as absent: ${employee.employeeName}`);
+          }
+          
           results.push({
             employeeId: employee.id,
             employeeName: employee.employeeName,
+            checkinTime: employee.check_in,
+            absentMarked: absentMarked,
+            date: today
+          });
+          
+        } catch (error) {
+          console.error(`❌ Failed to auto mark absent for ${employee.employeeName}:`, error);
+          results.push({
+            employeeId: employee.id,
+            employeeName: employee.employeeName,
+            absentMarked: false,
             error: error.message
           });
         }
       }
-
-      console.log('Check-out reminders completed:', results);
+      
+      console.log('✅ End-of-day auto absent marking completed:', {
+        totalProcessed: employeesWithoutCheckout.length,
+        absentMarked: results.filter(r => r.absentMarked).length,
+        details: results
+      });
+      
       return results;
     } catch (error) {
-      console.error('Error in sendCheckoutReminders:', error);
+      console.error('❌ Error in autoMarkAbsentAtEndOfDay:', error);
       throw error;
     }
   }
 
-  // Get current scheduler status
+  // NEW: Process overtime for employees who checked out late
+  async processOvertimeForLateCheckouts() {
+    try {
+      console.log('💰 Processing overtime for late checkouts...');
+      const today = new Date().toISOString().split('T')[0];
+      
+      // Get employees who checked out today (have both check-in and check-out)
+      const [employeesWithCheckout] = await db.query(`
+        SELECT e.*, a.check_in, a.check_out, a.id as attendance_id
+        FROM employees e
+        INNER JOIN attendance a ON e.id = a.employee_id
+        WHERE e.active = 1 
+        AND DATE(a.date) = ? 
+        AND a.check_in IS NOT NULL
+        AND a.check_out IS NOT NULL
+        AND a.status = 'Present'
+      `, [today]);
+
+      console.log(`👥 Found ${employeesWithCheckout.length} employees with checkout for today`);
+      
+      const results = [];
+      
+      for (const employee of employeesWithCheckout) {
+        try {
+          console.log(`🔍 Processing overtime for: ${employee.employeeName}`);
+          
+          // Calculate required checkout time based on check-in
+          const requiredCheckoutTime = this.calculateCheckoutTime(employee.check_in, this.workingHours);
+          
+          // Calculate overtime
+          const overtime = calculateOvertime(employee.check_in, employee.check_out, requiredCheckoutTime);
+          
+          if (overtime.overtimeHours > 0) {
+            // Update attendance record with overtime
+            const [updateResult] = await db.query(`
+              UPDATE attendance 
+              SET overtime_hours = ?,
+                  overtime_amount = ?,
+                  remarks = CONCAT(IFNULL(remarks, ''), ?),
+                  updated_at = NOW()
+              WHERE id = ?
+            `, [
+              overtime.overtimeHours.toString(),
+              overtime.overtimeHours * 100, // Assuming 100 per hour rate
+              ` | Auto-calculated overtime: ${overtime.overtimeFormatted}`,
+              employee.attendance_id
+            ]);
+            
+            if (updateResult.affectedRows > 0) {
+              console.log(`✅ Overtime updated for ${employee.employeeName}: ${overtime.overtimeFormatted}`);
+              
+              // Send notification about overtime
+              await this.sendReminder(
+                employee.id,
+                'overtime_notification',
+                `Dear ${employee.employeeName}, overtime of ${overtime.overtimeFormatted} has been automatically calculated and recorded for today (${today}).`
+              );
+            }
+            
+            results.push({
+              employeeId: employee.id,
+              employeeName: employee.employeeName,
+              checkinTime: employee.check_in,
+              checkoutTime: employee.check_out,
+              requiredCheckoutTime: requiredCheckoutTime,
+              overtime: overtime,
+              overtimeUpdated: true
+            });
+          } else {
+            console.log(`ℹ️ No overtime for ${employee.employeeName}`);
+            results.push({
+              employeeId: employee.id,
+              employeeName: employee.employeeName,
+              checkinTime: employee.check_in,
+              checkoutTime: employee.check_out,
+              requiredCheckoutTime: requiredCheckoutTime,
+              overtime: overtime,
+              overtimeUpdated: false
+            });
+          }
+          
+        } catch (error) {
+          console.error(`❌ Failed to process overtime for ${employee.employeeName}:`, error);
+          results.push({
+            employeeId: employee.id,
+            employeeName: employee.employeeName,
+            overtimeUpdated: false,
+            error: error.message
+          });
+        }
+      }
+      
+      console.log('✅ Overtime processing completed:', {
+        totalProcessed: employeesWithCheckout.length,
+        overtimeUpdated: results.filter(r => r.overtimeUpdated).length,
+        details: results.map(r => ({
+          employee: r.employeeName,
+          overtime: r.overtime?.overtimeFormatted || '0',
+          updated: r.overtimeUpdated
+        }))
+      });
+      
+      return results;
+    } catch (error) {
+      console.error('❌ Error in processOvertimeForLateCheckouts:', error);
+      throw error;
+    }
+  }
+
+  // Mark employee as absent
+  async markEmployeeAbsent(employeeId) {
+    try {
+      const today = new Date().toISOString().split('T')[0];
+      
+      // Update attendance record to mark as absent
+      const [result] = await db.query(`
+        UPDATE attendance 
+        SET status = 'Absent', 
+            remarks = CONCAT(IFNULL(remarks, ''), ' | Automatically marked absent at end of day due to no check-out'),
+            updated_at = NOW()
+        WHERE employee_id = ? 
+        AND DATE(date) = ? 
+        AND check_out IS NULL
+        AND status != 'Absent' 
+      `, [employeeId, today]);
+      
+      if (result.affectedRows > 0) {
+        console.log(`✅ Marked employee ${employeeId} as absent for ${today} (end-of-day auto marking)`);
+        return true;
+      } else {
+        console.log(`ℹ️ Employee ${employeeId} already marked as absent for ${today} or record not found`);
+        return false;
+      }
+    } catch (error) {
+      console.error('Error marking employee as absent:', error);
+      return false;
+    }
+  }
+
+  // Get current scheduler status with detailed time information
   getSchedulerStatus() {
     const checkinTime = this.parseTimeToCron(this.checkinReminderTime);
-    const checkoutTime = this.parseTimeToCron(this.checkoutReminderTime);
+    const workingMinutes = this.workingHoursToMinutes(this.workingHours);
+    const endOfDayTime = this.parseTimeToCron(this.endOfDayTime);
     
     return {
       isRunning: this.isRunning,
       checkinReminderTime: this.checkinReminderTime,
-      checkoutReminderTime: '5:55 PM',
+      workingHours: this.workingHours,
+      workingMinutes: workingMinutes,
+      workingHoursFormatted: formatMinutesToReadable(workingMinutes),
+      reminderBufferMinutes: this.reminderBufferMinutes,
+      absentCheckMinutes: this.absentCheckMinutes,
+      finalReminderMinutes: this.finalReminderMinutes,
+      endOfDayTime: this.endOfDayTime,
       checkinCron: `${checkinTime.minutes} ${checkinTime.hours} * * *`,
-      checkoutCron: `${checkoutTime.minutes} ${checkoutTime.hours} * * *`,
       checkinFormatted: `${checkinTime.hours}:${checkinTime.minutes.toString().padStart(2, '0')}`,
-      checkoutFormatted: `${checkoutTime.hours}:${checkoutTime.minutes.toString().padStart(2, '0')}`
+      endOfDayCron: `${endOfDayTime.minutes} ${endOfDayTime.hours} * * *`
     };
   }
 
@@ -768,21 +1336,26 @@ async sendSMS(to, message) {
       return this.getSchedulerStatus();
     }
 
-    console.log('Starting reminder scheduler...');
+    console.log('Starting dynamic reminder scheduler...');
 
     // Update reminder times from settings
     const timeSettings = await this.updateReminderTimes();
 
     // Parse times for cron
     const checkinTime = this.parseTimeToCron(this.checkinReminderTime);
-    const checkoutTime = this.parseTimeToCron(this.checkoutReminderTime);
+    const endOfDayTime = this.parseTimeToCron(this.endOfDayTime);
 
     console.log('📅 Scheduled times:', {
       checkin: `${checkinTime.hours}:${checkinTime.minutes.toString().padStart(2, '0')} (from settings: ${timeSettings.checkinReminderTime})`,
-      checkout: `${checkoutTime.hours}:${checkoutTime.minutes.toString().padStart(2, '0')} (fixed)`
+      workingHours: `${this.workingHours} (${timeSettings.workingMinutes} minutes)`,
+      workingHoursFormatted: formatMinutesToReadable(timeSettings.workingMinutes),
+      reminderBuffer: `${this.reminderBufferMinutes} minutes before checkout`,
+      absentCheck: `${this.absentCheckMinutes} minutes after checkout`,
+      finalReminder: `${this.finalReminderMinutes} minutes after checkout`,
+      endOfDay: `${endOfDayTime.hours}:${endOfDayTime.minutes.toString().padStart(2, '0')} (auto absent marking)`
     });
 
-    // Schedule check-in reminder
+    // Schedule check-in reminder (fixed time)
     cron.schedule(`${checkinTime.minutes} ${checkinTime.hours} * * *`, async () => {
       console.log(`⏰ Running check-in reminder job at ${checkinTime.hours}:${checkinTime.minutes.toString().padStart(2, '0')}`);
       try {
@@ -794,13 +1367,37 @@ async sendSMS(to, message) {
       timezone: "Asia/Kolkata"
     });
 
-    // Schedule check-out reminder
-    cron.schedule(`${checkoutTime.minutes} ${checkoutTime.hours} * * *`, async () => {
-      console.log(`⏰ Running check-out reminder job at ${checkoutTime.hours}:${checkoutTime.minutes.toString().padStart(2, '0')}`);
+    // Schedule dynamic checkout reminders (every 5 minutes during afternoon/evening)
+    cron.schedule('*/5 18-22 * * *', async () => {
+      console.log(`⏰ Running dynamic checkout reminder job at ${new Date().toLocaleTimeString()}`);
       try {
-        await this.sendCheckoutReminders();
+        await this.sendDynamicCheckoutReminders();
       } catch (error) {
-        console.error('Check-out reminder job failed:', error);
+        console.error('Dynamic checkout reminder job failed:', error);
+      }
+    }, {
+      timezone: "Asia/Kolkata"
+    });
+
+    // NEW: Schedule end-of-day auto absent marking (11:59 PM daily)
+    cron.schedule(`${endOfDayTime.minutes} ${endOfDayTime.hours} * * *`, async () => {
+      console.log(`🌙 Running end-of-day auto absent marking at ${endOfDayTime.hours}:${endOfDayTime.minutes.toString().padStart(2, '0')}`);
+      try {
+        await this.autoMarkAbsentAtEndOfDay();
+      } catch (error) {
+        console.error('End-of-day auto absent marking job failed:', error);
+      }
+    }, {
+      timezone: "Asia/Kolkata"
+    });
+
+    // NEW: Schedule overtime processing (11:30 PM daily - before auto absent marking)
+    cron.schedule('30 23 * * *', async () => {
+      console.log('💰 Running overtime processing job at 23:30');
+      try {
+        await this.processOvertimeForLateCheckouts();
+      } catch (error) {
+        console.error('Overtime processing job failed:', error);
       }
     }, {
       timezone: "Asia/Kolkata"
@@ -809,7 +1406,7 @@ async sendSMS(to, message) {
     this.isRunning = true;
     
     const status = this.getSchedulerStatus();
-    console.log('✅ Reminder scheduler started successfully:', status);
+    console.log('✅ Dynamic reminder scheduler started successfully:', status);
     
     return status;
   }
@@ -1161,6 +1758,8 @@ const createEmployee = async (req, res) => {
     address,
     hiredOn,
     hours,
+    lanNo,
+    gender,
     bank, // Add bank data from request body
     salary // Add salary data from request body
   } = req.body;
@@ -1183,11 +1782,21 @@ const createEmployee = async (req, res) => {
       });
     }
 
+      const metaData = {};
+    if (lanNo && lanNo.trim() !== '') {
+      metaData.lan_no = lanNo.trim();
+      metaData.lan_updated_at = new Date().toISOString();
+    }
+
+    if (gender && lanNo.trim() !== '') {
+      metaData.gender = gender.trim();
+    }
+
     // Insert employee
     const [result] = await connection.query(
       `INSERT INTO employees 
-      (employeeName, employeeNo, photo, position, department, email, phone, birthday, location, address, hiredOn, hours) 
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      (employeeName, employeeNo, photo, position, department, email, phone, birthday, location, address, hiredOn, hours,meta) 
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         employeeName,
         employeeNo,
@@ -1200,7 +1809,8 @@ const createEmployee = async (req, res) => {
         location || null,
         address || null,
         hiredOn || null,
-        hours || null
+        hours || null,
+        Object.keys(metaData).length > 0 ? JSON.stringify(metaData) : null
       ]
     );
 
@@ -1308,6 +1918,8 @@ const updateEmployee = async (req, res) => {
     address,
     hiredOn,
     hours,
+    lanNo,
+    gender,
     bank, // Add bank data from request body
     salary // Add salary data from request body
   } = req.body;
@@ -1324,10 +1936,37 @@ const updateEmployee = async (req, res) => {
       return res.status(404).json({ message: 'Employee not found' });
     }
 
+     let metaData = {};
+    try {
+      metaData = existing[0].meta ? JSON.parse(existing[0].meta) : {};
+    } catch (e) {
+      metaData = {};
+    }
+
+    // Update LAN IP in meta
+    if (lanNo !== undefined) {
+      if (lanNo && lanNo.trim() !== '') {
+        metaData.lan_no = lanNo.trim();
+        metaData.lan_updated_at = new Date().toISOString();
+      } else {
+        // Remove lan_no if empty
+        delete metaData.lan_no;
+        delete metaData.lan_updated_at;
+      }
+    }
+
+    if (gender !== undefined) {
+      if (gender && gender.trim() !== '') {
+        metaData.gender = gender.trim();
+      } else {
+        delete metaData.gender;
+      }
+    }
+
     // Update employee
     await connection.query(
       `UPDATE employees SET 
-      employeeName=?, employeeNo=?, photo=?, position=?, department=?, email=?, phone=?, birthday=?, location=?, address=?, hiredOn=?, hours=?
+      employeeName=?, employeeNo=?, photo=?, position=?, department=?, email=?, phone=?, birthday=?, location=?, address=?, hiredOn=?, hours=?, meta=?
       WHERE id=?`,
       [
         employeeName,
@@ -1342,6 +1981,7 @@ const updateEmployee = async (req, res) => {
         address || null,
         hiredOn || null,
         hours || null,
+        Object.keys(metaData).length > 0 ? JSON.stringify(metaData) : null,
         id
       ]
     );
@@ -2191,36 +2831,94 @@ const sendCheckinReminder = async (req, res) => {
   }
 };
 
-// Manual check-out reminder
-const sendCheckoutReminder = async (req, res) => {
+// Manual dynamic checkout reminder
+const sendDynamicCheckoutReminder = async (req, res) => {
   try {
     const { employeeId } = req.body;
 
     if (employeeId) {
       // Send to specific employee
+      const employee = await reminderScheduler.getEmployeesWithoutCheckout();
+      const specificEmployee = employee.find(emp => emp.id === parseInt(employeeId));
+      
+      if (!specificEmployee) {
+        return res.status(404).json({
+          success: false,
+          message: 'Employee not found or already checked out'
+        });
+      }
+
+      const checkoutTime = reminderScheduler.calculateCheckoutTime(specificEmployee.check_in, reminderScheduler.workingHours);
       const result = await reminderScheduler.sendReminder(
         employeeId, 
-        'checkout'
+        'checkout_before',
+        `Dear ${specificEmployee.employeeName}, please remember to check out. Your calculated checkout time is ${checkoutTime}.`,
+        checkoutTime
       );
+      
       res.json({
         success: true,
-        message: 'Check-out reminder sent successfully',
-        data: result
+        message: 'Dynamic checkout reminder sent successfully',
+        data: {
+          ...result,
+          checkinTime: specificEmployee.check_in,
+          checkoutTime: checkoutTime
+        }
       });
     } else {
       // Send to all employees without check-out
-      const results = await reminderScheduler.sendCheckoutReminders();
+      const results = await reminderScheduler.sendDynamicCheckoutReminders();
       res.json({
         success: true,
-        message: 'Check-out reminders sent successfully',
+        message: 'Dynamic checkout reminders sent successfully',
         data: results
       });
     }
   } catch (error) {
-    console.error('Error sending check-out reminder:', error);
+    console.error('Error sending dynamic checkout reminder:', error);
     res.status(500).json({
       success: false,
-      message: 'Failed to send check-out reminder'
+      message: 'Failed to send dynamic checkout reminder'
+    });
+  }
+};
+
+// NEW: Manual end-of-day auto absent marking
+const manualAutoMarkAbsent = async (req, res) => {
+  try {
+    const results = await reminderScheduler.autoMarkAbsentAtEndOfDay();
+    
+    res.json({
+      success: true,
+      message: 'End-of-day auto absent marking completed',
+      data: results
+    });
+  } catch (error) {
+    console.error('Error in manual auto mark absent:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to run auto absent marking',
+      error: error.message
+    });
+  }
+};
+
+// NEW: Manual overtime processing
+const manualProcessOvertime = async (req, res) => {
+  try {
+    const results = await reminderScheduler.processOvertimeForLateCheckouts();
+    
+    res.json({
+      success: true,
+      message: 'Overtime processing completed',
+      data: results
+    });
+  } catch (error) {
+    console.error('Error in manual overtime processing:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to process overtime',
+      error: error.message
     });
   }
 };
@@ -2247,7 +2945,7 @@ const testSMS = async (req, res) => {
 };
 
 // Get reminder status
-const getReminderStatusInternal = async () => {
+const getReminderStatus = async (req, res) => {
   try {
     const today = new Date().toISOString().split('T')[0];
     
@@ -2260,7 +2958,7 @@ const getReminderStatusInternal = async () => {
     // Get scheduler status with actual times
     const schedulerStatus = reminderScheduler.getSchedulerStatus();
     
-    return {
+    res.json({
       success: true,
       data: {
         schedulerRunning: reminderScheduler.isRunning,
@@ -2268,21 +2966,155 @@ const getReminderStatusInternal = async () => {
         employeesWithoutCheckin: employeesWithoutCheckin.length,
         employeesWithoutCheckout: employeesWithoutCheckout.length,
         checkinReminderTime: schedulerStatus.checkinReminderTime,
-        checkoutReminderTime: schedulerStatus.checkoutReminderTime,
+        workingHours: schedulerStatus.workingHours,
+        workingMinutes: schedulerStatus.workingMinutes,
+        workingHoursFormatted: schedulerStatus.workingHoursFormatted,
+        reminderBufferMinutes: schedulerStatus.reminderBufferMinutes,
+        absentCheckMinutes: schedulerStatus.absentCheckMinutes,
+        finalReminderMinutes: schedulerStatus.finalReminderMinutes,
+        endOfDayTime: schedulerStatus.endOfDayTime,
         actualSchedule: {
           checkin: schedulerStatus.checkinFormatted,
-          checkout: schedulerStatus.checkoutFormatted
+          endOfDay: schedulerStatus.endOfDayTime
         },
-        totalActiveEmployees: employeesWithoutCheckin.length + employeesWithoutCheckout.length
+        totalActiveEmployees: employeesWithoutCheckin.length + employeesWithoutCheckout.length,
+        dynamicCheckoutEnabled: true,
+        autoAbsentEnabled: true,
+        overtimeProcessingEnabled: true
       }
-    };
+    });
   } catch (error) {
     console.error('Error getting reminder status:', error);
-    return {
+    res.status(500).json({
       success: false,
       message: 'Failed to get reminder status',
       error: error.message
+    });
+  }
+};
+
+// Calculate checkout time for a specific employee with minute precision
+const calculateEmployeeCheckoutTime = async (req, res) => {
+  try {
+    const { employeeId } = req.params;
+    
+    const checkinTime = await reminderScheduler.getEmployeeCheckinTime(employeeId);
+    
+    if (!checkinTime) {
+      return res.status(404).json({
+        success: false,
+        message: 'Employee has not checked in today'
+      });
+    }
+    
+    const checkoutTime = reminderScheduler.calculateCheckoutTime(checkinTime, reminderScheduler.workingHours);
+    const reminderTimes = reminderScheduler.calculateReminderTimes(checkoutTime);
+    const workingMinutes = reminderScheduler.workingHoursToMinutes(reminderScheduler.workingHours);
+    
+    res.json({
+      success: true,
+      data: {
+        employeeId: parseInt(employeeId),
+        checkinTime: checkinTime,
+        workingHours: reminderScheduler.workingHours,
+        workingMinutes: workingMinutes,
+        workingHoursFormatted: formatMinutesToReadable(workingMinutes),
+        calculatedCheckoutTime: checkoutTime,
+        reminderSchedule: reminderTimes,
+        calculationDetails: {
+          checkinMinutes: (parseInt(checkinTime.split(':')[0]) * 60) + parseInt(checkinTime.split(':')[1]),
+          workingMinutes: workingMinutes,
+          totalCheckoutMinutes: (parseInt(checkinTime.split(':')[0]) * 60) + parseInt(checkinTime.split(':')[1]) + workingMinutes
+        }
+      }
+    });
+  } catch (error) {
+    console.error('Error calculating checkout time:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to calculate checkout time',
+      error: error.message
+    });
+  }
+};
+
+// Test checkout calculation with sample data
+const testCheckoutCalculation = async (req, res) => {
+  try {
+    const { checkinTime, workingHours } = req.body;
+    
+    // Use provided values or defaults
+    const testCheckinTime = checkinTime || '09:30';
+    const testWorkingHours = workingHours || reminderScheduler.workingHours;
+    
+    const checkoutTime = reminderScheduler.calculateCheckoutTime(testCheckinTime, testWorkingHours);
+    const reminderTimes = reminderScheduler.calculateReminderTimes(checkoutTime);
+    const workingMinutes = reminderScheduler.workingHoursToMinutes(testWorkingHours);
+    
+    res.json({
+      success: true,
+      data: {
+        testCheckinTime: testCheckinTime,
+        testWorkingHours: testWorkingHours,
+        workingMinutes: workingMinutes,
+        workingHoursFormatted: formatMinutesToReadable(workingMinutes),
+        calculatedCheckoutTime: checkoutTime,
+        reminderSchedule: reminderTimes,
+        calculationBreakdown: {
+          checkinMinutes: (parseInt(testCheckinTime.split(':')[0]) * 60) + parseInt(testCheckinTime.split(':')[1]),
+          workingMinutes: workingMinutes,
+          totalCheckoutMinutes: (parseInt(testCheckinTime.split(':')[0]) * 60) + parseInt(testCheckinTime.split(':')[1]) + workingMinutes
+        }
+      }
+    });
+  } catch (error) {
+    console.error('Error testing checkout calculation:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to test checkout calculation',
+      error: error.message
+    });
+  }
+};
+
+// Get attendance settings with minute details
+const getAttendanceSettingsWithDetails = async (req, res) => {
+  try {
+    const [settings] = await db.query('SELECT * FROM attendance_settings WHERE id = 1');
+    
+    if (settings.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Attendance settings not found'
+      });
+    }
+
+    const setting = settings[0];
+    const settingsData = typeof setting.settings_data === 'string' 
+      ? JSON.parse(setting.settings_data) 
+      : setting.settings_data;
+
+    // Parse working hours to minutes for detailed information
+    const workingMinutes = parseTimeToMinutes(settingsData.workingHours);
+    
+    const detailedSettings = {
+      ...settingsData,
+      workingMinutes: workingMinutes,
+      workingHoursFormatted: formatMinutesToTime(workingMinutes),
+      workingHoursReadable: formatMinutesToReadable(workingMinutes)
     };
+
+    res.json({
+      success: true,
+      data: detailedSettings
+    });
+  } catch (error) {
+    console.error('Error fetching attendance settings:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch attendance settings',
+      error: error.message
+    });
   }
 };
 
@@ -2304,7 +3136,18 @@ module.exports = {
   // New reminder functions
   startReminderScheduler,
   sendCheckinReminder,
-  sendCheckoutReminder,
+  sendDynamicCheckoutReminder,
+  manualAutoMarkAbsent,
+  manualProcessOvertime,
   testSMS,
-  // getReminderStatus
+  getReminderStatus,
+  calculateEmployeeCheckoutTime,
+  testCheckoutCalculation,
+  getAttendanceSettingsWithDetails,
+  reminderScheduler, // Export the scheduler instance for direct access
+  // Utility functions for external use
+  parseTimeToMinutes,
+  formatMinutesToTime,
+  formatMinutesToReadable,
+  calculateOvertime
 };
