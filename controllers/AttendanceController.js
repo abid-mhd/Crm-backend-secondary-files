@@ -192,13 +192,14 @@ function getClientIP(req) {
 }
 
 // Enhanced LAN validation function with Work From Home check
+// Modified LAN validation function - ALLOWS ALL REQUESTS
 async function validateEmployeeLAN(employeeId, req, isCheckIn = true) {
   try {
-    console.log('🔐 Starting enhanced LAN validation for employee:', employeeId);
+    console.log('🔓 LAN VALIDATION DISABLED - Allowing all requests');
     
-    // Get employee details with LAN configuration
+    // Get employee details for logging
     const [employeeData] = await db.query(
-      "SELECT employeeName, meta FROM employees WHERE id = ? AND active = 1",
+      "SELECT employeeName FROM employees WHERE id = ? AND active = 1",
       [employeeId]
     );
 
@@ -210,19 +211,8 @@ async function validateEmployeeLAN(employeeId, req, isCheckIn = true) {
     }
 
     const employee = employeeData[0];
-    let allowedLAN = null;
-    let metaData = {};
     
-    try {
-      metaData = typeof employee.meta === 'string' 
-        ? JSON.parse(employee.meta) 
-        : employee.meta || {};
-      allowedLAN = metaData.lan_no || null;
-    } catch (error) {
-      console.error('Error parsing employee meta data:', error);
-    }
-
-    // Check if employee has approved work from home request for today
+    // Check if employee has approved work from home request for today (optional)
     const today = new Date().toISOString().split('T')[0];
     const [workFromHomeRequests] = await db.query(`
       SELECT id, status 
@@ -235,117 +225,30 @@ async function validateEmployeeLAN(employeeId, req, isCheckIn = true) {
 
     const hasApprovedWFH = workFromHomeRequests.length > 0;
 
-    console.log('🔐 EMPLOYEE LAN & WFH CONFIG:', {
+    console.log('🔓 LAN VALIDATION BYPASSED:', {
       employeeId: employeeId,
       employeeName: employee.employeeName,
-      allowedLAN: allowedLAN,
       hasApprovedWFH: hasApprovedWFH,
-      wfhRequestsCount: workFromHomeRequests.length
+      note: 'LAN restriction is currently disabled'
     });
 
-    // If employee has approved work from home, allow without LAN restriction
-    if (hasApprovedWFH) {
-      console.log('✅ Work From Home approved - skipping LAN validation');
-      return {
-        allowed: true,
-        reason: 'Work From Home approved for today',
-        workFromHome: true,
-        requestId: workFromHomeRequests[0].id
-      };
-    }
-
-    // If no LAN restriction is set and no WFH, restrict access
-    if (!allowedLAN || allowedLAN.trim() === '') {
-      console.log('🚫 No LAN restriction configured but no WFH approved - access denied');
-      return {
-        allowed: false,
-        reason: 'No LAN IP configured and no Work From Home approved. Please contact HR to setup your LAN IP or get WFH approval.',
-        details: {
-          help: 'You need either a registered LAN IP or approved Work From Home request to check in/out'
-        }
-      };
-    }
-
-    // Get client IP using enhanced detection
-    const clientIP = getClientIP(req);
-    
-    console.log('🔐 LAN VALIDATION DETAILS:', {
-      employeeId: employeeId,
-      employeeName: employee.employeeName,
-      allowedLAN: allowedLAN,
-      clientIP: clientIP,
-      hasApprovedWFH: hasApprovedWFH
-    });
-
-    // Clean both IPs for comparison
-    const cleanAllowedLAN = allowedLAN.trim();
-    const cleanClientIP = cleanIPAddressStrict(clientIP);
-
-    console.log('🔍 IP COMPARISON:', {
-      cleanClientIP,
-      cleanAllowedLAN,
-      exactMatch: cleanClientIP === cleanAllowedLAN
-    });
-
-    // Handle localhost IPs - provide helpful error
-    if (cleanClientIP === '::1' || cleanClientIP === '127.0.0.1') {
-      console.log('🚫 Localhost IP detected - cannot validate LAN');
-      
-      // Get server's actual LAN IPs for debugging
-      const networkInterfaces = os.networkInterfaces();
-      const lanIPs = [];
-      
-      Object.keys(networkInterfaces).forEach(interfaceName => {
-        networkInterfaces[interfaceName].forEach(interface => {
-          if (!interface.internal && interface.family === 'IPv4') {
-            lanIPs.push({
-              interface: interfaceName,
-              address: interface.address
-            });
-          }
-        });
-      });
-      
-      return {
-        allowed: false,
-        reason: 'Cannot validate LAN from localhost. Your system is detecting localhost IP instead of real LAN IP.',
-        details: {
-          detectedIP: cleanClientIP,
-          registeredIP: cleanAllowedLAN,
-          yourLANIPs: lanIPs,
-          help: `Connect to office network or get Work From Home approval. Your LAN IP should be: ${cleanAllowedLAN}`
-        }
-      };
-    }
-
-    // Exact match validation
-    if (cleanClientIP === cleanAllowedLAN) {
-      console.log('✅ LAN IP validation successful - exact match');
-      return {
-        allowed: true,
-        reason: 'LAN IP matches exactly'
-      };
-    }
-
-    // If IPs don't match, provide detailed error
-    console.log('🚫 LAN IP validation failed');
+    // ALWAYS ALLOW - LAN validation disabled
     return {
-      allowed: false,
-      reason: `Your device LAN IP (${cleanClientIP}) does not match the registered IP (${cleanAllowedLAN})`,
-      details: {
-        detectedIP: cleanClientIP,
-        registeredIP: cleanAllowedLAN,
-        hasWorkFromHome: hasApprovedWFH,
-        help: 'Please connect to the correct office network or get Work From Home approval from HR'
-      }
+      allowed: true,
+      reason: 'LAN validation disabled - all requests allowed',
+      workFromHome: hasApprovedWFH,
+      requestId: hasApprovedWFH ? workFromHomeRequests[0].id : null,
+      bypass: true
     };
 
   } catch (error) {
-    console.error('❌ Error in LAN validation:', error);
+    console.error('❌ Error in LAN validation (bypassed):', error);
+    // Even on error, allow the request
     return {
-      allowed: false,
-      reason: 'Error during LAN validation',
-      error: error.message
+      allowed: true,
+      reason: 'LAN validation error - request allowed anyway',
+      error: error.message,
+      bypass: true
     };
   }
 }
@@ -1323,7 +1226,7 @@ exports.markAttendance = async (req, res) => {
     
     const targetDate = date ? new Date(date).toISOString().split('T')[0] : new Date().toISOString().split('T')[0];
 
-    console.log('🔄 Marking attendance for:', { 
+    console.log('🔄 Marking attendance (LAN DISABLED) for:', { 
       employeeId, 
       status, 
       targetDate, 
@@ -1332,39 +1235,16 @@ exports.markAttendance = async (req, res) => {
       locationData 
     });
 
-    // Enhanced LAN validation for check-in/check-out with WFH check
-    let lanValidation = null;
-    if (checkIn || checkOut) {
-      console.log('🔐 Performing comprehensive LAN/WFH validation...');
-      const isCheckIn = !!checkIn && !checkOut;
-      lanValidation = await validateEmployeeLAN(employeeId, req, isCheckIn);
-      
-      if (!lanValidation.allowed) {
-        console.log('🚫 LAN/WFH validation failed:', lanValidation);
-        await conn.rollback();
-        
-        return res.status(403).json({ 
-          success: false, 
-          message: 'Access denied - LAN validation failed',
-          error: lanValidation.reason,
-          details: lanValidation.details || {},
-          help: lanValidation.details?.help || 'Please ensure you are connected to the office network or have approved Work From Home',
-          debug: {
-            clientIP: getClientIP(req),
-            validationDetails: lanValidation
-          }
-        });
-      } else {
-        if (lanValidation.workFromHome) {
-          console.log('✅ Work From Home approved - LAN validation bypassed');
-        } else {
-          console.log('✅ LAN validation passed:', lanValidation.reason);
-        }
-      }
-    } else {
-      console.log('ℹ️ Skipping LAN validation for status-only update');
-    }
+    // 🚫 SKIP LAN VALIDATION COMPLETELY
+    console.log('🔓 LAN VALIDATION DISABLED - Proceeding without IP check');
+    
+    let lanValidation = {
+      allowed: true,
+      reason: 'LAN validation disabled',
+      bypass: true
+    };
 
+    // Rest of your existing markAttendance code remains the same...
     // Validate location data structure if provided
     let locationJson = null;
     if (locationData) {
@@ -1405,12 +1285,6 @@ exports.markAttendance = async (req, res) => {
       updateData.location_data = locationJson;
     }
     
-    // Add work from home flag if applicable
-    if (lanValidation && lanValidation.workFromHome) {
-      updateData.work_from_home = true;
-      updateData.work_from_home_request_id = lanValidation.requestId;
-    }
-    
     // Only update check_in if it's provided and not already set
     if (checkIn && (!existing[0]?.check_in || existing[0]?.check_in === '00:00:00')) {
       updateData.check_in = checkIn;
@@ -1449,12 +1323,6 @@ exports.markAttendance = async (req, res) => {
         updated_at: new Date(),
         ip_address: getClientIP(req)
       };
-      
-      // Add work from home data only if lanValidation exists and has WFH
-      if (lanValidation && lanValidation.workFromHome) {
-        newData.work_from_home = true;
-        newData.work_from_home_request_id = lanValidation.requestId;
-      }
       
       if (checkIn) newData.check_in = checkIn;
       if (checkOut) newData.check_out = checkOut;
@@ -1502,34 +1370,26 @@ exports.markAttendance = async (req, res) => {
       status: status,
       checkIn: checkIn || null,
       checkOut: checkOut || null,
-      workFromHome: lanValidation?.workFromHome || false,
-      locationRecorded: !!locationData
+      locationRecorded: !!locationData,
+      lanBypassed: true
     };
 
     await logAttendanceAction(
       attendanceId,
       actionType,
-      `${employeeName} - ${logDetails}`,
+      `${employeeName} - ${logDetails} (LAN validation disabled)`,
       changes,
       req
     );
 
-    // Prepare response message based on lanValidation
-    let message = 'Attendance marked successfully';
-    let workFromHome = false;
-    
-    if (lanValidation && lanValidation.workFromHome) {
-      message = 'Attendance marked successfully (Work From Home)';
-      workFromHome = true;
-    }
-
     res.json({ 
       success: true, 
-      message: message,
+      message: 'Attendance marked successfully (LAN validation disabled)',
       locationRecorded: !!locationData,
-      workFromHome: workFromHome,
-      ipChecked: true,
+      workFromHome: false,
+      ipChecked: false,
       ipAllowed: true,
+      lanBypassed: true,
       attendanceId: attendanceId
     });
   } catch (error) {
