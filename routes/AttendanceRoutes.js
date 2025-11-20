@@ -36,9 +36,5 @@ router.get('/my-attendance', attendanceController.getMyAttendance);
 router.get('/my-summary',  attendanceController.getMyAttendanceSummary);
 router.get('/my-stats',  attendanceController.getMyAttendanceStats);
 
-// Attendance log routes
-router.get('/logs/:attendanceId', attendanceController.getAttendanceLogs);
-router.get('/logs', attendanceController.getAllAttendanceLogs);
-router.get('/logs-stats', attendanceController.getAttendanceLogStats);
 
 module.exports = router;

@@ -3,8 +3,6 @@ const router = express.Router();
 const employeeController = require('../controllers/employeeController');
 const attendanceController = require('../controllers/AttendanceController');
 const authController = require('../controllers/authController');
-const auth = require('../middleware/authMiddleware');
-
 
 router.get('/', employeeController.getAllEmployees);
 router.get('/:id', employeeController.getEmployeeById);
@@ -33,7 +31,6 @@ router.get('/attendance/mark',attendanceController.markAttendance);
 router.post('/:id/send-invite', employeeController.sendStaffInvite);
 router.get('/validate-invitation', employeeController.validateInvitation);
 router.post('/complete-invitation', employeeController.completeInvitation);
-
 
 router.post('/import', 
   employeeController.upload.single('file'), 
