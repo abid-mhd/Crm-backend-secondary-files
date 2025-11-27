@@ -79,6 +79,47 @@ function isWeeklyOff(date, settings) {
   return settings.weeklyOff[dayName] === true;
 }
 
+// TEMPORARY FUNCTION: Helper to get week of month (1st, 2nd, 3rd, 4th, 5th) - FOR MANUAL BACKFILL ONLY
+function getWeekOfMonth(date) {
+  const firstDayOfMonth = new Date(date.getFullYear(), date.getMonth(), 1);
+  const firstDayOfWeek = firstDayOfMonth.getDay(); // 0 = Sunday
+  
+  const offset = firstDayOfWeek === 0 ? 6 : firstDayOfWeek - 1; // Adjust for Monday start
+  const dayOfMonth = date.getDate();
+  
+  return Math.ceil((dayOfMonth + offset) / 7);
+}
+
+// TEMPORARY FUNCTION: Get working days with alternative Saturdays - FOR MANUAL BACKFILL ONLY
+function getWorkingDaysWithAlternativeSaturdays(startDate, endDate) {
+  const workingDays = [];
+  const current = new Date(startDate);
+  const end = new Date(endDate);
+  
+  while (current <= end) {
+    const dayOfWeek = current.getDay();
+    const isSaturday = dayOfWeek === 6;
+    const isSunday = dayOfWeek === 0;
+    
+    if (!isSunday) {
+      if (!isSaturday) {
+        // Monday to Friday - always include
+        workingDays.push(new Date(current));
+      } else {
+        // Saturday - include only 1st, 3rd, and 5th
+        const weekOfMonth = getWeekOfMonth(current);
+        if ([1, 3, 5].includes(weekOfMonth)) {
+          workingDays.push(new Date(current));
+        }
+      }
+    }
+    
+    current.setDate(current.getDate() + 1);
+  }
+  
+  return workingDays;
+}
+
 // Daily cron job to mark absent employees for today
 exports.dailyAbsentMarking = async (req, res = null) => {
   const conn = await db.getConnection();
@@ -189,16 +230,17 @@ exports.dailyAbsentMarking = async (req, res = null) => {
   }
 };
 
-// Backfill missing attendance records for a specific date range
+// ORIGINAL Backfill missing attendance records for a specific date range (UNCHANGED)
 exports.backfillMissingAttendance = async (req, res = null) => {
-  const conn = await db.getConnection();
+   const conn = await db.getConnection();
   
   try {
     await conn.beginTransaction();
     
     let { startDate, endDate, month, year } = req?.body || req?.query || {};
     
-    console.log('📥 Backfill request parameters:', { startDate, endDate, month, year });
+    console.log('🎯 SPECIAL BACKFILL: Starting monthly backfill with alternative Saturdays (1st, 3rd, 5th)');
+    console.log('📥 Parameters:', { startDate, endDate, month, year });
 
     // Handle different parameter formats
     if (!startDate || !endDate) {
@@ -212,10 +254,10 @@ exports.backfillMissingAttendance = async (req, res = null) => {
         
         console.log('📅 Using provided month/year:', { month, year, startDate, endDate });
       } else {
-        // Default to current month (THIS WAS THE BUG - using current date instead of target)
+        // Default to current month
         const today = new Date();
-        const firstDay = new Date(today.getFullYear(), today.getMonth() - 1, 1);
-        const lastDay = new Date(today.getFullYear(), today.getMonth(), 0);
+        const firstDay = new Date(today.getFullYear(), today.getMonth(), 1);
+        const lastDay = new Date(today.getFullYear(), today.getMonth() + 1, 0);
         
         startDate = firstDay.toISOString().split('T')[0];
         endDate = lastDay.toISOString().split('T')[0];
@@ -224,12 +266,14 @@ exports.backfillMissingAttendance = async (req, res = null) => {
       }
     }
 
-    console.log(`🔄 Starting backfill missing attendance from ${startDate} to ${endDate}...`);
+    console.log(`🔄 SPECIAL BACKFILL: Processing from ${startDate} to ${endDate} with alternative Saturdays...`);
     
     const settings = await getAttendanceSettings();
-    const weekdays = getWeekdaysBetweenDates(startDate, endDate);
     
-    console.log(`📅 Processing ${weekdays.length} weekdays between ${startDate} and ${endDate}`);
+    // USE TEMPORARY FUNCTION: Get working days including alternative Saturdays
+    const workingDays = getWorkingDaysWithAlternativeSaturdays(startDate, endDate);
+    
+    console.log(`📅 Processing ${workingDays.length} working days (including alternative Saturdays)`);
     
     // Get all active employees
     const [activeEmployees] = await conn.query(
@@ -240,15 +284,23 @@ exports.backfillMissingAttendance = async (req, res = null) => {
     
     let totalRecordsCreated = 0;
     let totalRecordsSkipped = 0;
+    let saturdaysIncluded = 0;
     
-    // Process each weekday and each employee
-    for (const date of weekdays) {
+    // Process each working day and each employee
+    for (const date of workingDays) {
       const dateStr = date.toISOString().split('T')[0];
+      const dayOfWeek = date.getDay();
+      const isSaturday = dayOfWeek === 6;
       
-      // Skip if it's weekly off according to settings
-      if (isWeeklyOff(date, settings)) {
+      // For non-Saturday days, check weekly off settings
+      if (!isSaturday && isWeeklyOff(date, settings)) {
         console.log(`⏭️  Skipping weekly off: ${dateStr}`);
         continue;
+      }
+      
+      if (isSaturday) {
+        saturdaysIncluded++;
+        console.log(`🔧 Including alternative Saturday: ${dateStr}`);
       }
       
       for (const employee of activeEmployees) {
@@ -270,12 +322,15 @@ exports.backfillMissingAttendance = async (req, res = null) => {
               'Absent', 
               null,  // check_in
               null,  // check_out
-              `Automatically marked as absent during backfill process for ${dateStr}`
+              `Automatically marked as absent during special backfill process for ${dateStr}` + 
+              (isSaturday ? ' (Alternative Saturday)' : '')
             ]
           );
           
           totalRecordsCreated++;
-          console.log(`✅ Created absent record for ${employee.employeeName} on ${dateStr}`);
+          if (totalRecordsCreated % 50 === 0) {
+            console.log(`✅ Created ${totalRecordsCreated} records so far...`);
+          }
         } else {
           totalRecordsSkipped++;
         }
@@ -284,8 +339,9 @@ exports.backfillMissingAttendance = async (req, res = null) => {
     
     await conn.commit();
     
-    const resultMessage = `Backfill completed. Created ${totalRecordsCreated} absent records, skipped ${totalRecordsSkipped} existing records for ${weekdays.length} weekdays.`;
+    const resultMessage = `SPECIAL BACKFILL COMPLETED. Created ${totalRecordsCreated} absent records, skipped ${totalRecordsSkipped} existing records for ${workingDays.length} working days (including ${saturdaysIncluded} alternative Saturdays).`;
     console.log(`✅ ${resultMessage}`);
+    console.log('⚠️  NOTE: This was a one-time special backfill with alternative Saturdays');
     
     if (res) {
       return res.json({ 
@@ -294,10 +350,12 @@ exports.backfillMissingAttendance = async (req, res = null) => {
         data: {
           startDate,
           endDate,
-          weekdaysProcessed: weekdays.length,
+          workingDaysProcessed: workingDays.length,
           recordsCreated: totalRecordsCreated,
           recordsSkipped: totalRecordsSkipped,
-          totalEmployees: activeEmployees.length
+          totalEmployees: activeEmployees.length,
+          alternativeSaturdaysIncluded: saturdaysIncluded,
+          note: 'This was a one-time special backfill with alternative Saturdays (1st, 3rd, 5th)'
         }
       });
     }
@@ -306,9 +364,162 @@ exports.backfillMissingAttendance = async (req, res = null) => {
     
   } catch (error) {
     await conn.rollback();
-    console.error('❌ Error in backfill missing attendance:', error);
+    console.error('❌ Error in special backfill with alternative Saturdays:', error);
     
-    const errorMessage = `Error in backfill process: ${error.message}`;
+    const errorMessage = `Error in special backfill process: ${error.message}`;
+    
+    if (res) {
+      return res.status(500).json({ 
+        success: false, 
+        message: errorMessage,
+        error: error.message 
+      });
+    }
+    
+    throw error;
+  } finally {
+    conn.release();
+  }
+};
+
+
+// NEW: Special backfill function with alternative Saturdays (FOR ONE-TIME USE ONLY)
+exports.backfillMonthlyWithAlternativeSaturdays = async (req, res = null) => {
+  const conn = await db.getConnection();
+  
+  try {
+    await conn.beginTransaction();
+    
+    let { startDate, endDate, month, year } = req?.body || req?.query || {};
+    
+    console.log('🎯 SPECIAL BACKFILL: Starting monthly backfill with alternative Saturdays (1st, 3rd, 5th)');
+    console.log('📥 Parameters:', { startDate, endDate, month, year });
+
+    // Handle different parameter formats
+    if (!startDate || !endDate) {
+      if (month && year) {
+        // Use the provided month and year
+        month = parseInt(month);
+        year = parseInt(year);
+        startDate = `${year}-${month.toString().padStart(2, '0')}-01`;
+        const lastDay = new Date(year, month, 0).getDate();
+        endDate = `${year}-${month.toString().padStart(2, '0')}-${lastDay}`;
+        
+        console.log('📅 Using provided month/year:', { month, year, startDate, endDate });
+      } else {
+        // Default to current month
+        const today = new Date();
+        const firstDay = new Date(today.getFullYear(), today.getMonth(), 1);
+        const lastDay = new Date(today.getFullYear(), today.getMonth() + 1, 0);
+        
+        startDate = firstDay.toISOString().split('T')[0];
+        endDate = lastDay.toISOString().split('T')[0];
+        
+        console.log('⚠️  No date provided, using current month:', { startDate, endDate });
+      }
+    }
+
+    console.log(`🔄 SPECIAL BACKFILL: Processing from ${startDate} to ${endDate} with alternative Saturdays...`);
+    
+    const settings = await getAttendanceSettings();
+    
+    // USE TEMPORARY FUNCTION: Get working days including alternative Saturdays
+    const workingDays = getWorkingDaysWithAlternativeSaturdays(startDate, endDate);
+    
+    console.log(`📅 Processing ${workingDays.length} working days (including alternative Saturdays)`);
+    
+    // Get all active employees
+    const [activeEmployees] = await conn.query(
+      "SELECT id, employeeName FROM employees WHERE active = 1"
+    );
+    
+    console.log(`👥 Found ${activeEmployees.length} active employees`);
+    
+    let totalRecordsCreated = 0;
+    let totalRecordsSkipped = 0;
+    let saturdaysIncluded = 0;
+    
+    // Process each working day and each employee
+    for (const date of workingDays) {
+      const dateStr = date.toISOString().split('T')[0];
+      const dayOfWeek = date.getDay();
+      const isSaturday = dayOfWeek === 6;
+      
+      // For non-Saturday days, check weekly off settings
+      if (!isSaturday && isWeeklyOff(date, settings)) {
+        console.log(`⏭️  Skipping weekly off: ${dateStr}`);
+        continue;
+      }
+      
+      if (isSaturday) {
+        saturdaysIncluded++;
+        console.log(`🔧 Including alternative Saturday: ${dateStr}`);
+      }
+      
+      for (const employee of activeEmployees) {
+        // Check if attendance already exists for this date and employee
+        const [existingAttendance] = await conn.query(
+          "SELECT id FROM attendance WHERE employee_id = ? AND DATE(date) = ?",
+          [employee.id, dateStr]
+        );
+        
+        if (existingAttendance.length === 0) {
+          // No attendance record found - mark as absent with proper column structure
+          await conn.query(
+            `INSERT INTO attendance 
+             (employee_id, date, status, check_in, check_out, remarks, created_at, updated_at) 
+             VALUES (?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+            [
+              employee.id, 
+              dateStr, 
+              'Absent', 
+              null,  // check_in
+              null,  // check_out
+              `Automatically marked as absent during special backfill process for ${dateStr}` + 
+              (isSaturday ? ' (Alternative Saturday)' : '')
+            ]
+          );
+          
+          totalRecordsCreated++;
+          if (totalRecordsCreated % 50 === 0) {
+            console.log(`✅ Created ${totalRecordsCreated} records so far...`);
+          }
+        } else {
+          totalRecordsSkipped++;
+        }
+      }
+    }
+    
+    await conn.commit();
+    
+    const resultMessage = `SPECIAL BACKFILL COMPLETED. Created ${totalRecordsCreated} absent records, skipped ${totalRecordsSkipped} existing records for ${workingDays.length} working days (including ${saturdaysIncluded} alternative Saturdays).`;
+    console.log(`✅ ${resultMessage}`);
+    console.log('⚠️  NOTE: This was a one-time special backfill with alternative Saturdays');
+    
+    if (res) {
+      return res.json({ 
+        success: true, 
+        message: resultMessage,
+        data: {
+          startDate,
+          endDate,
+          workingDaysProcessed: workingDays.length,
+          recordsCreated: totalRecordsCreated,
+          recordsSkipped: totalRecordsSkipped,
+          totalEmployees: activeEmployees.length,
+          alternativeSaturdaysIncluded: saturdaysIncluded,
+          note: 'This was a one-time special backfill with alternative Saturdays (1st, 3rd, 5th)'
+        }
+      });
+    }
+    
+    return resultMessage;
+    
+  } catch (error) {
+    await conn.rollback();
+    console.error('❌ Error in special backfill with alternative Saturdays:', error);
+    
+    const errorMessage = `Error in special backfill process: ${error.message}`;
     
     if (res) {
       return res.status(500).json({ 
@@ -424,7 +635,7 @@ exports.getMissingAttendanceReport = async (req, res) => {
   }
 };
 
-// Manual trigger for testing
+// Manual trigger for testing - UPDATED to include special backfill
 exports.manualTrigger = async (req, res) => {
   try {
     const { type, startDate, endDate, month, year } = req.body;
@@ -440,6 +651,10 @@ exports.manualTrigger = async (req, res) => {
         result = await exports.backfillMissingAttendance(req, res);
         break;
         
+      case 'backfill-with-saturdays': // NEW: Special one-time backfill
+        result = await exports.backfillMonthlyWithAlternativeSaturdays(req, res);
+        break;
+        
       case 'report':
         result = await exports.getMissingAttendanceReport(req, res);
         break;
@@ -447,7 +662,7 @@ exports.manualTrigger = async (req, res) => {
       default:
         return res.status(400).json({
           success: false,
-          message: 'Invalid type. Use "daily", "backfill", or "report"'
+          message: 'Invalid type. Use "daily", "backfill", "backfill-with-saturdays", or "report"'
         });
     }
     
