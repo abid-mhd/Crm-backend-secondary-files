@@ -1,5 +1,8 @@
 const router = require('express').Router();
 const ctrl = require('../controllers/invoicesController');
+const authMiddleware = require('../middleware/authMiddleware');
+
+router.use(authMiddleware);
 
 router.get('/', ctrl.list);
 router.post('/', ctrl.create); // POST /api/invoices

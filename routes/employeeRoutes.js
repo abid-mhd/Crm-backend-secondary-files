@@ -5,6 +5,7 @@ const attendanceController = require('../controllers/AttendanceController');
 const authController = require('../controllers/authController');
 const auth = require('../middleware/authMiddleware');
 
+router.use(auth);
 
 router.get('/', employeeController.getAllEmployees);
 router.get('/:id', employeeController.getEmployeeById);

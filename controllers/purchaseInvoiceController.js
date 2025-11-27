@@ -37,7 +37,7 @@ function calculatePurchaseItemAmounts(item, taxType = 'sgst_cgst') {
     igstAmount = (taxableAmount * (item.igst || 18)) / 100;
   }
 
-  const totalAmount = taxableAmount ;
+  const totalAmount = taxableAmount;
 
   return {
     baseAmount,
@@ -56,10 +56,31 @@ const logInvoiceAction = async (invoiceId, action, details, changes = {}, req = 
   // Run in a separate connection to avoid transaction locks
   setImmediate(async () => {
     try {
-      const userName = req?.user?.name || 'System';
       const userId = req?.user?.id || null;
       const ipAddress = req?.ip || req?.connection?.remoteAddress || null;
       const userAgent = req?.get('user-agent') || null;
+      
+      let userName = 'System';
+      
+      // If user ID exists, fetch user name from users table
+      if (userId) {
+        try {
+          const [users] = await db.execute(
+            'SELECT name FROM users WHERE id = ?',
+            [userId]
+          );
+          
+          if (users.length > 0) {
+            userName = users[0].name;
+          } else {
+            console.warn(`⚠️ User not found with ID: ${userId}`);
+            userName = 'Unknown User';
+          }
+        } catch (userErr) {
+          console.error("❌ Error fetching user name:", userErr);
+          userName = 'Error Fetching Name';
+        }
+      }
 
       await db.execute(
         `INSERT INTO invoice_history 
@@ -76,8 +97,10 @@ const logInvoiceAction = async (invoiceId, action, details, changes = {}, req = 
           userAgent
         ]
       );
+      
+      console.log(`📝 Invoice history created for action: ${action} by user: ${userName}`);
     } catch (err) {
-      console.error("Error logging invoice action:", err);
+      console.error("❌ Error logging invoice action:", err);
       // Don't throw - logging should not break the main operation
     }
   });
@@ -123,10 +146,22 @@ exports.list = async (req, res) => {
     `);
 
     for (const inv of invoices) {
-      const [items] = await db.execute(
-        "SELECT * FROM invoice_items WHERE invoiceId = ?",
-        [inv.id]
-      );
+      // Get invoice items with full item details
+      const [items] = await db.execute(`
+        SELECT 
+          ii.*,
+          it.id as original_item_id,
+          it.name as original_item_name,
+          it.description as original_item_description,
+          it.hsnCode as original_hsn_code,
+          it.measuringUnit as original_measuring_unit,
+          it.sellingPrice as original_selling_price,
+          it.createdAt as item_created_at,
+          it.updatedAt as item_updated_at
+        FROM invoice_items ii
+        LEFT JOIN items it ON ii.itemId = it.id
+        WHERE ii.invoiceId = ?
+      `, [inv.id]);
       
       // Parse meta data for each item
       inv.items = items.map(item => {
@@ -150,6 +185,20 @@ exports.list = async (req, res) => {
         } else {
           item.meta = {};
         }
+        
+        // Add original item details to the response
+        item.originalItem = item.original_item_id ? {
+          id: item.original_item_id,
+          name: item.original_item_name,
+          description: item.original_item_description,
+          hsnCode: item.original_hsn_code,
+          measuringUnit: item.original_measuring_unit,
+          sellingPrice: item.original_selling_price,
+          tax: item.original_tax,
+          createdAt: item.item_created_at,
+          updatedAt: item.item_updated_at
+        } : null;
+        
         return item;
       });
 
@@ -204,10 +253,22 @@ exports.get = async (req, res) => {
     );
     invoice.supplier = supplier[0] || null;
 
-    const [items] = await db.execute(
-      "SELECT * FROM invoice_items WHERE invoiceId = ?",
-      [invoice.id]
-    );
+    // Get invoice items with full item details
+    const [items] = await db.execute(`
+      SELECT 
+        ii.*,
+        it.id as original_item_id,
+        it.name as original_item_name,
+        it.description as original_item_description,
+        it.hsnCode as original_hsn_code,
+        it.measuringUnit as original_measuring_unit,
+        it.sellingPrice as original_selling_price,
+        it.createdAt as item_created_at,
+        it.updatedAt as item_updated_at
+      FROM invoice_items ii
+      LEFT JOIN items it ON ii.itemId = it.id
+      WHERE ii.invoiceId = ?
+    `, [invoice.id]);
     
     // Parse meta data for each item
     invoice.items = items.map(item => {
@@ -231,6 +292,20 @@ exports.get = async (req, res) => {
       } else {
         item.meta = {};
       }
+      
+      // Add original item details to the response
+      item.originalItem = item.original_item_id ? {
+        id: item.original_item_id,
+        name: item.original_item_name,
+        description: item.original_item_description,
+        hsnCode: item.original_hsn_code,
+        measuringUnit: item.original_measuring_unit,
+        sellingPrice: item.original_selling_price,
+        tax: item.original_tax,
+        createdAt: item.item_created_at,
+        updatedAt: item.item_updated_at
+      } : null;
+      
       return item;
     });
 
@@ -362,7 +437,7 @@ exports.create = async (req, res) => {
 
     const invoiceId = result.insertId;
 
-    // Insert items with tax type support
+    // Insert items with tax type support and itemId
     for (const item of payload.items) {
       const amounts = calculatePurchaseItemAmounts(item, taxType);
 
@@ -379,10 +454,11 @@ exports.create = async (req, res) => {
 
       await conn.execute(
         `INSERT INTO invoice_items 
-        (invoiceId, description, hsn, uom, quantity, rate, discount, tax, taxAmount, amount, meta) 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        (invoiceId, itemId, description, hsn, uom, quantity, rate, discount, tax, taxAmount, amount, meta) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           invoiceId,
+          item.itemId || null, // Save the original item ID
           item.description,
           item.hsn || '',
           item.uom || '',
@@ -593,7 +669,7 @@ exports.update = async (req, res) => {
     // Delete existing items and insert new ones
     await conn.execute("DELETE FROM invoice_items WHERE invoiceId = ?", [req.params.id]);
 
-    // Insert updated items
+    // Insert updated items with itemId
     for (const item of payload.items) {
       const amounts = calculatePurchaseItemAmounts(item, taxType);
 
@@ -610,10 +686,11 @@ exports.update = async (req, res) => {
 
       await conn.execute(
         `INSERT INTO invoice_items 
-        (invoiceId, description, hsn, uom, quantity, rate, discount, tax, taxAmount, amount, meta) 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        (invoiceId, itemId, description, hsn, uom, quantity, rate, discount, tax, taxAmount, amount, meta) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           req.params.id,
+          item.itemId || null, // Save the original item ID
           item.description,
           item.hsn || '',
           item.uom || '',

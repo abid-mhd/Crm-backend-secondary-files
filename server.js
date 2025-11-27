@@ -7,7 +7,12 @@ const path = require("path");
 const employeeController = require('./controllers/employeeController');
 
 const app = express();
-// app.set('trust proxy', true);
+// Add this middleware to trust proxy headers
+app.set('trust proxy', true);
+app.set('trust proxy', 'loopback, 172.31.14.188');  // Or specific settings
+
+// Or for specific IP ranges:
+// app.set('trust proxy', ['192.168.0.0/16', '10.0.0.0/8', '172.16.0.0/12']);
 
 const cron = require('node-cron');
 const { checkAndSendReminderNotifications } = require('./controllers/employeeController');
@@ -195,6 +200,8 @@ const poSalesRoutes = require('./routes/projectSales');
 const ewayBillRoutes = require('./routes/ewayBillRoutes');
 const boqRoutes = require('./routes/boqRoutes');
 const vendorPoRoutes = require("./routes/vendorPoRoutes");
+const cronRoutes = require('./routes/cronRoutes');
+const cronScheduler = require('./cron/scheduler'); 
 
 app.use("/api/employees", employeeRoutes);
 app.use("/api/billing", billingRoutes);
@@ -225,6 +232,11 @@ app.use('/api/ewaybills', ewayBillRoutes);
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.use('/api/boq', boqRoutes);
 app.use("/api/vendor-pos", vendorPoRoutes);
+app.use('/api', cronRoutes);
+cronScheduler.startScheduler();
+
+console.log('🚀 Application started with daily absent marking scheduler');
+
 
 // If you want to serve through API route as well, keep this:
 app.use('/api/uploads', express.static(path.join(__dirname, 'uploads')));

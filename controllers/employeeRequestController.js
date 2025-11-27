@@ -3,13 +3,24 @@ const NotificationService = require('../services/notificationService');
 const twilio = require('twilio');
 const nodemailer = require('nodemailer');
 
-// Initialize Twilio client
-const twilioClient = twilio(
-  process.env.TWILIO_ACCOUNT_SID,
-  process.env.TWILIO_AUTH_TOKEN
-);
+// Initialize Twilio client only if in production
+let twilioClient = null;
+if (process.env.NODE_ENV === 'production' && process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
+  twilioClient = twilio(
+    process.env.TWILIO_ACCOUNT_SID,
+    process.env.TWILIO_AUTH_TOKEN
+  );
+  console.log('✅ Twilio client initialized for production environment');
+} else {
+  console.log('ℹ️ Twilio notifications disabled - not in production environment');
+}
 
 class EmployeeRequestController {
+  constructor() {
+    // Environment detection
+    this.isProduction = process.env.NODE_ENV === 'production';
+    console.log(`🔧 Employee Request Controller initialized in ${this.isProduction ? 'production' : 'development/staging'} mode`);
+  }
   
   // Get employee ID from authenticated user
   async getEmployeeId(req) {
@@ -220,7 +231,8 @@ class EmployeeRequestController {
           requestId: requestId,
           requestDate: formattedDate,
           status: 'pending'
-        }
+        },
+        environment: this.isProduction ? 'production' : 'development/staging'
       });
 
     } catch (error) {
@@ -356,7 +368,8 @@ class EmployeeRequestController {
         requestType: request_type,
         requestDate: formattedDate,
         status: 'pending'
-      }
+      },
+      environment: this.isProduction ? 'production' : 'development/staging'
     });
 
   } catch (error) {
@@ -371,7 +384,10 @@ class EmployeeRequestController {
 
 async notifyHRAndAdminsComprehensive(employee, requestDate, reason, requestId, requestType = 'unmark_absent') {
   try {
-    console.log(`🔔 Starting comprehensive HR/Admin notification for ${requestType} request ${requestId}`);
+    console.log(`🔔 Starting comprehensive HR/Admin notification for ${requestType} request ${requestId}`, {
+      environment: this.isProduction ? 'production' : 'development/staging',
+      smsEnabled: this.isProduction
+    });
     
     // Get all HR and Admin users
     const [hrAdmins] = await db.query(`
@@ -413,12 +429,15 @@ async notifyHRAndAdminsComprehensive(employee, requestDate, reason, requestId, r
           .catch(err => console.error(`Email error for user ${user.id}:`, err))
       );
 
-      // SMS notification to HR/Admin if phone exists
-      if (user.phone) {
+      // SMS notification to HR/Admin if phone exists and in production
+      if (user.phone && this.isProduction) {
         userNotificationPromises.push(
           this.sendRequestSMSToHR(user, employee, requestDate, reason, requestId, requestType)
             .catch(err => console.error(`SMS error for user ${user.id}:`, err))
         );
+      } else if (user.phone && !this.isProduction) {
+        console.log(`ℹ️ SMS skipped for HR/Admin user ${user.id} - not in production environment`);
+        userNotificationPromises.push(Promise.resolve({ type: 'sms', success: true, skipped: 'not_production' }));
       }
 
       // Execute all notifications for this user
@@ -455,7 +474,9 @@ async notifyHRAndAdminsComprehensive(employee, requestDate, reason, requestId, r
       totalHRAdmins: hrAdmins.length,
       totalNotifications: totalSuccessful + totalFailed,
       successful: totalSuccessful,
-      failed: totalFailed
+      failed: totalFailed,
+      environment: this.isProduction ? 'production' : 'development/staging',
+      smsEnabled: this.isProduction
     };
 
   } catch (error) {
@@ -477,7 +498,10 @@ getRequestTypeText(requestType) {
   // NOTIFY EMPLOYEE ABOUT REQUEST SUBMISSION
 async notifyEmployeeRequestSubmitted(employee, requestDate, reason, requestId, requestType = 'unmark_absent') {
   try {
-    console.log(`🔔 Notifying employee about ${requestType} request submission ${requestId}`);
+    console.log(`🔔 Notifying employee about ${requestType} request submission ${requestId}`, {
+      environment: this.isProduction ? 'production' : 'development/staging',
+      smsEnabled: this.isProduction
+    });
     
     if (!employee.user_id) {
       console.log('No user ID found for employee, skipping submission notification');
@@ -506,12 +530,15 @@ async notifyEmployeeRequestSubmitted(employee, requestDate, reason, requestId, r
         .catch(err => console.error(`Employee email error:`, err))
     );
 
-    // SMS notification to employee if phone exists
-    if (employee.phone) {
+    // SMS notification to employee if phone exists and in production
+    if (employee.phone && this.isProduction) {
       notificationPromises.push(
         this.sendRequestSubmissionSMSToEmployee(employee, requestDate, reason, requestId, requestType)
           .catch(err => console.error(`Employee SMS error:`, err))
       );
+    } else if (employee.phone && !this.isProduction) {
+      console.log(`ℹ️ SMS skipped for employee ${employee.employeeName} - not in production environment`);
+      notificationPromises.push(Promise.resolve({ type: 'sms', success: true, skipped: 'not_production' }));
     }
 
     // Execute all notification promises
@@ -610,7 +637,13 @@ async sendRequestEmailToHR(user, employee, requestDate, reason, requestId, reque
 // SEND SMS TO HR/ADMIN ABOUT NEW REQUEST
 async sendRequestSMSToHR(user, employee, requestDate, reason, requestId, requestType = 'unmark_absent') {
   try {
-    if (!user.phone || !process.env.TWILIO_ACCOUNT_SID) {
+    // Only send SMS in production environment
+    if (!this.isProduction) {
+      console.log(`ℹ️ HR/Admin SMS skipped for user ${user.id} - not in production environment`);
+      return { skipped: true, reason: 'not_production' };
+    }
+
+    if (!user.phone || !twilioClient) {
       console.log(`No phone number or Twilio not configured for HR/Admin user ${user.id}`);
       return;
     }
@@ -727,7 +760,13 @@ async sendRequestSubmissionEmailToEmployee(employee, requestDate, reason, reques
 // SEND SMS TO EMPLOYEE ABOUT REQUEST SUBMISSION
 async sendRequestSubmissionSMSToEmployee(employee, requestDate, reason, requestId, requestType = 'unmark_absent') {
   try {
-    if (!employee.phone || !process.env.TWILIO_ACCOUNT_SID) {
+    // Only send SMS in production environment
+    if (!this.isProduction) {
+      console.log(`ℹ️ Employee submission SMS skipped for ${employee.employeeName} - not in production environment`);
+      return { skipped: true, reason: 'not_production' };
+    }
+
+    if (!employee.phone || !twilioClient) {
       console.log(`No phone number or Twilio not configured for employee ${employee.employeeName}`);
       return;
     }
@@ -912,209 +951,303 @@ async getAllPendingRequests(req, res) {
   }
 }
 
-  // Update request status (for HR/Admin)
+// Update request status (for HR/Admin)
 async updateRequestStatus(req, res) {
-    try {
-      const { requestId } = req.params;
-      const { status, review_notes } = req.body;
-      const reviewedBy = req.user.id;
+  try {
+    const { requestId } = req.params;
+    const { status, review_notes } = req.body;
+    const reviewedBy = req.user.id;
 
-      if (!['approved', 'rejected'].includes(status)) {
-        return res.status(400).json({
-          success: false,
-          message: 'Invalid status. Must be "approved" or "rejected"'
-        });
-      }
-
-      // Get request details with employee information
-      const [requests] = await db.query(`
-        SELECT er.*, e.*, u.id as employee_user_id
-        FROM employee_requests er
-        INNER JOIN employees e ON er.employee_id = e.id
-        LEFT JOIN users u ON e.id = u.employee_id
-        WHERE er.id = ?
-      `, [requestId]);
-
-      if (requests.length === 0) {
-        return res.status(404).json({
-          success: false,
-          message: 'Request not found'
-        });
-      }
-
-      const request = requests[0];
-      const employee = {
-        id: request.employee_id,
-        employeeName: request.employeeName,
-        employeeNo: request.employeeNo,
-        email: request.email,
-        phone: request.phone,
-        user_id: request.employee_user_id
-      };
-
-      // Check if request is NOT pending (already processed)
-      if (request.status == 'pending') {
-        return res.status(400).json({
-          success: false,
-          message: 'Request has already been processed'
-        });
-      }
-
-      let connection;
-      try {
-        connection = await db.getConnection();
-        await connection.beginTransaction();
-
-        // Update request status
-        await connection.query(`
-          UPDATE employee_requests 
-          SET status = ?, admin_remarks = ?, handled_by = ?, handled_at = NOW(), updated_at = NOW()
-          WHERE id = ?
-        `, [status, review_notes || null, reviewedBy, requestId]);
-
-        // If approved, update attendance record
-        if (status === 'approved') {
-          // Get attendance settings to calculate checkout time
-          const [attendanceSettings] = await connection.query(`
-            SELECT settings_data FROM attendance_settings ORDER BY id LIMIT 1
-          `);
-
-          let workingHours = '09:00'; // Default working hours
-          
-          if (attendanceSettings.length > 0 && attendanceSettings[0].settings_data) {
-            try {
-              const settingsData = typeof attendanceSettings[0].settings_data === 'string' 
-                ? JSON.parse(attendanceSettings[0].settings_data) 
-                : attendanceSettings[0].settings_data;
-              
-              if (settingsData.workingHours) {
-                workingHours = settingsData.workingHours;
-              }
-            } catch (parseError) {
-              console.error('Error parsing settings_data JSON:', parseError);
-              // Use default working hours if JSON parsing fails
-            }
-          }
-
-          console.log('Using working hours:', workingHours); // Debug log
-
-          // Parse working hours (format: "HH:MM")
-          const [workHours, workMinutes] = workingHours.split(':').map(Number);
-          const totalWorkMinutes = workHours * 60 + workMinutes;
-
-          // First, find the attendance record for this employee and date
-          const [attendanceRecords] = await connection.query(`
-            SELECT id, check_in FROM attendance 
-            WHERE employee_id = ? AND DATE(date) = DATE(?)
-          `, [request.employee_id, request.request_date]);
-
-          if (attendanceRecords.length > 0) {
-            const attendanceRecord = attendanceRecords[0];
-            let checkoutTime = null;
-
-            // Calculate checkout time based on check_in time and working hours
-            if (attendanceRecord.check_in) {
-              // Parse check_in time (format: "HH:MM:SS")
-              const [checkInHours, checkInMinutes, checkInSeconds] = attendanceRecord.check_in.split(':').map(Number);
-              
-              // Calculate checkout time by adding working hours to check_in time
-              const totalCheckInMinutes = checkInHours * 60 + checkInMinutes;
-              const totalCheckoutMinutes = totalCheckInMinutes + totalWorkMinutes;
-              
-              // Convert back to hours and minutes
-              const checkoutHours = Math.floor(totalCheckoutMinutes / 60);
-              const checkoutMinutes = totalCheckoutMinutes % 60;
-              
-              // Format checkout time as HH:MM:SS
-              checkoutTime = `${checkoutHours.toString().padStart(2, '0')}:${checkoutMinutes.toString().padStart(2, '0')}:00`;
-              
-              console.log(`Checkout calculation: ${attendanceRecord.check_in} + ${workingHours} = ${checkoutTime}`); // Debug log
-            } else {
-              // If no check_in time, set default checkout time based on working hours
-              const defaultCheckIn = '10:00:00';
-              const [checkInHours, checkInMinutes] = defaultCheckIn.split(':').map(Number);
-              const totalCheckInMinutes = checkInHours * 60 + checkInMinutes;
-              const totalCheckoutMinutes = totalCheckInMinutes + totalWorkMinutes;
-              
-              const checkoutHours = Math.floor(totalCheckoutMinutes / 60);
-              const checkoutMinutes = totalCheckoutMinutes % 60;
-              checkoutTime = `${checkoutHours.toString().padStart(2, '0')}:${checkoutMinutes.toString().padStart(2, '0')}:00`;
-              
-              console.log(`Default checkout calculation: ${defaultCheckIn} + ${workingHours} = ${checkoutTime}`); // Debug log
-            }
-
-            // Update existing attendance record with checkout time
-            await connection.query(`
-              UPDATE attendance 
-              SET status = 'Present', 
-                  check_out = ?,
-                  remarks = CONCAT(IFNULL(remarks, ''), ' Absent regularized via request #${requestId}'),
-                  updated_at = NOW()
-              WHERE id = ?
-            `, [checkoutTime, attendanceRecord.id]);
-
-            console.log(`Updated attendance record ${attendanceRecord.id} with checkout time: ${checkoutTime}`); // Debug log
-
-          } else {
-            // Create new attendance record if not exists
-            const defaultCheckIn = '10:00:00'; // Default check-in time
-            
-            // Calculate checkout time for default check-in
-            const [checkInHours, checkInMinutes] = defaultCheckIn.split(':').map(Number);
-            const totalCheckInMinutes = checkInHours * 60 + checkInMinutes;
-            const totalCheckoutMinutes = totalCheckInMinutes + totalWorkMinutes;
-            
-            const checkoutHours = Math.floor(totalCheckoutMinutes / 60);
-            const checkoutMinutes = totalCheckoutMinutes % 60;
-            const checkoutTime = `${checkoutHours.toString().padStart(2, '0')}:${checkoutMinutes.toString().padStart(2, '0')}:00`;
-
-            await connection.query(`
-              INSERT INTO attendance 
-              (employee_id, date, status, check_in, check_out, remarks, created_at, updated_at)
-              VALUES (?, ?, 'Present', ?, ?, 'Absent regularized via request #${requestId}', NOW(), NOW())
-            `, [request.employee_id, request.request_date, defaultCheckIn, checkoutTime]);
-
-            console.log(`Created new attendance record with check_in: ${defaultCheckIn}, check_out: ${checkoutTime}`); // Debug log
-          }
-        }
-
-        await connection.commit();
-
-        // Notify employee about the decision
-        await this.notifyEmployeeDecisionComprehensive(employee, request, status, review_notes, request.request_type);
-
-        res.json({
-          success: true,
-          message: `Request ${status} successfully`,
-          data: {
-            requestId: requestId,
-            status: status,
-            updatedAt: new Date()
-          }
-        });
-
-      } catch (error) {
-        if (connection) await connection.rollback();
-        console.error('Transaction error:', error);
-        throw error;
-      } finally {
-        if (connection) connection.release();
-      }
-
-    } catch (error) {
-      console.error('Error updating request status:', error);
-      res.status(500).json({
+    if (!['approved', 'rejected'].includes(status)) {
+      return res.status(400).json({
         success: false,
-        message: 'Failed to update request status',
-        error: error.message
+        message: 'Invalid status. Must be "approved" or "rejected"'
       });
     }
+
+    // Get request details with employee information
+    const [requests] = await db.query(`
+      SELECT er.*, e.*, u.id as employee_user_id
+      FROM employee_requests er
+      INNER JOIN employees e ON er.employee_id = e.id
+      LEFT JOIN users u ON e.id = u.employee_id
+      WHERE er.id = ?
+    `, [requestId]);
+
+    if (requests.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Request not found'
+      });
+    }
+
+    const request = requests[0];
+    const employee = {
+      id: request.employee_id,
+      employeeName: request.employeeName,
+      employeeNo: request.employeeNo,
+      email: request.email,
+      phone: request.phone,
+      user_id: request.employee_user_id
+    };
+
+    // Check if request is already processed (NOT pending)
+    if (request.status == 'pending') {
+      return res.status(400).json({
+        success: false,
+        message: 'Request has already been processed'
+      });
+    }
+
+    let connection;
+    try {
+      connection = await db.getConnection();
+      await connection.beginTransaction();
+
+      // Update request status
+      await connection.query(`
+        UPDATE employee_requests 
+        SET status = ?, admin_remarks = ?, handled_by = ?, handled_at = NOW(), updated_at = NOW()
+        WHERE id = ?
+      `, [status, review_notes || null, reviewedBy, requestId]);
+
+      // If approved, handle different request types
+      if (status === 'approved') {
+        await this.handleApprovedRequest(connection, request, requestId);
+      }
+
+      await connection.commit();
+
+      // Notify employee about the decision
+      await this.notifyEmployeeDecisionComprehensive(employee, request, status, review_notes, request.request_type);
+
+      res.json({
+        success: true,
+        message: `Request ${status} successfully`,
+        data: {
+          requestId: requestId,
+          status: status,
+          updatedAt: new Date()
+        },
+        environment: this.isProduction ? 'production' : 'development/staging'
+      });
+
+    } catch (error) {
+      if (connection) await connection.rollback();
+      console.error('Transaction error:', error);
+      throw error;
+    } finally {
+      if (connection) connection.release();
+    }
+
+  } catch (error) {
+    console.error('Error updating request status:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to update request status',
+      error: error.message
+    });
   }
+}
+
+// Handle approved requests based on type
+async handleApprovedRequest(connection, request, requestId) {
+  const requestType = request.request_type;
+  
+  switch (requestType) {
+    case 'unmark_absent':
+      await this.handleUnmarkAbsentApproval(connection, request, requestId);
+      break;
+    
+    case 'work_from_home':
+      await this.handleWorkFromHomeApproval(connection, request, requestId);
+      break;
+    
+    case 'leave_approval':
+      await this.handleLeaveApproval(connection, request, requestId);
+      break;
+    
+    default:
+      console.log(`No specific handling for request type: ${requestType}`);
+  }
+}
+
+// Handle unmark_absent approval
+async handleUnmarkAbsentApproval(connection, request, requestId) {
+  // Get attendance settings to calculate checkout time
+  const [attendanceSettings] = await connection.query(`
+    SELECT settings_data FROM attendance_settings ORDER BY id LIMIT 1
+  `);
+
+  let workingHours = '09:00'; // Default working hours
+  
+  if (attendanceSettings.length > 0 && attendanceSettings[0].settings_data) {
+    try {
+      const settingsData = typeof attendanceSettings[0].settings_data === 'string' 
+        ? JSON.parse(attendanceSettings[0].settings_data) 
+        : attendanceSettings[0].settings_data;
+      
+      if (settingsData.workingHours) {
+        workingHours = settingsData.workingHours;
+      }
+    } catch (parseError) {
+      console.error('Error parsing settings_data JSON:', parseError);
+      // Use default working hours if JSON parsing fails
+    }
+  }
+
+  console.log('Using working hours:', workingHours);
+
+  // Parse working hours (format: "HH:MM")
+  const [workHours, workMinutes] = workingHours.split(':').map(Number);
+  const totalWorkMinutes = workHours * 60 + workMinutes;
+
+  // First, find the attendance record for this employee and date
+  const [attendanceRecords] = await connection.query(`
+    SELECT id, check_in FROM attendance 
+    WHERE employee_id = ? AND DATE(date) = DATE(?)
+  `, [request.employee_id, request.request_date]);
+
+  if (attendanceRecords.length > 0) {
+    const attendanceRecord = attendanceRecords[0];
+    let checkoutTime = null;
+
+    // Calculate checkout time based on check_in time and working hours
+    if (attendanceRecord.check_in) {
+      // Parse check_in time (format: "HH:MM:SS")
+      const [checkInHours, checkInMinutes, checkInSeconds] = attendanceRecord.check_in.split(':').map(Number);
+      
+      // Calculate checkout time by adding working hours to check_in time
+      const totalCheckInMinutes = checkInHours * 60 + checkInMinutes;
+      const totalCheckoutMinutes = totalCheckInMinutes + totalWorkMinutes;
+      
+      // Convert back to hours and minutes
+      const checkoutHours = Math.floor(totalCheckoutMinutes / 60);
+      const checkoutMinutes = totalCheckoutMinutes % 60;
+      
+      // Format checkout time as HH:MM:SS
+      checkoutTime = `${checkoutHours.toString().padStart(2, '0')}:${checkoutMinutes.toString().padStart(2, '0')}:00`;
+      
+      console.log(`Checkout calculation: ${attendanceRecord.check_in} + ${workingHours} = ${checkoutTime}`);
+    } else {
+      // If no check_in time, set default checkout time based on working hours
+      const defaultCheckIn = '10:00:00';
+      const [checkInHours, checkInMinutes] = defaultCheckIn.split(':').map(Number);
+      const totalCheckInMinutes = checkInHours * 60 + checkInMinutes;
+      const totalCheckoutMinutes = totalCheckInMinutes + totalWorkMinutes;
+      
+      const checkoutHours = Math.floor(totalCheckoutMinutes / 60);
+      const checkoutMinutes = totalCheckoutMinutes % 60;
+      checkoutTime = `${checkoutHours.toString().padStart(2, '0')}:${checkoutMinutes.toString().padStart(2, '0')}:00`;
+      
+      console.log(`Default checkout calculation: ${defaultCheckIn} + ${workingHours} = ${checkoutTime}`);
+    }
+
+    // Update existing attendance record with checkout time
+    await connection.query(`
+      UPDATE attendance 
+      SET status = 'Present', 
+          check_out = ?,
+          remarks = CONCAT(IFNULL(remarks, ''), ' Absent regularized via request #${requestId}'),
+          updated_at = NOW()
+      WHERE id = ?
+    `, [checkoutTime, attendanceRecord.id]);
+
+    console.log(`Updated attendance record ${attendanceRecord.id} with checkout time: ${checkoutTime}`);
+
+  } else {
+    // Create new attendance record if not exists
+    const defaultCheckIn = '10:00:00'; // Default check-in time
+    
+    // Calculate checkout time for default check-in
+    const [checkInHours, checkInMinutes] = defaultCheckIn.split(':').map(Number);
+    const totalCheckInMinutes = checkInHours * 60 + checkInMinutes;
+    const totalCheckoutMinutes = totalCheckInMinutes + totalWorkMinutes;
+    
+    const checkoutHours = Math.floor(totalCheckoutMinutes / 60);
+    const checkoutMinutes = totalCheckoutMinutes % 60;
+    const checkoutTime = `${checkoutHours.toString().padStart(2, '0')}:${checkoutMinutes.toString().padStart(2, '0')}:00`;
+
+    await connection.query(`
+      INSERT INTO attendance 
+      (employee_id, date, status, check_in, check_out, remarks, created_at, updated_at)
+      VALUES (?, ?, 'Present', ?, ?, 'Absent regularized via request #${requestId}', NOW(), NOW())
+    `, [request.employee_id, request.request_date, defaultCheckIn, checkoutTime]);
+
+    console.log(`Created new attendance record with check_in: ${defaultCheckIn}, check_out: ${checkoutTime}`);
+  }
+}
+
+// Handle work_from_home approval
+async handleWorkFromHomeApproval(connection, request, requestId) {
+  // Check if attendance record already exists for this date
+  const [attendanceRecords] = await connection.query(`
+    SELECT id FROM attendance 
+    WHERE employee_id = ? AND DATE(date) = DATE(?)
+  `, [request.employee_id, request.request_date]);
+
+  if (attendanceRecords.length > 0) {
+    // Update existing record - ONLY work_from_home and work_from_home_request_id columns
+    await connection.query(`
+      UPDATE attendance 
+      SET work_from_home = 1,
+          work_from_home_request_id = ?,
+          remarks = CONCAT(IFNULL(remarks, ''), ' Work from home approved via request #${requestId}'),
+          updated_at = NOW()
+      WHERE id = ?
+    `, [requestId, attendanceRecords[0].id]);
+    
+    console.log(`Updated existing attendance record with work from home for request #${requestId}`);
+  } else {
+    // Create new attendance record with work from home flags
+    await connection.query(`
+      INSERT INTO attendance 
+      (employee_id, date, work_from_home, work_from_home_request_id, remarks, created_at, updated_at)
+      VALUES (?, ?, 1, ?, 'Work from home approved via request #${requestId}', NOW(), NOW())
+    `, [request.employee_id, request.request_date, requestId]);
+    
+    console.log(`Created new work from home attendance record for request #${requestId}`);
+  }
+}
+
+// Handle leave_approval approval
+async handleLeaveApproval(connection, request, requestId) {
+  // Check if attendance record already exists for this date
+  const [attendanceRecords] = await connection.query(`
+    SELECT id FROM attendance 
+    WHERE employee_id = ? AND DATE(date) = DATE(?)
+  `, [request.employee_id, request.request_date]);
+
+  if (attendanceRecords.length > 0) {
+    // Update existing record
+    await connection.query(`
+      UPDATE attendance 
+      SET status = 'On Leave',
+          remarks = CONCAT(IFNULL(remarks, ''), ' Leave approved via request #${requestId}'),
+          updated_at = NOW()
+      WHERE id = ?
+    `, [attendanceRecords[0].id]);
+    
+    console.log(`Updated existing attendance record to On Leave for request #${requestId}`);
+  } else {
+    // Create new attendance record with On Leave status
+    await connection.query(`
+      INSERT INTO attendance 
+      (employee_id, date, status, remarks, created_at, updated_at)
+      VALUES (?, ?, 'On Leave', 'Leave approved via request #${requestId}', NOW(), NOW())
+    `, [request.employee_id, request.request_date]);
+    
+    console.log(`Created new On Leave attendance record for request #${requestId}`);
+  }
+}
 
   // COMPREHENSIVE NOTIFICATION FOR EMPLOYEE DECISION
 async notifyEmployeeDecisionComprehensive(employee, request, status, review_notes, requestType = 'unmark_absent') {
   try {
-    console.log(`🔔 Starting comprehensive decision notification for ${requestType} request ${request.id}`);
+    console.log(`🔔 Starting comprehensive decision notification for ${requestType} request ${request.id}`, {
+      environment: this.isProduction ? 'production' : 'development/staging',
+      smsEnabled: this.isProduction
+    });
     
     const statusText = status === 'approved' ? 'approved' : 'rejected';
     const requestTypeText = this.getRequestTypeText(requestType);
@@ -1145,12 +1278,15 @@ async notifyEmployeeDecisionComprehensive(employee, request, status, review_note
         .catch(err => console.error(`Decision email error:`, err))
     );
 
-    // SMS notification to employee
-    if (employee.phone) {
+    // SMS notification to employee - only in production
+    if (employee.phone && this.isProduction) {
       notificationPromises.push(
         this.sendDecisionSMSToEmployee(employee, request, status, review_notes, requestType)
           .catch(err => console.error(`Decision SMS error:`, err))
       );
+    } else if (employee.phone && !this.isProduction) {
+      console.log(`ℹ️ Decision SMS skipped for employee ${employee.employeeName} - not in production environment`);
+      notificationPromises.push(Promise.resolve({ type: 'sms', success: true, skipped: 'not_production' }));
     }
 
     // Execute all notification promises
@@ -1252,7 +1388,13 @@ async sendDecisionEmailToEmployee(employee, request, status, review_notes, reque
 // SEND DECISION SMS TO EMPLOYEE
 async sendDecisionSMSToEmployee(employee, request, status, review_notes, requestType = 'unmark_absent') {
   try {
-    if (!employee.phone || !process.env.TWILIO_ACCOUNT_SID) {
+    // Only send SMS in production environment
+    if (!this.isProduction) {
+      console.log(`ℹ️ Decision SMS skipped for employee ${employee.employeeName} - not in production environment`);
+      return { skipped: true, reason: 'not_production' };
+    }
+
+    if (!employee.phone || !twilioClient) {
       console.log(`No phone number or Twilio not configured for employee ${employee.employeeName}`);
       return;
     }
@@ -1339,7 +1481,9 @@ async sendDecisionSMSToEmployee(employee, request, status, review_notes, request
         data: {
           employee: employee.employeeName,
           type: type,
-          result: result
+          result: result,
+          environment: this.isProduction ? 'production' : 'development/staging',
+          smsEnabled: this.isProduction
         }
       });
 

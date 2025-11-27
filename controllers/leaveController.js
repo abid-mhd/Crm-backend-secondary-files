@@ -561,8 +561,26 @@ const updateLeaveStatus = async (req, res) => {
     
     const leave = leaves[0];
     
-    // Debug: Log the actual leave type from database
-    console.log('Leave type from DB:', leave.leave_type);
+    // ✅ FIXED: Use dates directly without timezone conversion
+    const startDate = new Date(leave.start_date);
+    const endDate = new Date(leave.end_date);
+    
+    // Extract date parts to avoid timezone issues
+    const localStartDate = new Date(startDate.getFullYear(), startDate.getMonth(), startDate.getDate());
+    const localEndDate = new Date(endDate.getFullYear(), endDate.getMonth(), endDate.getDate());
+    
+    console.log('Leave dates (raw from DB):', {
+      start_date: leave.start_date,
+      end_date: leave.end_date,
+      days: leave.days
+    });
+    
+    console.log('Leave dates (processed):', {
+      localStart: localStartDate.toISOString().split('T')[0],
+      localEnd: localEndDate.toISOString().split('T')[0],
+      startDate: startDate.toISOString(),
+      endDate: endDate.toISOString()
+    });
     
     // Update leave status
     await connection.query(
@@ -572,16 +590,16 @@ const updateLeaveStatus = async (req, res) => {
       [status, approvedBy, comments, id]
     );
     
-    // If approved, deduct from leave balance
+    // If approved, deduct from leave balance AND update attendance records
     if (status === 'Approved') {
-      // Map leave type to database column name - handle both cases
+      // Map leave type to database column name
       const leaveTypeMap = {
         'Casual Leave': 'casual_leave',
         'Sick Leave': 'sick_leave',
         'Permission': 'permission',
         'Women Special': 'women_special',
         'Woman Special': 'women_special',
-        'Women Special': 'women_special' // Add this line to handle potential mismatch
+        'Women Special': 'women_special'
       };
       
       const leaveTypeKey = leaveTypeMap[leave.leave_type];
@@ -594,7 +612,7 @@ const updateLeaveStatus = async (req, res) => {
         });
       }
       
-      // Check if the employee has a leave balance record and if the specific leave type has balance configured
+      // Check if the employee has a leave balance record
       const [balanceCheck] = await connection.query(
         'SELECT * FROM leave_balance WHERE employee_id = ?',
         [leave.employee_id]
@@ -617,18 +635,75 @@ const updateLeaveStatus = async (req, res) => {
           console.log(`No balance configured for ${leave.leave_type}, skipping deduction`);
         }
       }
+
+      // ✅ FIXED: Update attendance records without timezone conversion
+      let currentDate = new Date(localStartDate);
+      const finalEndDate = new Date(localEndDate);
+      let dateCount = 0;
+      
+      console.log('Processing attendance for dates:');
+      
+      while (currentDate <= finalEndDate) {
+        // Format date as YYYY-MM-DD without timezone conversion
+        const year = currentDate.getFullYear();
+        const month = String(currentDate.getMonth() + 1).padStart(2, '0');
+        const day = String(currentDate.getDate()).padStart(2, '0');
+        const formattedDate = `${year}-${month}-${day}`;
+        
+        console.log(`- Processing date: ${formattedDate}`);
+        
+        // Check if attendance record already exists for this date
+        const [existingAttendance] = await connection.query(
+          'SELECT id, status, remarks FROM attendance WHERE employee_id = ? AND date = ?',
+          [leave.employee_id, formattedDate]
+        );
+        
+        if (existingAttendance.length > 0) {
+          // Update existing attendance record
+          const existingRecord = existingAttendance[0];
+          const newRemarks = existingRecord.remarks 
+            ? `${existingRecord.remarks} | Leave Approved: ${leave.leave_type}`
+            : `Leave Approved: ${leave.leave_type}`;
+          
+          await connection.query(
+            `UPDATE attendance 
+             SET status = 'Paid Leave', 
+                 remarks = ?,
+                 updated_at = NOW()
+             WHERE employee_id = ? AND date = ?`,
+            [newRemarks, leave.employee_id, formattedDate]
+          );
+          
+          console.log(`  Updated existing attendance record for ${formattedDate}`);
+        } else {
+          // Insert new attendance record for the specific leave date
+          await connection.query(
+            `INSERT INTO attendance 
+             (employee_id, date, status, remarks, created_at, updated_at) 
+             VALUES (?, ?, 'Paid Leave', 'Leave Approved: ${leave.leave_type}', NOW(), NOW())`,
+            [leave.employee_id, formattedDate]
+          );
+          
+          console.log(`  Created new attendance record for ${formattedDate}`);
+        }
+        
+        dateCount++;
+        currentDate.setDate(currentDate.getDate() + 1);
+      }
+      
+      console.log(`Successfully updated ${dateCount} attendance records for ${leave.leave_type}`);
     }
     
     // If rejected and was previously approved, restore balance
     if (status === 'Rejected' && leave.status === 'Approved') {
-      // Map leave type to database column name - handle both cases
+      // Map leave type to database column name
       const leaveTypeMap = {
         'Casual Leave': 'casual_leave',
         'Sick Leave': 'sick_leave',
         'Permission': 'permission',
         'Women Special': 'women_special',
         'Woman Special': 'women_special',
-        'Women Special': 'women_special' // Add this line to handle potential mismatch
+        'Women Special': 'women_special'
       };
       
       const leaveTypeKey = leaveTypeMap[leave.leave_type];
@@ -641,7 +716,7 @@ const updateLeaveStatus = async (req, res) => {
         });
       }
       
-      // Check if the employee has a leave balance record and if the specific leave type had balance configured
+      // Check if the employee has a leave balance record
       const [balanceCheck] = await connection.query(
         'SELECT * FROM leave_balance WHERE employee_id = ?',
         [leave.employee_id]
@@ -664,6 +739,41 @@ const updateLeaveStatus = async (req, res) => {
           console.log(`No balance configured for ${leave.leave_type}, skipping restoration`);
         }
       }
+
+      // ✅ FIXED: Remove Paid Leave attendance records without timezone conversion
+      let currentDate = new Date(localStartDate);
+      const finalEndDate = new Date(localEndDate);
+      let removedCount = 0;
+      
+      while (currentDate <= finalEndDate) {
+        // Format date as YYYY-MM-DD without timezone conversion
+        const year = currentDate.getFullYear();
+        const month = String(currentDate.getMonth() + 1).padStart(2, '0');
+        const day = String(currentDate.getDate()).padStart(2, '0');
+        const formattedDate = `${year}-${month}-${day}`;
+        
+        // Check if attendance record exists and was marked as Paid Leave for this leave
+        const [existingAttendance] = await connection.query(
+          `SELECT id FROM attendance 
+           WHERE employee_id = ? AND date = ? AND status = 'Paid Leave' 
+           AND remarks LIKE ?`,
+          [leave.employee_id, formattedDate, `%Leave Approved: ${leave.leave_type}%`]
+        );
+        
+        if (existingAttendance.length > 0) {
+          // Delete the attendance record created for this leave
+          await connection.query(
+            'DELETE FROM attendance WHERE employee_id = ? AND date = ? AND status = "Paid Leave" AND remarks LIKE ?',
+            [leave.employee_id, formattedDate, `%Leave Approved: ${leave.leave_type}%`]
+          );
+          removedCount++;
+          console.log(`Removed attendance record for ${formattedDate}`);
+        }
+        
+        currentDate.setDate(currentDate.getDate() + 1);
+      }
+      
+      console.log(`Removed ${removedCount} Paid Leave attendance records for rejected leave`);
     }
 
     // Send notification to the employee about leave status update

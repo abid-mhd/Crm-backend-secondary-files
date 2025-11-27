@@ -8,10 +8,31 @@ const logAttendanceAction = async (attendanceId, action, details, changes = {}, 
   // Run in a separate connection to avoid transaction locks
   setImmediate(async () => {
     try {
-      const userName = req?.user?.name || 'System';
       const userId = req?.user?.id || null;
       const ipAddress = req?.ip || req?.connection?.remoteAddress || null;
       const userAgent = req?.get('user-agent') || null;
+      
+      let userName = 'System';
+      
+      // If user ID exists, fetch user name from users table
+      if (userId) {
+        try {
+          const [users] = await db.execute(
+            'SELECT name FROM users WHERE id = ?',
+            [userId]
+          );
+          
+          if (users.length > 0) {
+            userName = users[0].name;
+          } else {
+            console.warn(`⚠️ User not found with ID: ${userId}`);
+            userName = 'Unknown User';
+          }
+        } catch (userErr) {
+          console.error("❌ Error fetching user name:", userErr);
+          userName = 'Error Fetching Name';
+        }
+      }
 
       await db.execute(
         `INSERT INTO attendance_logs 
@@ -29,7 +50,7 @@ const logAttendanceAction = async (attendanceId, action, details, changes = {}, 
         ]
       );
       
-      console.log(`📝 Attendance log created for action: ${action}`);
+      console.log(`📝 Attendance log created for action: ${action} by user: ${userName}`);
     } catch (err) {
       console.error("❌ Error logging attendance action:", err);
       // Don't throw - logging should not break the main operation
@@ -98,108 +119,265 @@ const logAttendanceDeletion = async (attendanceId, req = null) => {
   }
 };
 
-
 function getClientIP(req) {
   try {
-    console.log('🔍 Starting enhanced IP detection...');
+    console.log('🔍 Enhanced IP detection started...');
     
-    // Check various headers for real client IP (in order of reliability)
+    // List of headers to check for real client IP (in priority order)
     const ipHeaders = [
-      'x-client-ip',
-      'x-forwarded-for', 
-      'cf-connecting-ip', // Cloudflare
-      'true-client-ip',
-      'x-real-ip',
-      'x-cluster-client-ip',
-      'x-forwarded',
-      'forwarded-for',
-      'forwarded'
+      'x-client-ip',           // Custom header
+      'x-forwarded-for',       // Standard proxy header
+      'x-real-ip',             // Nginx
+      'x-cluster-client-ip',   // Rackspace LB, Riverbed Stingray
+      'x-forwarded',           // General forward
+      'forwarded-for',         // RFC 7239
+      'forwarded',             // RFC 7239
+      'cf-connecting-ip',      // Cloudflare
+      'true-client-ip',        // Akamai, Cloudflare
+      'fastly-client-ip',      // Fastly
     ];
 
     let clientIP = null;
 
     // Check headers first
     for (const header of ipHeaders) {
-      const headerValue = req.headers[header];
-      if (headerValue && headerValue.trim() !== '') {
-        clientIP = headerValue.trim();
-        console.log(`📡 Found IP in header ${header}:`, clientIP);
+      const value = req.headers[header];
+      if (value) {
+        console.log(`📡 Found IP in ${header}:`, value);
         
-        // If x-forwarded-for contains multiple IPs, take the first one (client IP)
-        if (header === 'x-forwarded-for' && clientIP.includes(',')) {
-          clientIP = clientIP.split(',')[0].trim();
-          console.log(`📡 Extracted client IP from x-forwarded-for:`, clientIP);
+        // x-forwarded-for can contain multiple IPs (client, proxy1, proxy2...)
+        if (header === 'x-forwarded-for') {
+          const ips = value.split(',').map(ip => ip.trim());
+          // Get the first IP (original client)
+          clientIP = ips[0];
+          console.log('📡 Using first IP from x-forwarded-for:', clientIP);
+        } else {
+          clientIP = value;
         }
-        break;
+        
+        // Clean and validate the IP
+        clientIP = cleanIPAddressStrict(clientIP);
+        
+        if (clientIP && clientIP !== 'unknown' && clientIP !== '127.0.0.1') {
+          console.log(`✅ Using IP from ${header}: ${clientIP}`);
+          break;
+        }
       }
     }
 
-    // If still no IP found, check connection info
-    if (!clientIP) {
-      clientIP = req.connection?.remoteAddress || 
-                 req.socket?.remoteAddress ||
-                 (req.connection?.socket ? req.connection.socket.remoteAddress : null);
-      console.log(`📡 Using connection remoteAddress:`, clientIP);
-    }
-
-    // Final fallback - get server's network interfaces
-    if (!clientIP || clientIP === '::1' || clientIP === '127.0.0.1') {
-      console.log('🔄 Localhost detected, checking network interfaces...');
-      const networkInterfaces = os.networkInterfaces();
+    // If no valid IP from headers, check connection
+    if (!clientIP || clientIP === '127.0.0.1' || clientIP === 'unknown') {
+      const connectionIP = req.connection?.remoteAddress || 
+                          req.socket?.remoteAddress ||
+                          req.info?.remoteAddress;
       
-      // Find the first non-internal IPv4 address
-      for (const interfaceName in networkInterfaces) {
-        for (const interface of networkInterfaces[interfaceName]) {
-          if (!interface.internal && interface.family === 'IPv4') {
-            clientIP = interface.address;
-            console.log(`🌐 Using server network interface IP: ${clientIP} from ${interfaceName}`);
-            break;
-          }
-        }
-        if (clientIP && clientIP !== '::1' && clientIP !== '127.0.0.1') break;
+      if (connectionIP) {
+        clientIP = cleanIPAddressStrict(connectionIP);
+        console.log(`📡 Using connection IP: ${clientIP}`);
       }
     }
 
-    // If we still have localhost, try to get external IP
-    if (!clientIP || clientIP === '::1' || clientIP === '127.0.0.1') {
-      console.log('⚠️ Still localhost, using fallback method...');
-      // Try to get the IP from the first network interface
-      const networkInterfaces = os.networkInterfaces();
-      const eth0 = networkInterfaces['Ethernet'] || networkInterfaces['Wi-Fi'] || networkInterfaces['en0'] || networkInterfaces['eth0'];
-      if (eth0 && eth0.length > 0) {
-        for (const iface of eth0) {
-          if (!iface.internal && iface.family === 'IPv4') {
-            clientIP = iface.address;
-            console.log(`🔧 Fallback to interface IP: ${clientIP}`);
-            break;
-          }
-        }
-      }
+    // Final validation
+    if (!clientIP || clientIP === '127.0.0.1' || clientIP === '::1') {
+      console.log('❌ No valid client IP detected, using local network IP');
+      clientIP = getLocalNetworkIP() || 'unknown';
     }
 
-    // Final safety check
-    if (!clientIP || clientIP === '::1' || clientIP === '127.0.0.1') {
-      console.log('❌ Could not determine real LAN IP, using localhost');
-      clientIP = '127.0.0.1';
-    }
-
-    console.log('✅ Final detected IP:', clientIP);
+    console.log('✅ Final client IP:', clientIP);
     return clientIP;
   } catch (error) {
-    console.error('❌ Error getting client IP:', error);
-    return 'unknown';
+    console.error('❌ Error in getClientIP:', error);
+    return getLocalNetworkIP() || 'unknown';
   }
 }
 
-// Enhanced LAN validation function with Work From Home check
-// Modified LAN validation function - ALLOWS ALL REQUESTS
+// Helper function to check if IP is in local network range
+function isLocalNetworkIP(ip) {
+  if (!ip) return false;
+  
+  const cleanIP = cleanIPAddressStrict(ip);
+  
+  // Localhost
+  if (cleanIP === '127.0.0.1' || cleanIP === '::1') return true;
+  
+  // Private network ranges
+  if (cleanIP.startsWith('10.')) return true;
+  if (cleanIP.startsWith('192.168.')) return true;
+  if (cleanIP.startsWith('172.')) {
+    const secondOctet = parseInt(cleanIP.split('.')[1]);
+    if (secondOctet >= 16 && secondOctet <= 31) return true;
+  }
+  
+  return false;
+}
+
+// Get server's local network IP
+function getLocalNetworkIP() {
+  try {
+    const networkInterfaces = os.networkInterfaces();
+    
+    // Priority interfaces (Ethernet/Wi-Fi)
+    const priorityInterfaces = ['Ethernet', 'eth0', 'en0', 'Wi-Fi', 'wlan0'];
+    
+    for (const interfaceName of priorityInterfaces) {
+      const iface = networkInterfaces[interfaceName];
+      if (iface) {
+        for (const config of iface) {
+          if (config.family === 'IPv4' && !config.internal && isLocalNetworkIP(config.address)) {
+            console.log(`🔍 Found local IP on ${interfaceName}: ${config.address}`);
+            return config.address;
+          }
+        }
+      }
+    }
+    
+    // Fallback: any non-internal IPv4
+    for (const interfaceName in networkInterfaces) {
+      for (const config of networkInterfaces[interfaceName]) {
+        if (config.family === 'IPv4' && !config.internal && isLocalNetworkIP(config.address)) {
+          console.log(`🔍 Fallback local IP on ${interfaceName}: ${config.address}`);
+          return config.address;
+        }
+      }
+    }
+    
+    return null;
+  } catch (error) {
+    console.error('Error getting local network IP:', error);
+    return null;
+  }
+}
+
+// Use this endpoint to update the employee's LAN IP
+exports.fixEmployeeLAN = async (req, res) => {
+  try {
+    const { employeeId } = req.params;
+    const { newLANIP } = req.body;
+
+    // Get current meta
+    const [employeeData] = await db.query(
+      "SELECT meta FROM employees WHERE id = ?",
+      [employeeId]
+    );
+
+    if (employeeData.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Employee not found' 
+      });
+    }
+
+    let meta = {};
+    try {
+      meta = typeof employeeData[0].meta === 'string' 
+        ? JSON.parse(employeeData[0].meta) 
+        : employeeData[0].meta || {};
+    } catch (error) {
+      console.error('Error parsing meta:', error);
+    }
+
+    // Update LAN IP
+    meta.lan_no = newLANIP;
+    meta.lan_updated_at = new Date().toISOString();
+
+    await db.query(
+      "UPDATE employees SET meta = ? WHERE id = ?",
+      [JSON.stringify(meta), employeeId]
+    );
+
+    res.json({ 
+      success: true, 
+      message: 'LAN IP updated successfully',
+      data: { newLANIP }
+    });
+  } catch (error) {
+    console.error('Error updating LAN IP:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Error updating LAN IP' 
+    });
+  }
+};
+
+
+exports.networkDiagnostics = async (req, res) => {
+  try {
+    const clientIP = getClientIP(req);
+    const networkInterfaces = os.networkInterfaces();
+    
+    const diagnostics = {
+      client: {
+        ip: clientIP,
+        isLocal: isLocalNetworkIP(clientIP),
+        headers: {
+          'x-forwarded-for': req.headers['x-forwarded-for'],
+          'x-real-ip': req.headers['x-real-ip'],
+          'x-client-ip': req.headers['x-client-ip']
+        }
+      },
+      server: {
+        networkInterfaces: {},
+        localIPs: []
+      },
+      recommendations: []
+    };
+
+    // Collect server network info
+    Object.keys(networkInterfaces).forEach(interfaceName => {
+      diagnostics.server.networkInterfaces[interfaceName] = 
+        networkInterfaces[interfaceName].map(iface => ({
+          family: iface.family,
+          address: iface.address,
+          internal: iface.internal,
+          localNetwork: isLocalNetworkIP(iface.address)
+        }));
+      
+      // Collect local IPs
+      networkInterfaces[interfaceName].forEach(iface => {
+        if (iface.family === 'IPv4' && !iface.internal && isLocalNetworkIP(iface.address)) {
+          diagnostics.server.localIPs.push({
+            interface: interfaceName,
+            address: iface.address
+          });
+        }
+      });
+    });
+
+    // Generate recommendations
+    if (!diagnostics.client.isLocal) {
+      diagnostics.recommendations.push(
+        'Client is accessing from external network. Use Work From Home approval or VPN.'
+      );
+    }
+
+    if (diagnostics.server.localIPs.length === 0) {
+      diagnostics.recommendations.push(
+        'No local network IPs detected on server. Check network configuration.'
+      );
+    }
+
+    res.json({
+      success: true,
+      data: diagnostics,
+      message: 'Network diagnostics completed'
+    });
+  } catch (error) {
+    console.error('Network diagnostics error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error running network diagnostics'
+    });
+  }
+};
+
+// Enhanced LAN validation function with Work From Home check and STRICT IP validation
 async function validateEmployeeLAN(employeeId, req, isCheckIn = true) {
   try {
-    console.log('🔓 LAN VALIDATION DISABLED - Allowing all requests');
+    console.log('🔐 Starting STRICT LAN validation for employee:', employeeId);
     
-    // Get employee details for logging
+    // Get employee details
     const [employeeData] = await db.query(
-      "SELECT employeeName FROM employees WHERE id = ? AND active = 1",
+      "SELECT employeeName, meta FROM employees WHERE id = ? AND active = 1",
       [employeeId]
     );
 
@@ -211,8 +389,32 @@ async function validateEmployeeLAN(employeeId, req, isCheckIn = true) {
     }
 
     const employee = employeeData[0];
+    let allowedLAN = null;
+    let wfhEnabled = false;
+    let metaData = {};
     
-    // Check if employee has approved work from home request for today (optional)
+    try {
+      metaData = typeof employee.meta === 'string' 
+        ? JSON.parse(employee.meta) 
+        : employee.meta || {};
+      allowedLAN = metaData.lan_no || null;
+      wfhEnabled = metaData.wfh_enabled || false;
+    } catch (error) {
+      console.error('Error parsing employee meta data:', error);
+    }
+
+    // Check if employee has wfh_enabled flag (permanent WFH)
+    if (wfhEnabled) {
+      console.log('✅ Employee has WFH enabled - skipping LAN validation permanently');
+      return {
+        allowed: true,
+        reason: 'Work From Home permanently enabled for this employee',
+        workFromHome: true,
+        wfhEnabled: true
+      };
+    }
+
+    // Check Work From Home requests for today
     const today = new Date().toISOString().split('T')[0];
     const [workFromHomeRequests] = await db.query(`
       SELECT id, status 
@@ -225,33 +427,151 @@ async function validateEmployeeLAN(employeeId, req, isCheckIn = true) {
 
     const hasApprovedWFH = workFromHomeRequests.length > 0;
 
-    console.log('🔓 LAN VALIDATION BYPASSED:', {
-      employeeId: employeeId,
+    console.log('🔐 EMPLOYEE CONFIG:', {
+      employeeId,
       employeeName: employee.employeeName,
-      hasApprovedWFH: hasApprovedWFH,
-      note: 'LAN restriction is currently disabled'
+      allowedLAN,
+      wfhEnabled,
+      hasApprovedWFH
     });
 
-    // ALWAYS ALLOW - LAN validation disabled
+    // Allow if Work From Home approved for today
+    if (hasApprovedWFH) {
+      console.log('✅ Work From Home approved for today - skipping LAN validation');
+      return {
+        allowed: true,
+        reason: 'Work From Home approved for today',
+        workFromHome: true,
+        requestId: workFromHomeRequests[0].id
+      };
+    }
+
+    // STRICT: If no LAN restriction is set, DENY access
+    if (!allowedLAN || allowedLAN.trim() === '') {
+      console.log('🚫 No LAN restriction set - access denied in strict mode');
+      return {
+        allowed: false,
+        reason: 'No LAN IP configured and no Work From Home approved',
+        details: {
+          help: 'Contact HR to setup LAN IP or get WFH approval'
+        }
+      };
+    }
+
+    // Get client IP with enhanced detection
+    const clientIP = getClientIP(req);
+    const cleanAllowedLAN = allowedLAN.trim();
+    const cleanClientIP = cleanIPAddressStrict(clientIP);
+
+    console.log('🔐 STRICT IP COMPARISON:', {
+      cleanClientIP,
+      cleanAllowedLAN,
+      isLocalNetwork: isLocalNetworkIP(cleanClientIP),
+      wfhEnabled: wfhEnabled
+    });
+
+    // STRICT: Deny localhost/loopback in production/staging
+    if (cleanClientIP === '127.0.0.1' || cleanClientIP === '::1') {
+      console.log('🚫 Localhost IP detected - access denied in strict mode');
+      return {
+        allowed: false,
+        reason: 'Localhost access not allowed',
+        details: {
+          detectedIP: cleanClientIP,
+          registeredIP: cleanAllowedLAN,
+          help: 'Access from localhost is not permitted for attendance marking'
+        }
+      };
+    }
+
+    // STRICT: Enhanced IP matching
+    const ipValidation = validateIPAgainstLANStrict(cleanClientIP, cleanAllowedLAN);
+
+    if (ipValidation.isAllowed) {
+      console.log('✅ STRICT LAN validation successful:', ipValidation.matchType);
+      return {
+        allowed: true,
+        reason: `LAN IP validated (${ipValidation.matchType})`,
+        ipMatch: true,
+        matchType: ipValidation.matchType
+      };
+    }
+
+    // If IP doesn't match, provide detailed error
+    console.log('🚫 STRICT LAN validation failed');
     return {
-      allowed: true,
-      reason: 'LAN validation disabled - all requests allowed',
-      workFromHome: hasApprovedWFH,
-      requestId: hasApprovedWFH ? workFromHomeRequests[0].id : null,
-      bypass: true
+      allowed: false,
+      reason: `Network validation failed - IP mismatch`,
+      details: {
+        detectedIP: cleanClientIP,
+        registeredIP: cleanAllowedLAN,
+        matchType: ipValidation.matchType,
+        isLocalNetwork: isLocalNetworkIP(cleanClientIP),
+        hasWorkFromHome: false,
+        wfhEnabled: wfhEnabled,
+        help: `Your IP (${cleanClientIP}) doesn't match registered LAN IP (${cleanAllowedLAN}). Connect to office network or get Work From Home approval.`
+      }
     };
 
   } catch (error) {
-    console.error('❌ Error in LAN validation (bypassed):', error);
-    // Even on error, allow the request
+    console.error('❌ Error in LAN validation:', error);
     return {
-      allowed: true,
-      reason: 'LAN validation error - request allowed anyway',
-      error: error.message,
-      bypass: true
+      allowed: false,
+      reason: 'Error during LAN validation',
+      error: error.message
     };
   }
 }
+
+// Enhanced debug endpoint for IP detection issues
+exports.debugIPDetection = async (req, res) => {
+  try {
+    const clientIP = getClientIP(req);
+    
+    // Get all headers that might contain IP information
+    const ipHeaders = {};
+    const possibleHeaders = [
+      'x-client-ip', 'x-forwarded-for', 'x-real-ip', 
+      'x-cluster-client-ip', 'x-forwarded', 'forwarded-for', 
+      'forwarded', 'cf-connecting-ip', 'true-client-ip'
+    ];
+    
+    possibleHeaders.forEach(header => {
+      if (req.headers[header]) {
+        ipHeaders[header] = req.headers[header];
+      }
+    });
+
+    // Network information
+    const networkInfo = {
+      clientIP: clientIP,
+      connection: {
+        remoteAddress: req.connection?.remoteAddress,
+        socketRemoteAddress: req.socket?.remoteAddress,
+        remotePort: req.connection?.remotePort
+      },
+      headers: ipHeaders,
+      serverIPs: getLocalNetworkIP(),
+      networkInterfaces: os.networkInterfaces(),
+      environment: process.env.NODE_ENV || 'development'
+    };
+
+    console.log('🔧 ENHANCED IP DEBUG INFO:', networkInfo);
+
+    res.json({
+      success: true,
+      data: networkInfo,
+      message: 'Enhanced IP detection debug information'
+    });
+  } catch (error) {
+    console.error('Error in IP debug:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error during IP debug',
+      error: error.message
+    });
+  }
+};
 
 // Enhanced mark attendance with comprehensive validation
 // exports.markAttendance = async (req, res) => {
@@ -1068,14 +1388,16 @@ exports.addEmployee = async (req, res) => {
       salary,
       last_month_due = 0,
       balance = 0,
-      lan_no = null // Added LAN No field
+      lan_no = null,
+      wfh_enabled = false // Add wfh_enabled parameter
     } = req.body;
 
     const meta = JSON.stringify({
       addedBy: "system",
       internalNote: "Added via backend",
       timestamp: new Date().toISOString(),
-      lan_no: lan_no // Store LAN No in meta
+      lan_no: lan_no,
+      wfh_enabled: wfh_enabled // Store WFH enabled flag
     });
 
     await db.query(
@@ -1089,7 +1411,9 @@ exports.addEmployee = async (req, res) => {
 
     res.status(201).json({ 
       message: "Employee added successfully",
-      note: lan_no ? 
+      note: wfh_enabled ? 
+        'Employee can check in from any location (WFH Enabled)' :
+        lan_no ? 
         `Employee can check in from LAN IP: ${lan_no}` : 
         'Employee will need Work From Home approval to check in'
     });
@@ -1111,7 +1435,8 @@ exports.updateEmployee = async (req, res) => {
       salary,
       last_month_due,
       balance,
-      lan_no = null // Added LAN No field
+      lan_no = null,
+      wfh_enabled = false // Add wfh_enabled parameter
     } = req.body;
 
     // Get current meta data to preserve existing settings
@@ -1131,8 +1456,9 @@ exports.updateEmployee = async (req, res) => {
       }
     }
 
-    // Update LAN number in meta
+    // Update LAN number and WFH enabled in meta
     meta.lan_no = lan_no;
+    meta.wfh_enabled = wfh_enabled;
     meta.updatedBy = "system";
     meta.timestamp = new Date().toISOString();
 
@@ -1147,7 +1473,9 @@ exports.updateEmployee = async (req, res) => {
 
     res.json({ 
       message: "Employee updated successfully",
-      note: lan_no ? 
+      note: wfh_enabled ? 
+        'WFH enabled - employee can check in from any location' :
+        lan_no ? 
         `LAN IP updated to: ${lan_no}` : 
         'LAN IP removed - employee will need Work From Home approval'
     });
@@ -1226,7 +1554,7 @@ exports.markAttendance = async (req, res) => {
     
     const targetDate = date ? new Date(date).toISOString().split('T')[0] : new Date().toISOString().split('T')[0];
 
-    console.log('🔄 Marking attendance (LAN DISABLED) for:', { 
+    console.log('🔄 Marking attendance for:', { 
       employeeId, 
       status, 
       targetDate, 
@@ -1235,16 +1563,46 @@ exports.markAttendance = async (req, res) => {
       locationData 
     });
 
-    // 🚫 SKIP LAN VALIDATION COMPLETELY
-    console.log('🔓 LAN VALIDATION DISABLED - Proceeding without IP check');
+    // Enhanced LAN validation for check-in/check-out with WFH check
+    let lanValidation = null;
+    let isWFHApproved = false;
+    let isWFHEnabled = false;
     
-    let lanValidation = {
-      allowed: true,
-      reason: 'LAN validation disabled',
-      bypass: true
-    };
+    if (checkIn || checkOut) {
+      console.log('🔐 Performing comprehensive LAN/WFH validation...');
+      const isCheckIn = !!checkIn && !checkOut;
+      lanValidation = await validateEmployeeLAN(employeeId, req, isCheckIn);
+      
+      if (!lanValidation.allowed) {
+        console.log('🚫 LAN/WFH validation failed:', lanValidation);
+        await conn.rollback();
+        
+        return res.status(403).json({ 
+          success: false, 
+          message: 'Access denied - LAN validation failed',
+          error: lanValidation.reason,
+          details: lanValidation.details || {},
+          help: lanValidation.details?.help || 'Please ensure you are connected to the office network or have approved Work From Home',
+          debug: {
+            clientIP: getClientIP(req),
+            validationDetails: lanValidation
+          }
+        });
+      } else {
+        if (lanValidation.workFromHome) {
+          isWFHApproved = true;
+          console.log('✅ Work From Home approved - LAN validation bypassed');
+        }
+        if (lanValidation.wfhEnabled) {
+          isWFHEnabled = true;
+          console.log('✅ Permanent Work From Home enabled');
+        }
+        console.log('✅ LAN validation passed:', lanValidation.reason);
+      }
+    } else {
+      console.log('ℹ️ Skipping LAN validation for status-only update');
+    }
 
-    // Rest of your existing markAttendance code remains the same...
     // Validate location data structure if provided
     let locationJson = null;
     if (locationData) {
@@ -1285,6 +1643,12 @@ exports.markAttendance = async (req, res) => {
       updateData.location_data = locationJson;
     }
     
+    // Add work from home flag if applicable
+    if (isWFHApproved) {
+      updateData.work_from_home = true;
+      updateData.work_from_home_request_id = lanValidation?.requestId || null;
+    }
+    
     // Only update check_in if it's provided and not already set
     if (checkIn && (!existing[0]?.check_in || existing[0]?.check_in === '00:00:00')) {
       updateData.check_in = checkIn;
@@ -1323,6 +1687,12 @@ exports.markAttendance = async (req, res) => {
         updated_at: new Date(),
         ip_address: getClientIP(req)
       };
+      
+      // Add work from home data only if WFH is approved
+      if (isWFHApproved) {
+        newData.work_from_home = true;
+        newData.work_from_home_request_id = lanValidation?.requestId || null;
+      }
       
       if (checkIn) newData.check_in = checkIn;
       if (checkOut) newData.check_out = checkOut;
@@ -1370,28 +1740,37 @@ exports.markAttendance = async (req, res) => {
       status: status,
       checkIn: checkIn || null,
       checkOut: checkOut || null,
-      locationRecorded: !!locationData,
-      lanBypassed: true
+      workFromHome: isWFHApproved,
+      locationRecorded: !!locationData
     };
 
     await logAttendanceAction(
       attendanceId,
       actionType,
-      `${employeeName} - ${logDetails} (LAN validation disabled)`,
+      `${employeeName} - ${logDetails}`,
       changes,
       req
     );
 
+    // Prepare response message based on WFH status
+    let message = 'Attendance marked successfully';
+    if (isWFHEnabled) {
+      message = 'Attendance marked successfully (LAN Disabled)';
+    } else if (isWFHApproved) {
+      message = 'Attendance marked successfully (Work From Home)';
+    }
+
     res.json({ 
       success: true, 
-      message: 'Attendance marked successfully (LAN validation disabled)',
+      message: message,
       locationRecorded: !!locationData,
-      workFromHome: false,
-      ipChecked: false,
+      workFromHome: isWFHApproved,
+      wfhEnabled: isWFHEnabled,
+      ipChecked: true,
       ipAllowed: true,
-      lanBypassed: true,
       attendanceId: attendanceId
     });
+
   } catch (error) {
     await conn.rollback();
     console.error('❌ Error marking attendance:', error);
@@ -1898,16 +2277,18 @@ exports.getAttendanceHistory = async (req, res) => {
       SELECT 
         id,
         date,
+        updated_at,
         status,
         check_in as checkIn,
         check_out as checkOut,
         overtime_hours as overtimeHours,
         overtime_amount as overtimeAmount,
         remarks,
-        location_data as locationData
+        location_data as locationData,
+        work_from_home as workFromHome
       FROM attendance 
       WHERE employee_id = ? 
-        AND date BETWEEN ? AND ?
+        AND updated_at BETWEEN ? AND ?
       ORDER BY date DESC
     `, [employeeId, startDate, endDate]);
 

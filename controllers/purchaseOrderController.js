@@ -1,4 +1,8 @@
 const db = require("../config/db");
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
+const XLSX = require('xlsx');
 
 // Helper function to calculate item base amount
 function calculateItemBaseAmount(item) {
@@ -55,31 +59,1163 @@ function calculateItemAmounts(item, taxType = 'sgst_cgst') {
   };
 }
 
+// Helper function to log purchase order actions - RUNS OUTSIDE TRANSACTION
+const logPurchaseOrderAction = async (orderId, action, details, changes = {}, req = null) => {
+  // Run in a separate connection to avoid transaction locks
+  setImmediate(async () => {
+    try {
+      const userId = req?.user?.id || null;
+      const ipAddress = req?.ip || req?.connection?.remoteAddress || null;
+      const userAgent = req?.get('user-agent') || null;
+      
+      let userName = 'System';
+      
+      // If user ID exists, fetch user name from users table
+      if (userId) {
+        try {
+          const [users] = await db.execute(
+            'SELECT name FROM users WHERE id = ?',
+            [userId]
+          );
+          
+          if (users.length > 0) {
+            userName = users[0].name;
+          } else {
+            console.warn(`⚠️ User not found with ID: ${userId}`);
+            userName = 'Unknown User';
+          }
+        } catch (userErr) {
+          console.error("❌ Error fetching user name:", userErr);
+          userName = 'Error Fetching Name';
+        }
+      }
+
+      await db.execute(
+        `INSERT INTO invoice_history 
+         (invoiceId, action, userId, userName, changes, details, ipAddress, userAgent) 
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          orderId,
+          action,
+          userId,
+          userName,
+          JSON.stringify(changes),
+          details,
+          ipAddress,
+          userAgent
+        ]
+      );
+      
+      console.log(`📝 Purchase order history created for action: ${action} by user: ${userName}`);
+    } catch (err) {
+      console.error("❌ Error logging purchase order action:", err);
+      // Don't throw - logging should not break the main operation
+    }
+  });
+};
+
 // Get next purchase order number
 exports.getNextPurchaseOrderNumber = async (req, res) => {
   try {
     const [purchaseOrders] = await db.execute(`
       SELECT invoiceNumber FROM invoices 
       WHERE type = 'purchase_order' 
+      AND invoiceNumber LIKE 'ICE/25-26/PO/%'
       ORDER BY createdAt DESC 
       LIMIT 1
     `);
 
-    let nextNumber = "0001";
+    let nextNumber = "ICE/25-26/PO/001";
     
     if (purchaseOrders.length > 0) {
       const lastInvoiceNumber = purchaseOrders[0].invoiceNumber;
+      console.log('Last invoice number:', lastInvoiceNumber);
+      
       // Extract the numeric part from the last invoice number
-      const matches = lastInvoiceNumber.match(/\d+/g);
-      if (matches && matches.length > 0) {
-        const lastNumber = parseInt(matches[matches.length - 1]);
-        nextNumber = (lastNumber + 1).toString().padStart(4, '0');
+      const matches = lastInvoiceNumber.match(/ICE\/25-26\/PO\/(\d+)/);
+      if (matches && matches[1]) {
+        const lastNumber = parseInt(matches[1]);
+        nextNumber = `ICE/25-26/PO/${(lastNumber + 1).toString().padStart(3, '0')}`;
       }
     }
 
+    console.log('Generated next PO number:', nextNumber);
     res.json({ nextNumber });
   } catch (err) {
     console.error("Error generating purchase order number:", err);
+    res.status(500).json({ message: "Database error" });
+  }
+};
+
+// Configure multer for file uploads
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    const uploadDir = 'uploads/purchase-orders/';
+    if (!fs.existsSync(uploadDir)) {
+      fs.mkdirSync(uploadDir, { recursive: true });
+    }
+    cb(null, uploadDir);
+  },
+  filename: (req, file, cb) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    if (file.mimetype === 'application/pdf') {
+      cb(null, 'po-pdf-' + uniqueSuffix + path.extname(file.originalname));
+    } else {
+      cb(null, 'po-excel-' + uniqueSuffix + path.extname(file.originalname));
+    }
+  }
+});
+
+const upload = multer({ 
+  storage: storage,
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype === 'application/pdf' || 
+        file.mimetype === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' ||
+        file.mimetype === 'application/vnd.ms-excel') {
+      cb(null, true);
+    } else {
+      cb(new Error('Only PDF and Excel files are allowed'), false);
+    }
+  },
+  limits: {
+    fileSize: 10 * 1024 * 1024 // 10MB limit
+  }
+});
+
+exports.upload = upload;
+
+// Helper function to find or create supplier
+async function findOrCreateSupplier(supplierName, gstin, pan, conn = db) {
+  if (!supplierName) return null;
+
+  try {
+    // Try to find existing supplier
+    const [existingSuppliers] = await conn.execute(
+      'SELECT id FROM parties WHERE partyName = ? AND (partyType = "supplier" OR partyType IS NULL)',
+      [supplierName.trim()]
+    );
+
+    if (existingSuppliers.length > 0) {
+      return existingSuppliers[0].id;
+    }
+
+    // Create new supplier
+    const [result] = await conn.execute(
+      'INSERT INTO parties (partyName, partyType, gstin, pan, createdAt, updatedAt) VALUES (?, "supplier", ?, ?, NOW(), NOW())',
+      [supplierName.trim(), gstin || null, pan || null]
+    );
+
+    return result.insertId;
+  } catch (error) {
+    console.error('Error finding/creating supplier:', error);
+    return null;
+  }
+}
+
+// Helper function to generate next PO number
+async function getNextPurchaseOrderNumber(conn) {
+  try {
+    const [purchaseOrders] = await conn.execute(`
+      SELECT invoiceNumber FROM invoices 
+      WHERE type = 'purchase_order' 
+      AND invoiceNumber LIKE 'ICE/25-26/PO/%'
+      ORDER BY createdAt DESC 
+      LIMIT 1
+    `);
+
+    let nextNumber = "ICE/25-26/PO/001";
+    
+    if (purchaseOrders.length > 0) {
+      const lastInvoiceNumber = purchaseOrders[0].invoiceNumber;
+      console.log('Last invoice number in import:', lastInvoiceNumber);
+      
+      // Extract the numeric part from the last invoice number
+      const matches = lastInvoiceNumber.match(/ICE\/25-26\/PO\/(\d+)/);
+      if (matches && matches[1]) {
+        const lastNumber = parseInt(matches[1]);
+        nextNumber = `ICE/25-26/PO/${(lastNumber + 1).toString().padStart(3, '0')}`;
+      }
+    }
+
+    console.log('Generated next PO number for import:', nextNumber);
+    return nextNumber;
+  } catch (err) {
+    console.error("Error generating purchase order number in import:", err);
+    return "ICE/25-26/PO/001";
+  }
+}
+
+// Import purchase orders from Excel
+async function findOrCreateSupplierWithAddress(supplierName, gstin, pan, billingAddress, shippingAddress, mobile = '', email = '', conn = db) {
+  if (!supplierName) {
+    console.error('Supplier name is required');
+    return null;
+  }
+
+  try {
+    const trimmedName = supplierName.toString().trim();
+    
+    // Try to find existing supplier by name (case insensitive) or GSTIN
+    let [existingSuppliers] = await conn.execute(
+      `SELECT id FROM parties 
+       WHERE (LOWER(partyName) = LOWER(?) OR gstin = ?) 
+       AND (partyType = 'Supplier' OR partyType IS NULL OR partyType = '') 
+       LIMIT 1`,
+      [trimmedName, gstin]
+    );
+
+    if (existingSuppliers.length > 0) {
+      console.log(`Found existing supplier: ${trimmedName}, ID: ${existingSuppliers[0].id}`);
+      
+      // Update existing supplier with address if needed
+      const supplierId = existingSuppliers[0].id;
+      try {
+        await conn.execute(
+          `UPDATE parties SET 
+           billingAddress = COALESCE(?, billingAddress), 
+           shippingAddress = COALESCE(?, shippingAddress), 
+           gstin = COALESCE(?, gstin), 
+           pan = COALESCE(?, pan), 
+           updatedAt = NOW() 
+           WHERE id = ?`,
+          [billingAddress, shippingAddress, gstin, pan, supplierId]
+        );
+      } catch (updateError) {
+        console.error('Error updating supplier:', updateError);
+        // Continue with existing supplier even if update fails
+      }
+      return supplierId;
+    }
+
+    // Create new supplier with ALL required fields
+    console.log(`Creating new supplier: ${trimmedName}`);
+    const [result] = await conn.execute(
+      `INSERT INTO parties 
+      (partyName, mobile, email, partyType, category, gstin, pan, billingAddress, shippingAddress, createdAt, updatedAt) 
+      VALUES (?, ?, ?, 'Supplier', 'Wholesale', ?, ?, ?, ?, NOW(), NOW())`,
+      [
+        trimmedName,
+        mobile || '0000000000', // Default mobile number
+        email || `${trimmedName.replace(/\s+/g, '').toLowerCase()}@supplier.com`, // Default email
+        gstin || null, 
+        pan || null, 
+        billingAddress || '', 
+        shippingAddress || ''
+      ]
+    );
+
+    console.log(`Created new supplier with ID: ${result.insertId}`);
+    return result.insertId;
+
+  } catch (error) {
+    console.error('Error in findOrCreateSupplierWithAddress:', error);
+    
+    // Check for specific MySQL errors
+    if (error.code === 'ER_DUP_ENTRY') {
+      console.error('Duplicate entry error - supplier might already exist');
+      // Try to find the supplier again
+      try {
+        const [suppliers] = await conn.execute(
+          'SELECT id FROM parties WHERE LOWER(partyName) = LOWER(?) AND partyType = "Supplier" LIMIT 1',
+          [supplierName.trim()]
+        );
+        if (suppliers.length > 0) {
+          return suppliers[0].id;
+        }
+      } catch (retryError) {
+        console.error('Error retrying supplier search:', retryError);
+      }
+    }
+    
+    return null;
+  }
+}
+
+// Enhanced import purchase orders from Excel with logging
+exports.importPurchaseOrders = async (req, res) => {
+  const conn = await db.getConnection();
+  
+  try {
+    await conn.beginTransaction();
+
+    // Check for Excel file
+    if (!req.files || !req.files.file) {
+      return res.status(400).json({ 
+        success: false,
+        message: 'No Excel file uploaded' 
+      });
+    }
+
+    const excelFile = req.files.file[0];
+    
+    // Extract individual PDF files
+    const individualPDFs = {};
+    Object.entries(req.files).forEach(([fieldName, fileArray]) => {
+      if (fieldName.startsWith('pdf_') && fileArray && fileArray[0]) {
+        const rowIndex = fieldName.replace('pdf_', '');
+        individualPDFs[rowIndex] = fileArray[0];
+      }
+    });
+
+    console.log('Excel file:', excelFile.filename);
+    console.log('Individual PDF files:', Object.keys(individualPDFs).length);
+
+    // Read Excel file
+    const workbook = XLSX.readFile(excelFile.path);
+    const sheetName = workbook.SheetNames[0];
+    const worksheet = workbook.Sheets[sheetName];
+    
+    // Convert to JSON with header row
+    const jsonData = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
+    
+    if (jsonData.length <= 1) {
+      // Clean up files
+      fs.unlinkSync(excelFile.path);
+      Object.values(individualPDFs).forEach(pdfFile => {
+        fs.unlinkSync(pdfFile.path);
+      });
+      
+      return res.status(400).json({
+        success: false,
+        message: 'Excel file is empty or has no data rows'
+      });
+    }
+
+    // Extract headers and data
+    const headers = jsonData[0].map(header => header ? header.toString().trim() : '');
+    const dataRows = jsonData.slice(1);
+
+    console.log('Headers found:', headers);
+    console.log('Number of data rows:', dataRows.length);
+
+    const results = {
+      successful: [],
+      failed: []
+    };
+
+    // Get the starting PO number for this import batch
+    let currentPONumber = await getNextPurchaseOrderNumber(conn);
+    console.log('Starting PO number for import batch:', currentPONumber);
+
+    // Process each row
+    for (const [index, row] of dataRows.entries()) {
+      let rowData = {};
+      let rowPDF = individualPDFs[index.toString()]; // Get PDF for this specific row
+      
+      try {
+        // Skip empty rows
+        if (row.length === 0 || !row.some(cell => cell !== null && cell !== undefined && cell !== '')) {
+          console.log(`Skipping empty row ${index + 2}`);
+          continue;
+        }
+
+        // Create row object from headers and data
+        headers.forEach((header, colIndex) => {
+          if (header && row[colIndex] !== undefined && row[colIndex] !== null) {
+            rowData[header] = row[colIndex];
+          }
+        });
+
+        console.log(`Processing row ${index + 2}:`, rowData);
+        console.log(`PDF for row ${index + 2}:`, rowPDF ? rowPDF.filename : 'No PDF');
+
+        // Check if custom PO number is provided
+        let orderNumber = currentPONumber;
+        if (rowData['PO Number'] && rowData['PO Number'].toString().trim() !== '') {
+          // Use custom PO number if provided
+          orderNumber = rowData['PO Number'].toString().trim();
+          console.log(`Using custom PO number: ${orderNumber}`);
+        } else {
+          // Use auto-generated number and increment for next row
+          console.log(`Using auto-generated PO number: ${orderNumber}`);
+          
+          // Extract current number and prepare next one
+          const matches = currentPONumber.match(/ICE\/25-26\/PO\/(\d+)/);
+          if (matches && matches[1]) {
+            const currentNumber = parseInt(matches[1]);
+            const nextNumber = currentNumber + 1;
+            currentPONumber = `ICE/25-26/PO/${nextNumber.toString().padStart(3, '0')}`;
+          }
+        }
+
+        // Validate required fields - updated for multi-item support
+        const requiredFields = [
+          'Vendor Name*', 'GSTIN / PAN*', 'Billing Address*', 'Shipping Address*',
+          'Contact Mobile*', 'Contact Email*'
+        ];
+        
+        const missingFields = requiredFields.filter(field => {
+          const value = rowData[field];
+          return value === undefined || value === null || value === '' || 
+                 (typeof value === 'string' && value.trim() === '');
+        });
+        
+        if (missingFields.length > 0) {
+          const errorMsg = `Missing required fields: ${missingFields.join(', ')}`;
+          console.error(`Row ${index + 2}: ${errorMsg}`);
+          results.failed.push({
+            row: index + 2,
+            data: rowData,
+            error: errorMsg
+          });
+          continue;
+        }
+
+        // Parse multiple items from the row
+        const items = parseMultipleItems(rowData);
+        if (items.length === 0) {
+          results.failed.push({
+            row: index + 2,
+            data: rowData,
+            error: 'No valid items found. Please provide at least one item with description, quantity, and rate.'
+          });
+          continue;
+        }
+
+        console.log(`Found ${items.length} items in row ${index + 2}:`, items);
+
+        // Validate mobile number
+        const mobile = rowData['Contact Mobile*'].toString().trim();
+        if (!mobile.match(/^[0-9]{10}$/)) {
+          results.failed.push({
+            row: index + 2,
+            data: rowData,
+            error: 'Invalid mobile number. Must be 10 digits.'
+          });
+          continue;
+        }
+
+        // Validate email
+        const email = rowData['Contact Email*'].toString().trim();
+        if (!email.match(/^[^\s@]+@[^\s@]+\.[^\s@]+$/)) {
+          results.failed.push({
+            row: index + 2,
+            data: rowData,
+            error: 'Invalid email format.'
+          });
+          continue;
+        }
+
+        // Extract GSTIN and PAN
+        let gstin = null;
+        let pan = null;
+        const gstinPan = rowData['GSTIN / PAN*'].toString().trim();
+        
+        // Validate GSTIN/PAN format
+        if (gstinPan.length === 15) {
+          gstin = gstinPan;
+        } else if (gstinPan.length === 10) {
+          pan = gstinPan;
+        } else {
+          results.failed.push({
+            row: index + 2,
+            data: rowData,
+            error: 'Invalid GSTIN/PAN. GSTIN must be 15 characters, PAN must be 10 characters.'
+          });
+          continue;
+        }
+
+        // Extract pincode from shipping address for tax calculation
+        const shippingAddress = rowData['Shipping Address*'].toString();
+        const pincode = extractPincode(shippingAddress);
+        const isTN = isTamilNaduPincode(pincode);
+        const taxType = isTN ? 'sgst_cgst' : 'igst';
+
+        console.log(`Tax calculation - Pincode: ${pincode}, Is Tamil Nadu: ${isTN}, Tax Type: ${taxType}`);
+
+        // Calculate totals from all items
+        let totalGrossAmount = 0;
+        let totalGstAmount = 0;
+        let totalAmount = 0;
+
+        items.forEach(item => {
+          const itemGrossAmount = item.quantity * item.rate;
+          const itemGstAmount = item.gstAmount || (itemGrossAmount * (item.gstPercent || 0) / 100);
+          const itemTotalAmount = itemGrossAmount + itemGstAmount;
+
+          totalGrossAmount += itemGrossAmount;
+          totalGstAmount += itemGstAmount;
+          totalAmount += itemTotalAmount;
+        });
+
+        // Find or create supplier with complete details including mobile and email
+        const supplierId = await findOrCreateSupplierWithAddress(
+          rowData['Vendor Name*'],
+          gstin,
+          pan,
+          rowData['Billing Address*'],
+          rowData['Shipping Address*'],
+          mobile,
+          email,
+          conn
+        );
+        
+        if (!supplierId) {
+          const errorMsg = 'Failed to create or find supplier. Please check supplier details.';
+          console.error(`Row ${index + 2}: ${errorMsg}`);
+          results.failed.push({
+            row: index + 2,
+            data: rowData,
+            error: errorMsg
+          });
+          continue;
+        }
+
+        console.log(`Supplier created/found with ID: ${supplierId}`);
+
+        // Prepare PDF meta data for this specific row if PDF exists
+        let pdfMeta = null;
+        if (rowPDF) {
+          // Create uploads directory if it doesn't exist
+          const uploadDir = 'uploads/purchase-orders';
+          if (!fs.existsSync(uploadDir)) {
+            fs.mkdirSync(uploadDir, { recursive: true });
+          }
+
+          // Generate unique filename
+          const fileExtension = path.extname(rowPDF.originalname);
+          const uniqueFileName = `po_pdf_${Date.now()}_${Math.random().toString(36).substring(7)}${fileExtension}`;
+          const filePath = path.join(uploadDir, uniqueFileName);
+
+          // Move file to permanent location
+          fs.renameSync(rowPDF.path, filePath);
+
+          pdfMeta = {
+            fileName: uniqueFileName,
+            originalName: rowPDF.originalname,
+            uploadedAt: new Date().toISOString(),
+            filePath: filePath,
+            associatedWithImport: true,
+            rowIndex: index,
+            fileSize: rowPDF.size,
+            mimeType: rowPDF.mimetype
+          };
+          console.log(`PDF associated with row ${index + 2}: ${uniqueFileName}`);
+        }
+
+        // Create purchase order data WITH INDIVIDUAL PDF META
+        const purchaseOrderMeta = {
+          orderStatus: (rowData['Payment Status'] || 'Unpaid') === 'Paid' ? 'confirmed' : 'draft',
+          priority: 'medium',
+          category: rowData['Category'] || 'General',
+          paymentMode: rowData['Payment Mode'] || 'Cash',
+          paymentStatus: rowData['Payment Status'] || 'Unpaid',
+          importedFromExcel: true,
+          taxType: taxType,
+          billingAddress: rowData['Billing Address*'],
+          shippingAddress: rowData['Shipping Address*'],
+          pincode: pincode,
+          taxableAmount: totalGrossAmount,
+          contactMobile: mobile,
+          contactEmail: email,
+          // Add individual PDF file information if available
+          ...(pdfMeta && { pdfFile: pdfMeta })
+        };
+
+        // Create purchase order
+        const purchaseOrder = {
+          invoiceNumber: orderNumber,
+          date: new Date().toISOString().split('T')[0],
+          dueDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
+          clientId: supplierId,
+          status: 'draft',
+          subTotal: totalGrossAmount,
+          tax: totalGstAmount,
+          discount: 0,
+          total: totalAmount,
+          notes: rowData['Remarks'] ? [rowData['Remarks']] : [],
+          type: 'purchase_order',
+          meta: purchaseOrderMeta
+        };
+
+        console.log(`Creating purchase order: ${orderNumber} with ${items.length} items`);
+
+        // Insert purchase order
+        const [orderResult] = await conn.execute(
+          `INSERT INTO invoices 
+          (invoiceNumber, date, dueDate, clientId, status, subTotal, tax, discount, total, notes, type, meta, createdAt, updatedAt) 
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+          [
+            purchaseOrder.invoiceNumber,
+            purchaseOrder.date,
+            purchaseOrder.dueDate,
+            purchaseOrder.clientId,
+            purchaseOrder.status,
+            purchaseOrder.subTotal,
+            purchaseOrder.tax,
+            purchaseOrder.discount,
+            purchaseOrder.total,
+            JSON.stringify(purchaseOrder.notes),
+            purchaseOrder.type,
+            JSON.stringify(purchaseOrder.meta)
+          ]
+        );
+
+        const orderId = orderResult.insertId;
+        console.log(`Purchase order created with ID: ${orderId}`);
+
+        // Insert all items
+        for (const item of items) {
+          const itemGrossAmount = item.quantity * item.rate;
+          const itemGstAmount = item.gstAmount || (itemGrossAmount * (item.gstPercent || 0) / 100);
+          const itemTotalAmount = itemGrossAmount + itemGstAmount;
+
+          // Calculate tax breakdown for this item
+          const sgst = taxType === 'sgst_cgst' ? (item.gstPercent || 0) / 2 : 0;
+          const cgst = taxType === 'sgst_cgst' ? (item.gstPercent || 0) / 2 : 0;
+          const igst = taxType === 'igst' ? (item.gstPercent || 0) : 0;
+
+          const sgstAmount = taxType === 'sgst_cgst' ? itemGstAmount / 2 : 0;
+          const cgstAmount = taxType === 'sgst_cgst' ? itemGstAmount / 2 : 0;
+          const igstAmount = taxType === 'igst' ? itemGstAmount : 0;
+
+          await conn.execute(
+            `INSERT INTO invoice_items 
+            (invoiceId, description, hsn, uom, quantity, rate, amount, tax, taxAmount, meta, createdAt, updatedAt) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+            [
+              orderId,
+              item.description,
+              item.hsn || '',
+              item.uom || 'PCS',
+              item.quantity,
+              item.rate,
+              itemGrossAmount,
+              item.gstPercent || 0,
+              itemGstAmount,
+              JSON.stringify({
+                taxType: taxType,
+                sgst: sgst,
+                cgst: cgst,
+                igst: igst,
+                sgstAmount: sgstAmount,
+                cgstAmount: cgstAmount,
+                igstAmount: igstAmount,
+                taxableAmount: itemGrossAmount,
+                hsnCode: item.hsn || '',
+                uom: item.uom || 'PCS'
+              })
+            ]
+          );
+        }
+
+        console.log(`All ${items.length} items created for order ID: ${orderId}`);
+
+        // Commit transaction FIRST for this order
+        await conn.commit();
+
+        // THEN log the import action OUTSIDE the transaction
+        logPurchaseOrderAction(
+          orderId,
+          'imported',
+          `Purchase order ${orderNumber} imported from Excel with ${items.length} items`,
+          {
+            orderNumber: orderNumber,
+            supplier: supplierId,
+            total: totalAmount,
+            items: items.length,
+            taxType: taxType,
+            importedFromExcel: true
+          },
+          req
+        );
+
+        results.successful.push({
+          row: index + 2,
+          orderNumber: purchaseOrder.invoiceNumber,
+          orderId: orderId,
+          supplier: rowData['Vendor Name*'],
+          amount: totalAmount,
+          items: items.length,
+          hasPDF: !!pdfMeta,
+          pdfFileName: pdfMeta ? pdfMeta.fileName : null
+        });
+
+        console.log(`Row ${index + 2} processed successfully with ${items.length} items`);
+
+      } catch (error) {
+        await conn.rollback();
+        console.error(`Error processing row ${index + 2}:`, error);
+        results.failed.push({
+          row: index + 2,
+          data: rowData,
+          error: error.message || 'Unknown error occurred during processing'
+        });
+        
+        // Start new transaction for next row
+        await conn.beginTransaction();
+      }
+    }
+
+    console.log(`Import completed: ${results.successful.length} successful, ${results.failed.length} failed`);
+
+    // Clean up uploaded files
+    fs.unlinkSync(excelFile.path);
+    
+    // Only delete PDF files if their associated rows failed
+    Object.entries(individualPDFs).forEach(([rowIndex, pdfFile]) => {
+      const rowSuccess = results.successful.some(result => 
+        result.row === parseInt(rowIndex) + 2
+      );
+      if (!rowSuccess && fs.existsSync(pdfFile.path)) {
+        fs.unlinkSync(pdfFile.path);
+        console.log(`PDF file deleted for failed row ${rowIndex}: ${pdfFile.filename}`);
+      } else if (rowSuccess) {
+        console.log(`PDF file retained for successful row ${rowIndex}: ${pdfFile.filename}`);
+      }
+    });
+
+    const pdfSuccessCount = results.successful.filter(result => result.hasPDF).length;
+    
+    res.json({
+      success: true,
+      message: `Import completed: ${results.successful.length} successful, ${results.failed.length} failed`,
+      results: results,
+      totalImported: results.successful.length,
+      pdfAssociated: pdfSuccessCount,
+      individualPDFs: pdfSuccessCount > 0
+    });
+
+  } catch (error) {
+    await conn.rollback();
+    console.error('Import transaction error:', error);
+    
+    // Clean up all uploaded files in case of error
+    if (req.files?.file?.[0] && fs.existsSync(req.files.file[0].path)) {
+      fs.unlinkSync(req.files.file[0].path);
+    }
+    
+    // Clean up all individual PDF files
+    Object.entries(req.files).forEach(([fieldName, fileArray]) => {
+      if (fieldName.startsWith('pdf_') && fileArray && fileArray[0] && fs.existsSync(fileArray[0].path)) {
+        fs.unlinkSync(fileArray[0].path);
+      }
+    });
+
+    res.status(500).json({
+      success: false,
+      message: 'Failed to import purchase orders',
+      error: error.message
+    });
+  } finally {
+    conn.release();
+  }
+};
+
+// Helper function to parse multiple items from a single row
+function parseMultipleItems(rowData) {
+  const items = [];
+  
+  // Define the pattern for item fields
+  const itemPatterns = [
+    { prefix: 'Item 1', required: true },
+    { prefix: 'Item 2', required: false },
+    { prefix: 'Item 3', required: false },
+    { prefix: 'Item 4', required: false },
+    { prefix: 'Item 5', required: false }
+  ];
+
+  for (const pattern of itemPatterns) {
+    const description = rowData[`${pattern.prefix} - Description`];
+    const quantity = rowData[`${pattern.prefix} - Quantity`];
+    const rate = rowData[`${pattern.prefix} - Rate`];
+    
+    // If this is the first item and required fields are missing, skip the row
+    if (pattern.required && (!description || !quantity || !rate)) {
+      if (items.length === 0) {
+        return []; // No valid items found
+      }
+      break; // Stop processing further items
+    }
+    
+    // If this is an optional item and required fields are missing, stop processing
+    if (!pattern.required && (!description || !quantity || !rate)) {
+      break;
+    }
+
+    // Validate numeric fields
+    const parsedQuantity = parseFloat(quantity);
+    const parsedRate = parseFloat(rate);
+    
+    if (isNaN(parsedQuantity) || parsedQuantity <= 0) {
+      if (pattern.required) {
+        return []; // Invalid required item
+      }
+      continue; // Skip this optional item
+    }
+    
+    if (isNaN(parsedRate) || parsedRate < 0) {
+      if (pattern.required) {
+        return []; // Invalid required item
+      }
+      continue; // Skip this optional item
+    }
+
+    // Create item object
+    const item = {
+      description: description.toString().trim(),
+      quantity: parsedQuantity,
+      rate: parsedRate,
+      hsn: rowData[`${pattern.prefix} - HSN`] ? rowData[`${pattern.prefix} - HSN`].toString().trim() : '',
+      uom: rowData[`${pattern.prefix} - UOM`] ? rowData[`${pattern.prefix} - UOM`].toString().trim() : 'PCS',
+      gstPercent: rowData[`${pattern.prefix} - GST %`] ? parseFloat(rowData[`${pattern.prefix} - GST %`]) : 0,
+      gstAmount: rowData[`${pattern.prefix} - GST Amount`] ? parseFloat(rowData[`${pattern.prefix} - GST Amount`]) : 0
+    };
+
+    items.push(item);
+  }
+
+  return items;
+}
+
+// Upload PO PDF
+exports.uploadPOPDF = async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({
+        success: false,
+        message: 'No PDF file uploaded'
+      });
+    }
+
+    const { orderId } = req.body;
+    const fileName = req.file.filename;
+    const originalName = req.file.originalname;
+
+    if (orderId) {
+      // Associate PDF with existing purchase order
+      const [rows] = await db.execute(
+        'SELECT meta FROM invoices WHERE id = ? AND type = "purchase_order"',
+        [orderId]
+      );
+
+      if (rows.length === 0) {
+        // Clean up file if order not found
+        fs.unlinkSync(req.file.path);
+        return res.status(404).json({
+          success: false,
+          message: 'Purchase order not found'
+        });
+      }
+
+      let meta = {};
+      if (rows[0].meta) {
+        meta = typeof rows[0].meta === 'string' ? JSON.parse(rows[0].meta) : rows[0].meta;
+      }
+
+      // Store PDF information in meta
+      meta.pdfFile = {
+        fileName: fileName,
+        originalName: originalName,
+        uploadedAt: new Date().toISOString()
+      };
+
+      await db.execute(
+        'UPDATE invoices SET meta = ? WHERE id = ?',
+        [JSON.stringify(meta), orderId]
+      );
+
+      // Log PDF upload action
+      logPurchaseOrderAction(
+        orderId,
+        'pdf_uploaded',
+        `PDF document uploaded for purchase order`,
+        {
+          fileName: fileName,
+          originalName: originalName
+        },
+        req
+      );
+    }
+
+    res.json({
+      success: true,
+      message: 'PDF uploaded successfully',
+      fileName,
+      originalName,
+      orderId
+    });
+
+  } catch (error) {
+    // Clean up file in case of error
+    if (req.file && fs.existsSync(req.file.path)) {
+      fs.unlinkSync(req.file.path);
+    }
+
+    console.error('PDF upload error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to upload PDF',
+      error: error.message
+    });
+  }
+};
+
+// Get PO PDF
+exports.getPOPDF = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const [rows] = await db.execute(
+      'SELECT meta FROM invoices WHERE id = ? AND type = "purchase_order"',
+      [id]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Purchase order not found'
+      });
+    }
+
+    const meta = typeof rows[0].meta === 'string' ? JSON.parse(rows[0].meta) : rows[0].meta;
+    const pdfFile = meta?.pdfFile;
+
+    if (!pdfFile || !pdfFile.fileName) {
+      return res.status(404).json({
+        success: false,
+        message: 'PDF not found for this purchase order'
+      });
+    }
+
+    const fullPath = path.join('uploads/purchase-orders/', pdfFile.fileName);
+    
+    if (!fs.existsSync(fullPath)) {
+      return res.status(404).json({
+        success: false,
+        message: 'PDF file not found on server'
+      });
+    }
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${pdfFile.originalName || 'purchase-order.pdf'}"`);
+    
+    const fileStream = fs.createReadStream(fullPath);
+    fileStream.pipe(res);
+
+  } catch (error) {
+    console.error('PDF retrieval error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to retrieve PDF',
+      error: error.message
+    });
+  }
+};
+
+// Download Excel Template with multi-item support
+exports.downloadTemplate = (req, res) => {
+  try {
+    // Create comprehensive template data with multi-item support
+    const templateData = [
+      {
+        'PO Number': 'ICE/25-26/PO/001',
+        'Category': 'Office Supplies',
+        'Vendor Name*': 'ABC Suppliers Pvt Ltd',
+        'GSTIN / PAN*': '29ABCDE1234F1Z5',
+        'Billing Address*': '123 Business Street, GST Nagar, Chennai - 600001, Tamil Nadu',
+        'Shipping Address*': '123 Business Street, GST Nagar, Chennai - 600001, Tamil Nadu',
+        'Contact Mobile*': '9876543210',
+        'Contact Email*': 'abc.suppliers@example.com',
+        
+        // Item 1 (Required)
+        'Item 1 - Description': 'Laptop Dell XPS 15',
+        'Item 1 - HSN': '84713000',
+        'Item 1 - UOM': 'PCS',
+        'Item 1 - Quantity': '2',
+        'Item 1 - Rate': '50000',
+        'Item 1 - GST %': '18',
+        'Item 1 - GST Amount': '18000',
+        
+        // Item 2 (Optional)
+        'Item 2 - Description': 'Wireless Mouse',
+        'Item 2 - HSN': '84716070',
+        'Item 2 - UOM': 'PCS',
+        'Item 2 - Quantity': '5',
+        'Item 2 - Rate': '800',
+        'Item 2 - GST %': '18',
+        'Item 2 - GST Amount': '720',
+        
+        // Item 3 (Optional)
+        'Item 3 - Description': 'Laptop Bag',
+        'Item 3 - HSN': '42021290',
+        'Item 3 - UOM': 'PCS',
+        'Item 3 - Quantity': '2',
+        'Item 3 - Rate': '1200',
+        'Item 3 - GST %': '12',
+        'Item 3 - GST Amount': '288',
+        
+        // Totals (Auto-calculated, can be provided for verification)
+        'Gross Amount*': '101600',
+        'Total GST Amount': '19008',
+        'Total Amount*': '120608',
+        
+        'Payment Mode': 'Bank Transfer',
+        'Payment Status': 'Unpaid',
+        'Remarks': 'Urgent delivery required for laptops'
+      }
+    ];
+
+    // Create workbook
+    const workbook = XLSX.utils.book_new();
+    const worksheet = XLSX.utils.json_to_sheet(templateData);
+    
+    XLSX.utils.book_append_sheet(workbook, worksheet, 'Purchase Orders Template');
+
+    // Set column widths for better readability
+    const colWidths = [
+      { wch: 18 },  // PO Number
+      { wch: 15 },  // Category
+      { wch: 25 },  // Vendor Name*
+      { wch: 18 },  // GSTIN / PAN*
+      { wch: 30 },  // Billing Address*
+      { wch: 30 },  // Shipping Address*
+      { wch: 15 },  // Contact Mobile*
+      { wch: 20 },  // Contact Email*
+      
+      // Item 1 columns
+      { wch: 25 },  // Item 1 - Description
+      { wch: 12 },  // Item 1 - HSN
+      { wch: 8 },   // Item 1 - UOM
+      { wch: 10 },  // Item 1 - Quantity
+      { wch: 12 },  // Item 1 - Rate
+      { wch: 8 },   // Item 1 - GST %
+      { wch: 12 },  // Item 1 - GST Amount
+      
+      // Item 2 columns
+      { wch: 25 },  // Item 2 - Description
+      { wch: 12 },  // Item 2 - HSN
+      { wch: 8 },   // Item 2 - UOM
+      { wch: 10 },  // Item 2 - Quantity
+      { wch: 12 },  // Item 2 - Rate
+      { wch: 8 },   // Item 2 - GST %
+      { wch: 12 },  // Item 2 - GST Amount
+      
+      // Item 3 columns
+      { wch: 25 },  // Item 3 - Description
+      { wch: 12 },  // Item 3 - HSN
+      { wch: 8 },   // Item 3 - UOM
+      { wch: 10 },  // Item 3 - Quantity
+      { wch: 12 },  // Item 3 - Rate
+      { wch: 8 },   // Item 3 - GST %
+      { wch: 12 },  // Item 3 - GST Amount
+      
+      // Totals
+      { wch: 15 },  // Gross Amount*
+      { wch: 15 },  // Total GST Amount
+      { wch: 15 },  // Total Amount*
+      
+      { wch: 15 },  // Payment Mode
+      { wch: 15 },  // Payment Status
+      { wch: 25 }   // Remarks
+    ];
+    worksheet['!cols'] = colWidths;
+
+    // Generate buffer
+    const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
+
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', 'attachment; filename=purchase-order-multi-item-template.xlsx');
+    res.send(buffer);
+
+  } catch (error) {
+    console.error('Template download error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to generate template',
+      error: error.message
+    });
+  }
+};
+
+// Associate PDF with purchase order
+exports.associatePDFWithOrder = async (req, res) => {
+  try {
+    const { orderId, fileName, originalName } = req.body;
+
+    if (!orderId || !fileName) {
+      return res.status(400).json({
+        success: false,
+        message: 'Order ID and file name are required'
+      });
+    }
+
+    const [rows] = await db.execute(
+      'SELECT meta FROM invoices WHERE id = ? AND type = "purchase_order"',
+      [orderId]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Purchase order not found'
+      });
+    }
+
+    let meta = {};
+    if (rows[0].meta) {
+      meta = typeof rows[0].meta === 'string' ? JSON.parse(rows[0].meta) : rows[0].meta;
+    }
+
+    meta.pdfFile = {
+      fileName: fileName,
+      originalName: originalName || 'purchase-order.pdf',
+      uploadedAt: new Date().toISOString(),
+      filePath: `uploads/purchase-orders/${fileName}`
+    };
+
+    await db.execute(
+      'UPDATE invoices SET meta = ? WHERE id = ?',
+      [JSON.stringify(meta), orderId]
+    );
+
+    // Log PDF association action
+    logPurchaseOrderAction(
+      orderId,
+      'pdf_associated',
+      `PDF document associated with purchase order`,
+      {
+        fileName: fileName,
+        originalName: originalName
+      },
+      req
+    );
+
+    res.json({
+      success: true,
+      message: 'PDF associated with purchase order successfully',
+      orderId
+    });
+
+  } catch (error) {
+    console.error('PDF association error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to associate PDF with order',
+      error: error.message
+    });
+  }
+};
+
+// Get purchase order history logs
+exports.getHistory = async (req, res) => {
+  try {
+    const [logs] = await db.execute(
+      `SELECT * FROM invoice_history 
+       WHERE orderId = ? 
+       ORDER BY createdAt DESC`,
+      [req.params.id]
+    );
+
+    // Parse JSON changes field
+    const parsedLogs = logs.map(log => ({
+      ...log,
+      changes: log.changes ? (typeof log.changes === 'string' ? JSON.parse(log.changes) : log.changes) : {}
+    }));
+
+    res.json(parsedLogs);
+  } catch (err) {
+    console.error("Error fetching purchase order history:", err);
     res.status(500).json({ message: "Database error" });
   }
 };
@@ -96,10 +1232,22 @@ exports.list = async (req, res) => {
     `);
 
     for (const order of orders) {
-      const [items] = await db.execute(
-        "SELECT * FROM invoice_items WHERE invoiceId = ?",
-        [order.id]
-      );
+      // Get invoice items with full item details
+      const [items] = await db.execute(`
+        SELECT 
+          ii.*,
+          it.id as original_item_id,
+          it.name as original_item_name,
+          it.description as original_item_description,
+          it.hsnCode as original_hsn_code,
+          it.measuringUnit as original_measuring_unit,
+          it.sellingPrice as original_selling_price,
+          it.createdAt as item_created_at,
+          it.updatedAt as item_updated_at
+        FROM invoice_items ii
+        LEFT JOIN items it ON ii.itemId = it.id
+        WHERE ii.invoiceId = ?
+      `, [order.id]);
       
       // Parse meta data for order
       if (order.meta && typeof order.meta === 'string') {
@@ -136,6 +1284,20 @@ exports.list = async (req, res) => {
         } else {
           item.meta = {};
         }
+        
+        // Add original item details to the response
+        item.originalItem = item.original_item_id ? {
+          id: item.original_item_id,
+          name: item.original_item_name,
+          description: item.original_item_description,
+          hsnCode: item.original_hsn_code,
+          measuringUnit: item.original_measuring_unit,
+          sellingPrice: item.original_selling_price,
+          tax: item.original_tax,
+          createdAt: item.item_created_at,
+          updatedAt: item.item_updated_at
+        } : null;
+        
         return item;
       });
     }
@@ -161,10 +1323,22 @@ exports.getPurchaseOrdersByProject = async (req, res) => {
     `, [projectId]);
 
     for (const order of orders) {
-      const [items] = await db.execute(
-        "SELECT * FROM invoice_items WHERE invoiceId = ?",
-        [order.id]
-      );
+      // Get invoice items with full item details
+      const [items] = await db.execute(`
+        SELECT 
+          ii.*,
+          it.id as original_item_id,
+          it.name as original_item_name,
+          it.description as original_item_description,
+          it.hsnCode as original_hsn_code,
+          it.measuringUnit as original_measuring_unit,
+          it.sellingPrice as original_selling_price,
+          it.createdAt as item_created_at,
+          it.updatedAt as item_updated_at
+        FROM invoice_items ii
+        LEFT JOIN items it ON ii.itemId = it.id
+        WHERE ii.invoiceId = ?
+      `, [order.id]);
       
       // Parse meta data for order
       if (order.meta && typeof order.meta === 'string') {
@@ -201,6 +1375,20 @@ exports.getPurchaseOrdersByProject = async (req, res) => {
         } else {
           item.meta = {};
         }
+        
+        // Add original item details to the response
+        item.originalItem = item.original_item_id ? {
+          id: item.original_item_id,
+          name: item.original_item_name,
+          description: item.original_item_description,
+          hsnCode: item.original_hsn_code,
+          measuringUnit: item.original_measuring_unit,
+          sellingPrice: item.original_selling_price,
+          tax: item.original_tax,
+          createdAt: item.item_created_at,
+          updatedAt: item.item_updated_at
+        } : null;
+        
         return item;
       });
     }
@@ -216,7 +1404,7 @@ exports.getPurchaseOrdersByProject = async (req, res) => {
 exports.get = async (req, res) => {
   try {
     const [rows] = await db.execute(
-      "SELECT * FROM invoices WHERE id = ? AND type = 'purchase_order'",
+      "SELECT i.*, p.project_name as projectName FROM invoices i LEFT JOIN projects p ON i.project_id = p.id WHERE i.id = ? AND i.type = 'purchase_order'",
       [req.params.id]
     );
     if (rows.length === 0) return res.status(404).json({ message: "Purchase order not found" });
@@ -243,10 +1431,22 @@ exports.get = async (req, res) => {
     );
     order.supplier = supplier[0] || null;
 
-    const [items] = await db.execute(
-      "SELECT * FROM invoice_items WHERE invoiceId = ?",
-      [order.id]
-    );
+    // Get invoice items with full item details
+    const [items] = await db.execute(`
+      SELECT 
+        ii.*,
+        it.id as original_item_id,
+        it.name as original_item_name,
+        it.description as original_item_description,
+        it.hsnCode as original_hsn_code,
+        it.measuringUnit as original_measuring_unit,
+        it.sellingPrice as original_selling_price,
+        it.createdAt as item_created_at,
+        it.updatedAt as item_updated_at
+      FROM invoice_items ii
+      LEFT JOIN items it ON ii.itemId = it.id
+      WHERE ii.invoiceId = ?
+    `, [order.id]);
     
     // Parse meta data for each item
     order.items = items.map(item => {
@@ -271,8 +1471,28 @@ exports.get = async (req, res) => {
       } else {
         item.meta = {};
       }
+      
+      // Add original item details to the response
+      item.originalItem = item.original_item_id ? {
+        id: item.original_item_id,
+        name: item.original_item_name,
+        description: item.original_item_description,
+        hsnCode: item.original_hsn_code,
+        measuringUnit: item.original_measuring_unit,
+        sellingPrice: item.original_selling_price,
+        tax: item.original_tax,
+        createdAt: item.item_created_at,
+        updatedAt: item.item_updated_at
+      } : null;
+      
       return item;
     });
+
+    // Add project information from meta if available
+    if (order.meta.projectId) {
+      order.projectId = order.meta.projectId;
+      order.projectName = order.meta.projectName || order.projectName;
+    }
 
     res.json(order);
   } catch (err) {
@@ -281,7 +1501,7 @@ exports.get = async (req, res) => {
   }
 };
 
-// Create PURCHASE ORDER with items
+// Create PURCHASE ORDER with items and logging
 exports.create = async (req, res) => {
   const payload = req.body;
   const conn = await db.getConnection();
@@ -462,10 +1682,11 @@ exports.create = async (req, res) => {
 
       await conn.execute(
         `INSERT INTO invoice_items 
-        (invoiceId, description, hsn, uom, quantity, rate, discount, tax, taxAmount, amount, meta) 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        (invoiceId, itemId, description, hsn, uom, quantity, rate, discount, tax, taxAmount, amount, meta) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           orderId,
+          item.itemId || null, // Save the original item ID
           item.description,
           item.hsn || '',
           item.uom || '',
@@ -480,7 +1701,25 @@ exports.create = async (req, res) => {
       );
     }
 
+    // Commit transaction FIRST
     await conn.commit();
+
+    // THEN log the creation action OUTSIDE the transaction
+    logPurchaseOrderAction(
+      orderId,
+      'created',
+      `Purchase order ${payload.invoiceNumber} created with ${payload.items.length} items`,
+      {
+        orderNumber: payload.invoiceNumber,
+        supplier: payload.clientId,
+        total: payload.total ?? calculatedTotal,
+        items: payload.items.length,
+        taxType: taxType,
+        status: payload.status || "draft",
+        projectId: payload.projectId || null
+      },
+      req
+    );
 
     res.status(201).json({ 
       message: "Purchase order created", 
@@ -500,14 +1739,14 @@ exports.create = async (req, res) => {
   }
 };
 
-// Update PURCHASE ORDER
+// Update PURCHASE ORDER with logging
 exports.update = async (req, res) => {
   const conn = await db.getConnection();
   
   try {
     await conn.beginTransaction();
 
-    // Check if order exists
+    // Check if order exists and get old data for comparison
     const [rows] = await conn.execute(
       "SELECT * FROM invoices WHERE id = ? AND type = 'purchase_order'", 
       [req.params.id]
@@ -517,7 +1756,37 @@ exports.update = async (req, res) => {
       return res.status(404).json({ message: "Purchase order not found" });
     }
 
+    const oldOrder = rows[0];
     const payload = req.body;
+
+    // Track changes for history log
+    const changes = {};
+    
+    // Compare basic fields
+    if (oldOrder.status !== payload.status) {
+      changes.status = { from: oldOrder.status, to: payload.status };
+    }
+    if (parseFloat(oldOrder.total).toFixed(2) !== parseFloat(payload.total).toFixed(2)) {
+      changes.total = { from: parseFloat(oldOrder.total), to: parseFloat(payload.total) };
+    }
+    if (oldOrder.invoiceNumber !== payload.invoiceNumber) {
+      changes.orderNumber = { from: oldOrder.invoiceNumber, to: payload.invoiceNumber };
+    }
+    if (oldOrder.clientId !== payload.clientId) {
+      changes.supplier = { from: oldOrder.clientId, to: payload.clientId };
+    }
+
+    // Parse old meta to compare tax type and other fields
+    let oldTaxType = 'sgst_cgst';
+    let oldMeta = {};
+    if (oldOrder.meta) {
+      try {
+        oldMeta = typeof oldOrder.meta === 'string' ? JSON.parse(oldOrder.meta) : oldOrder.meta;
+        oldTaxType = oldMeta.taxType || 'sgst_cgst';
+      } catch (e) {
+        console.error("Error parsing old order meta:", e);
+      }
+    }
 
     // Format dates to YYYY-MM-DD for MySQL
     const formatDateForMySQL = (dateString) => {
@@ -537,6 +1806,10 @@ exports.update = async (req, res) => {
 
     // Get tax type from payload
     const taxType = payload.taxType || 'sgst_cgst';
+
+    if (oldTaxType !== taxType) {
+      changes.taxType = { from: oldTaxType, to: taxType };
+    }
 
     // Calculate subtotal using the helper function
     const subtotal = payload.items.reduce((sum, item) => {
@@ -653,43 +1926,85 @@ exports.update = async (req, res) => {
     // Delete existing items and insert new ones
     await conn.execute("DELETE FROM invoice_items WHERE invoiceId = ?", [req.params.id]);
 
+    // Track item changes
+    changes.items = {
+      from: `Previous items count`,
+      to: `${payload.items.length} items`
+    };
+
     // Insert updated items with tax type
     for (const item of payload.items) {
-      const amounts = calculateItemAmounts(item, taxType);
+  const amounts = calculateItemAmounts(item, taxType);
 
-      // Create item meta with tax type
-      const itemMeta = {
-        taxType: taxType,
-        sgst: taxType === 'sgst_cgst' ? (item.sgst || 9) : 0,
-        cgst: taxType === 'sgst_cgst' ? (item.cgst || 9) : 0,
-        igst: taxType === 'igst' ? (item.igst || 18) : 0,
-        sgstAmount: amounts.sgstAmount,
-        cgstAmount: amounts.cgstAmount,
-        igstAmount: amounts.igstAmount,
-        taxableAmount: amounts.taxableAmount
-      };
-
-      await conn.execute(
-        `INSERT INTO invoice_items 
-        (invoiceId, description, hsn, uom, quantity, rate, discount, tax, taxAmount, amount, meta) 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          req.params.id,
-          item.description,
-          item.hsn || '',
-          item.uom || '',
-          item.quantity,
-          item.rate,
-          item.discountAmount || 0,
-          item.tax || 0,
-          amounts.taxAmount,
-          amounts.totalAmount,
-          JSON.stringify(itemMeta)
-        ]
+  // Validate if item exists in items table
+  let validItemId = null;
+  if (item.itemId) {
+    try {
+      const [itemCheck] = await conn.execute(
+        "SELECT id FROM items WHERE id = ?",
+        [item.itemId]
       );
+      if (itemCheck.length > 0) {
+        validItemId = item.itemId;
+      } else {
+        console.warn(`Item with ID ${item.itemId} not found in items table`);
+        // Continue without itemId - it's optional
+      }
+    } catch (error) {
+      console.error(`Error checking item ${item.itemId}:`, error);
+      // Continue without itemId
+    }
+  }
+
+  // Create item meta with tax type
+  const itemMeta = {
+    taxType: taxType,
+    sgst: taxType === 'sgst_cgst' ? (item.sgst || 9) : 0,
+    cgst: taxType === 'sgst_cgst' ? (item.cgst || 9) : 0,
+    igst: taxType === 'igst' ? (item.igst || 18) : 0,
+    sgstAmount: amounts.sgstAmount,
+    cgstAmount: amounts.cgstAmount,
+    igstAmount: amounts.igstAmount,
+    taxableAmount: amounts.taxableAmount
+  };
+
+  await conn.execute(
+    `INSERT INTO invoice_items 
+    (invoiceId, itemId, description, hsn, uom, quantity, rate, discount, tax, taxAmount, amount, meta) 
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      req.params.id,
+      validItemId, // Use validated itemId or null
+      item.description,
+      item.hsn || '',
+      item.uom || '',
+      item.quantity,
+      item.rate,
+      item.discountAmount || 0,
+      item.tax || 0,
+      amounts.taxAmount,
+      amounts.totalAmount,
+      JSON.stringify(itemMeta)
+    ]
+  );
+}
+
+    // Commit transaction FIRST
+    await conn.commit();
+
+    // THEN log the update action OUTSIDE the transaction
+    let details = `Purchase order ${payload.invoiceNumber} updated`;
+    if (Object.keys(changes).length > 0) {
+      details += ` - ${Object.keys(changes).join(', ')} changed`;
     }
 
-    await conn.commit();
+    logPurchaseOrderAction(
+      req.params.id,
+      'updated',
+      details,
+      changes,
+      req
+    );
 
     res.json({ 
       message: "Purchase order updated successfully",
@@ -712,47 +2027,148 @@ exports.update = async (req, res) => {
   }
 };
 
-// Delete PURCHASE ORDER
+// Delete PURCHASE ORDER with logging
 exports.delete = async (req, res) => {
+  const conn = await db.getConnection();
+  
   try {
-    const [rows] = await db.execute(
+    await conn.beginTransaction();
+
+    const [rows] = await conn.execute(
       "SELECT * FROM invoices WHERE id = ? AND type = 'purchase_order'", 
       [req.params.id]
     );
-    if (rows.length === 0) return res.status(404).json({ message: "Purchase order not found" });
+    if (rows.length === 0) {
+      await conn.rollback();
+      return res.status(404).json({ message: "Purchase order not found" });
+    }
 
-    await db.execute("DELETE FROM invoice_items WHERE invoiceId = ?", [req.params.id]);
-    const [result] = await db.execute(
+    const order = rows[0];
+
+    // Delete items first
+    await conn.execute("DELETE FROM invoice_items WHERE invoiceId = ?", [req.params.id]);
+    
+    // Delete order
+    const [result] = await conn.execute(
       "DELETE FROM invoices WHERE id = ? AND type = 'purchase_order'", 
       [req.params.id]
     );
 
-    if (result.affectedRows === 0) return res.status(404).json({ message: "Purchase order not found" });
+    if (result.affectedRows === 0) {
+      await conn.rollback();
+      return res.status(404).json({ message: "Purchase order not found" });
+    }
 
-    res.json({ message: "Purchase order deleted" });
+    await conn.commit();
+
+    // Log the deletion AFTER successful deletion
+    logPurchaseOrderAction(
+      req.params.id,
+      'deleted',
+      `Purchase order ${order.invoiceNumber} deleted`,
+      {
+        orderNumber: order.invoiceNumber,
+        total: order.total,
+        supplier: order.clientId,
+        status: order.status
+      },
+      req
+    );
+
+    res.json({ message: "Purchase order deleted successfully" });
   } catch (err) {
+    await conn.rollback();
     console.error("Error deleting purchase order:", err);
     res.status(500).json({ message: "Database error" });
+  } finally {
+    conn.release();
   }
 };
 
-// Update purchase order status
+// Update purchase order status with logging
 exports.updateStatus = async (req, res) => {
+  const conn = await db.getConnection();
+  
   try {
+    await conn.beginTransaction();
+
+    const [rows] = await conn.execute(
+      "SELECT * FROM invoices WHERE id = ? AND type = 'purchase_order'", 
+      [req.params.id]
+    );
+    if (rows.length === 0) {
+      await conn.rollback();
+      return res.status(404).json({ message: "Purchase order not found" });
+    }
+
+    const oldOrder = rows[0];
     const { status } = req.body;
+
+    const changes = {};
     
-    const [result] = await db.execute(
+    // Track status changes
+    if (oldOrder.status !== status) {
+      changes.status = { from: oldOrder.status, to: status };
+    }
+
+    await conn.execute(
       "UPDATE invoices SET status = ?, updatedAt = NOW() WHERE id = ? AND type = 'purchase_order'",
       [status, req.params.id]
     );
 
-    if (result.affectedRows === 0) {
-      return res.status(404).json({ message: "Purchase order not found" });
-    }
+    await conn.commit();
+
+    // Log status update
+    logPurchaseOrderAction(
+      req.params.id,
+      'status_updated',
+      `Purchase order status updated from ${oldOrder.status} to ${status}`,
+      changes,
+      req
+    );
 
     res.json({ message: "Purchase order status updated successfully" });
   } catch (err) {
+    await conn.rollback();
     console.error("Error updating purchase order status:", err);
+    res.status(500).json({ message: "Database error" });
+  } finally {
+    conn.release();
+  }
+};
+
+// Get purchase order stats
+exports.getPurchaseOrderStats = async (req, res) => {
+  try {
+    const [totalCount] = await db.execute(
+      "SELECT COUNT(*) as count FROM invoices WHERE type = 'purchase_order'"
+    );
+    
+    const [totalAmount] = await db.execute(
+      "SELECT COALESCE(SUM(total), 0) as total FROM invoices WHERE type = 'purchase_order'"
+    );
+    
+    const [draftCount] = await db.execute(
+      "SELECT COUNT(*) as count FROM invoices WHERE type = 'purchase_order' AND status = 'draft'"
+    );
+    
+    const [confirmedCount] = await db.execute(
+      "SELECT COUNT(*) as count FROM invoices WHERE type = 'purchase_order' AND status = 'confirmed'"
+    );
+
+    const [cancelledCount] = await db.execute(
+      "SELECT COUNT(*) as count FROM invoices WHERE type = 'purchase_order' AND status = 'cancelled'"
+    );
+
+    res.json({
+      totalPurchaseOrders: totalCount[0].count,
+      totalAmount: totalAmount[0].total,
+      draftPurchaseOrders: draftCount[0].count,
+      confirmedPurchaseOrders: confirmedCount[0].count,
+      cancelledPurchaseOrders: cancelledCount[0].count
+    });
+  } catch (err) {
+    console.error("Error fetching purchase order stats:", err);
     res.status(500).json({ message: "Database error" });
   }
 };

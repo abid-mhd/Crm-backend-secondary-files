@@ -1,5 +1,60 @@
 const db = require("../config/db");
 
+// Helper function to log invoice actions - RUNS OUTSIDE TRANSACTION
+const logInvoiceAction = async (invoiceId, action, details, changes = {}, req = null) => {
+  // Run in a separate connection to avoid transaction locks
+  setImmediate(async () => {
+    try {
+      const userId = req?.user?.id || null;
+      const ipAddress = req?.ip || req?.connection?.remoteAddress || null;
+      const userAgent = req?.get('user-agent') || null;
+      
+      let userName = 'System';
+      
+      // If user ID exists, fetch user name from users table
+      if (userId) {
+        try {
+          const [users] = await db.execute(
+            'SELECT name FROM users WHERE id = ?',
+            [userId]
+          );
+          
+          if (users.length > 0) {
+            userName = users[0].name;
+          } else {
+            console.warn(`⚠️ User not found with ID: ${userId}`);
+            userName = 'Unknown User';
+          }
+        } catch (userErr) {
+          console.error("❌ Error fetching user name:", userErr);
+          userName = 'Error Fetching Name';
+        }
+      }
+
+      await db.execute(
+        `INSERT INTO invoice_history 
+         (invoiceId, action, userId, userName, changes, details, ipAddress, userAgent) 
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          invoiceId,
+          action,
+          userId,
+          userName,
+          JSON.stringify(changes),
+          details,
+          ipAddress,
+          userAgent
+        ]
+      );
+      
+      console.log(`📝 Invoice history created for action: ${action} by user: ${userName}`);
+    } catch (err) {
+      console.error("❌ Error logging invoice action:", err);
+      // Don't throw - logging should not break the main operation
+    }
+  });
+};
+
 // Helper function to calculate item base amount
 function calculateItemBaseAmount(item) {
   if (item.isPercentageQty && item.percentageValue) {
@@ -67,6 +122,29 @@ const handleSignature = (signatureData) => {
   return signatureData;
 };
 
+// Get history logs for a sales invoice
+exports.getHistory = async (req, res) => {
+  try {
+    const [logs] = await db.execute(
+      `SELECT * FROM invoice_history 
+       WHERE invoiceId = ? 
+       ORDER BY createdAt DESC`,
+      [req.params.id]
+    );
+
+    // Parse JSON changes field
+    const parsedLogs = logs.map(log => ({
+      ...log,
+      changes: log.changes ? (typeof log.changes === 'string' ? JSON.parse(log.changes) : log.changes) : {}
+    }));
+
+    res.json(parsedLogs);
+  } catch (err) {
+    console.error("Error fetching invoice history:", err);
+    res.status(500).json({ message: "Database error" });
+  }
+};
+
 // List all SALES invoices with client + items + project details
 exports.list = async (req, res) => {
   try {
@@ -80,10 +158,23 @@ exports.list = async (req, res) => {
     `);
 
     for (const inv of invoices) {
-      const [items] = await db.execute(
-        "SELECT * FROM invoice_items WHERE invoiceId = ?",
-        [inv.id]
-      );
+      // Get invoice items with full item details
+      const [items] = await db.execute(`
+        SELECT 
+          ii.*,
+          it.id as original_item_id,
+          it.name as original_item_name,
+          it.description as original_item_description,
+          it.hsnCode as original_hsn_code,
+          it.measuringUnit as original_measuring_unit,
+          it.sellingPrice as original_selling_price,
+          it.createdAt as item_created_at,
+          it.updatedAt as item_updated_at
+        FROM invoice_items ii
+        LEFT JOIN items it ON ii.itemId = it.id
+        WHERE ii.invoiceId = ?
+      `, [inv.id]);
+      
       inv.items = items;
 
       // Parse meta data for project information
@@ -151,10 +242,22 @@ exports.get = async (req, res) => {
     );
     invoice.client = client[0] || null;
 
-    const [items] = await db.execute(
-      "SELECT * FROM invoice_items WHERE invoiceId = ?",
-      [invoice.id]
-    );
+    // Get invoice items with full item details
+    const [items] = await db.execute(`
+      SELECT 
+        ii.*,
+        it.id as original_item_id,
+        it.name as original_item_name,
+        it.description as original_item_description,
+        it.hsnCode as original_hsn_code,
+        it.measuringUnit as original_measuring_unit,
+        it.sellingPrice as original_selling_price,
+        it.createdAt as item_created_at,
+        it.updatedAt as item_updated_at
+      FROM invoice_items ii
+      LEFT JOIN items it ON ii.itemId = it.id
+      WHERE ii.invoiceId = ?
+    `, [invoice.id]);
     
     // Parse meta data for each item
     invoice.items = items.map(item => {
@@ -180,6 +283,20 @@ exports.get = async (req, res) => {
       } else {
         item.meta = {};
       }
+      
+      // Add original item details to the response
+      item.originalItem = item.original_item_id ? {
+        id: item.original_item_id,
+        name: item.original_item_name,
+        description: item.original_item_description,
+        hsnCode: item.original_hsn_code,
+        measuringUnit: item.original_measuring_unit,
+        sellingPrice: item.original_selling_price,
+        tax: item.original_tax,
+        createdAt: item.item_created_at,
+        updatedAt: item.item_updated_at
+      } : null;
+      
       return item;
     });
 
@@ -214,10 +331,23 @@ exports.getInvoicesByProject = async (req, res) => {
     `, [projectId]);
 
     for (const inv of invoices) {
-      const [items] = await db.execute(
-        "SELECT * FROM invoice_items WHERE invoiceId = ?",
-        [inv.id]
-      );
+      // Get invoice items with full item details
+      const [items] = await db.execute(`
+        SELECT 
+          ii.*,
+          it.id as original_item_id,
+          it.name as original_item_name,
+          it.description as original_item_description,
+          it.hsnCode as original_hsn_code,
+          it.measuringUnit as original_measuring_unit,
+          it.sellingPrice as original_selling_price,
+          it.tax as original_tax,
+          it.createdAt as item_created_at,
+          it.updatedAt as item_updated_at
+        FROM invoice_items ii
+        LEFT JOIN items it ON ii.itemId = it.id
+        WHERE ii.invoiceId = ?
+      `, [inv.id]);
       
       // Parse meta data for invoice
       if (inv.meta && typeof inv.meta === 'string') {
@@ -254,6 +384,20 @@ exports.getInvoicesByProject = async (req, res) => {
         } else {
           item.meta = {};
         }
+        
+        // Add original item details to the response
+        item.originalItem = item.original_item_id ? {
+          id: item.original_item_id,
+          name: item.original_item_name,
+          description: item.original_item_description,
+          hsnCode: item.original_hsn_code,
+          measuringUnit: item.original_measuring_unit,
+          sellingPrice: item.original_selling_price,
+          tax: item.original_tax,
+          createdAt: item.item_created_at,
+          updatedAt: item.item_updated_at
+        } : null;
+        
         return item;
       });
 
@@ -271,7 +415,7 @@ exports.getInvoicesByProject = async (req, res) => {
   }
 };
 
-// Create SALES invoice with items and project details
+// Create SALES invoice with items and project details - WITH LOGGING
 exports.create = async (req, res) => {
   const payload = req.body;
   const conn = await db.getConnection();
@@ -284,7 +428,7 @@ exports.create = async (req, res) => {
     let originalProjectBudget = null;
     let currentProjectBudget = null;
 
-    // NEW: Project Budget Validation
+    // Project Budget Validation
     if (payload.projectId) {
       console.log("Checking project budget for project ID:", payload.projectId);
       
@@ -444,7 +588,7 @@ exports.create = async (req, res) => {
       projectId: payload.projectId || null,
       projectName: payload.projectName || null,
       
-      // NEW: Store original project budget for future validation during updates
+      // Store original project budget for future validation during updates
       originalProjectBudget: originalProjectBudget,
       invoiceCreatedAtBudget: currentProjectBudget,
       
@@ -484,7 +628,7 @@ exports.create = async (req, res) => {
 
     const invoiceId = result.insertId;
 
-    // NEW: Update project budget after successful invoice creation
+    // Update project budget after successful invoice creation
     if (payload.projectId && currentProjectBudget !== null) {
       console.log("Updating project budget for project ID:", payload.projectId);
       
@@ -548,10 +692,11 @@ exports.create = async (req, res) => {
       // Insert item with productId
       await conn.execute(
         `INSERT INTO invoice_items 
-        (invoiceId, description, hsn, uom, quantity, rate, discount, tax, taxAmount, amount, meta) 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        (invoiceId,itemId, description, hsn, uom, quantity, rate, discount, tax, taxAmount, amount, meta) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           invoiceId,
+          item.itemId || null,
           item.description,
           item.hsn || '',
           item.uom || '',
@@ -566,7 +711,27 @@ exports.create = async (req, res) => {
       );
     }
 
+    // Commit transaction FIRST
     await conn.commit();
+
+    // THEN log the creation action OUTSIDE the transaction
+    logInvoiceAction(
+      invoiceId,
+      'created',
+      `Sales invoice ${payload.invoiceNumber} created with ${payload.items.length} items`,
+      {
+        invoiceNumber: payload.invoiceNumber,
+        client: payload.clientId,
+        total: payload.total || finalTotal,
+        items: payload.items.length,
+        taxType: taxType,
+        status: payload.status || "draft",
+        projectId: payload.projectId || null,
+        projectBudgetUsed: finalTotal,
+        originalProjectBudget: originalProjectBudget
+      },
+      req
+    );
 
     res.status(201).json({ 
       message: "Sales invoice created", 
@@ -603,7 +768,7 @@ exports.create = async (req, res) => {
   }
 };
 
-// Update SALES invoice with project details
+// Update SALES invoice with project details - WITH LOGGING
 exports.update = async (req, res) => {
   const conn = await db.getConnection();
   
@@ -622,6 +787,23 @@ exports.update = async (req, res) => {
     const oldInvoice = rows[0];
     const payload = req.body;
 
+    // Track changes for history log
+    const changes = {};
+    
+    // Compare basic fields
+    if (oldInvoice.status !== payload.status) {
+      changes.status = { from: oldInvoice.status, to: payload.status };
+    }
+    if (parseFloat(oldInvoice.total).toFixed(2) !== parseFloat(payload.total).toFixed(2)) {
+      changes.total = { from: parseFloat(oldInvoice.total), to: parseFloat(payload.total) };
+    }
+    if (oldInvoice.invoiceNumber !== payload.invoiceNumber) {
+      changes.invoiceNumber = { from: oldInvoice.invoiceNumber, to: payload.invoiceNumber };
+    }
+    if (oldInvoice.clientId !== payload.clientId) {
+      changes.client = { from: oldInvoice.clientId, to: payload.clientId };
+    }
+
     // Parse old invoice meta to get original project budget
     let oldInvoiceMeta = {};
     if (oldInvoice.meta) {
@@ -637,7 +819,13 @@ exports.update = async (req, res) => {
     // Get tax type from payload
     const taxType = payload.taxType || 'sgst_cgst';
 
-    // NEW: Project Budget Validation for Update - Use original project budget from invoice meta
+    // Compare tax type changes
+    const oldTaxType = oldInvoiceMeta.taxType || 'sgst_cgst';
+    if (oldTaxType !== taxType) {
+      changes.taxType = { from: oldTaxType, to: taxType };
+    }
+
+    // Project Budget Validation for Update - Use original project budget from invoice meta
     if (payload.projectId) {
       console.log("Checking project budget for project ID:", payload.projectId);
       
@@ -713,6 +901,13 @@ exports.update = async (req, res) => {
       console.warn('Signature provided but not in base64 format. Signature will not be updated.');
     }
 
+    // Track signature changes
+    if (payload.signature && !oldInvoice.signature) {
+      changes.signature = { from: 'No signature', to: 'Signature added' };
+    } else if (!payload.signature && oldInvoice.signature) {
+      changes.signature = { from: 'Had signature', to: 'Signature removed' };
+    }
+
     // Format dates to YYYY-MM-DD for MySQL
     const formatDateForMySQL = (dateString) => {
       if (!dateString) return null;
@@ -761,6 +956,12 @@ exports.update = async (req, res) => {
     const calculatedTotal = taxable + tcs + totalTax + sgstTotal + cgstTotal + igstTotal;
     const finalTotal = payload.roundingApplied ? Math.round(calculatedTotal) : calculatedTotal;
 
+    // Track rounding changes
+    const oldRoundingApplied = oldInvoiceMeta.roundingApplied || false;
+    if (oldRoundingApplied !== (payload.roundingApplied || false)) {
+      changes.roundingApplied = { from: oldRoundingApplied, to: payload.roundingApplied || false };
+    }
+
     // Create meta object with tax type and project details
     const meta = {
       taxType: taxType,
@@ -786,7 +987,7 @@ exports.update = async (req, res) => {
       projectId: payload.projectId || null,
       projectName: payload.projectName || null,
       
-      // NEW: Preserve the original project budget from the old invoice
+      // Preserve the original project budget from the old invoice
       originalProjectBudget: oldInvoiceMeta.originalProjectBudget || null,
       invoiceCreatedAtBudget: oldInvoiceMeta.invoiceCreatedAtBudget || null,
       
@@ -838,7 +1039,7 @@ exports.update = async (req, res) => {
       ]
     );
 
-    // NEW: Update project budget after successful invoice update
+    // Update project budget after successful invoice update
     if (payload.projectId && oldInvoiceMeta.originalProjectBudget) {
       console.log("Updating project budget for project ID:", payload.projectId);
       
@@ -882,11 +1083,29 @@ exports.update = async (req, res) => {
         );
         
         console.log(`Project budget updated: ₹${currentBudget.toFixed(2)} - (${finalTotal.toFixed(2)} - ${oldInvoiceTotal.toFixed(2)}) = ₹${newBudgetAmount.toFixed(2)}`);
+        
+        // Track budget changes
+        changes.projectBudget = { 
+          from: `₹${currentBudget.toFixed(2)}`, 
+          to: `₹${newBudgetAmount.toFixed(2)}`,
+          difference: `₹${budgetDifference.toFixed(2)}`
+        };
       }
     }
 
     // Delete existing items and insert new ones
     await conn.execute("DELETE FROM invoice_items WHERE invoiceId = ?", [req.params.id]);
+
+    // Track item changes
+    const [oldItems] = await conn.execute(
+      "SELECT COUNT(*) as count FROM invoice_items WHERE invoiceId = ?",
+      [req.params.id]
+    );
+    const oldItemCount = oldItems[0].count;
+    changes.items = {
+      from: `${oldItemCount} items`,
+      to: `${payload.items.length} items`
+    };
 
     // Insert updated items
     for (const item of payload.items) {
@@ -910,10 +1129,11 @@ exports.update = async (req, res) => {
 
       await conn.execute(
         `INSERT INTO invoice_items 
-        (invoiceId, description, hsn, uom, quantity, rate, discount, tax, taxAmount, amount, meta) 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        (invoiceId,itemId, description, hsn, uom, quantity, rate, discount, tax, taxAmount, amount, meta) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           req.params.id,
+          item.itemId || null,
           item.description,
           item.hsn || '',
           item.uom || '',
@@ -928,7 +1148,22 @@ exports.update = async (req, res) => {
       );
     }
 
+    // Commit transaction FIRST
     await conn.commit();
+
+    // THEN log the update action OUTSIDE the transaction
+    let details = `Sales invoice ${payload.invoiceNumber} updated`;
+    if (Object.keys(changes).length > 0) {
+      details += ` - ${Object.keys(changes).join(', ')} changed`;
+    }
+
+    logInvoiceAction(
+      req.params.id,
+      'updated',
+      details,
+      changes,
+      req
+    );
 
     res.json({ 
       message: "Sales invoice updated successfully",
@@ -965,6 +1200,273 @@ exports.update = async (req, res) => {
     conn.release();
   }
 };
+
+// Delete SALES invoice - WITH LOGGING
+exports.delete = async (req, res) => {
+  const conn = await db.getConnection();
+  
+  try {
+    await conn.beginTransaction();
+
+    const [rows] = await conn.execute(
+      "SELECT * FROM invoices WHERE id = ? AND type = 'sales'", 
+      [req.params.id]
+    );
+    if (rows.length === 0) {
+      await conn.rollback();
+      return res.status(404).json({ message: "Sales invoice not found" });
+    }
+
+    const invoice = rows[0];
+
+    // Parse invoice meta for project information
+    let invoiceMeta = {};
+    if (invoice.meta) {
+      try {
+        invoiceMeta = typeof invoice.meta === 'string' 
+          ? JSON.parse(invoice.meta) 
+          : invoice.meta;
+      } catch (e) {
+        console.error("Error parsing invoice meta:", e);
+      }
+    }
+
+    // LOG THE DELETION ACTION BEFORE DELETING THE INVOICE
+    const logData = {
+      invoiceNumber: invoice.invoiceNumber,
+      total: invoice.total,
+      client: invoice.clientId,
+      status: invoice.status,
+      projectId: invoice.project_id,
+      budgetRestored: !!invoice.project_id
+    };
+
+    // Restore project budget if invoice was associated with a project
+    if (invoice.project_id && invoiceMeta.originalProjectBudget) {
+      console.log("Restoring project budget for project ID:", invoice.project_id);
+      
+      // Get current project details
+      const [projects] = await conn.execute(
+        "SELECT * FROM projects WHERE id = ?",
+        [invoice.project_id]
+      );
+      
+      if (projects.length > 0) {
+        const project = projects[0];
+        let projectMeta = {};
+        
+        // Parse existing meta_data
+        if (project.meta_data) {
+          try {
+            projectMeta = typeof project.meta_data === 'string' 
+              ? JSON.parse(project.meta_data) 
+              : project.meta_data;
+          } catch (e) {
+            console.error("Error parsing project meta_data:", e);
+          }
+        }
+        
+        // Restore budget by adding back the invoice amount
+        const currentBudget = projectMeta.amount !== undefined ? parseFloat(projectMeta.amount) : 0;
+        const invoiceAmount = parseFloat(invoice.total);
+        const newBudgetAmount = currentBudget + invoiceAmount;
+        
+        // Update project meta_data with restored budget amount
+        projectMeta.amount = newBudgetAmount;
+        
+        // Update the project in database
+        await conn.execute(
+          "UPDATE projects SET meta_data = ? WHERE id = ?",
+          [JSON.stringify(projectMeta), invoice.project_id]
+        );
+        
+        console.log(`Project budget restored: ₹${currentBudget.toFixed(2)} + ₹${invoiceAmount.toFixed(2)} = ₹${newBudgetAmount.toFixed(2)}`);
+      }
+    }
+
+    // Delete items first
+    await conn.execute("DELETE FROM invoice_items WHERE invoiceId = ?", [req.params.id]);
+    
+    // Delete invoice
+    const [result] = await conn.execute(
+      "DELETE FROM invoices WHERE id = ? AND type = 'sales'", 
+      [req.params.id]
+    );
+
+    if (result.affectedRows === 0) {
+      await conn.rollback();
+      return res.status(404).json({ message: "Sales invoice not found" });
+    }
+
+    await conn.commit();
+
+    // Log the deletion AFTER successful deletion but using the stored data
+    logInvoiceAction(
+      req.params.id, // We still pass the ID for reference, but it won't be in the database
+      'deleted',
+      `Sales invoice ${logData.invoiceNumber} deleted`,
+      logData,
+      req
+    );
+
+    res.json({ message: "Sales invoice deleted successfully" });
+  } catch (err) {
+    await conn.rollback();
+    console.error("Error deleting sales invoice:", err);
+    res.status(500).json({ message: "Database error" });
+  } finally {
+    conn.release();
+  }
+};
+
+// Update payment status for sales invoice - WITH LOGGING
+exports.updatePaymentStatus = async (req, res) => {
+  const conn = await db.getConnection();
+  
+  try {
+    await conn.beginTransaction();
+
+    const [rows] = await conn.execute(
+      "SELECT * FROM invoices WHERE id = ? AND type = 'sales'", 
+      [req.params.id]
+    );
+    if (rows.length === 0) {
+      await conn.rollback();
+      return res.status(404).json({ message: "Sales invoice not found" });
+    }
+
+    const oldInvoice = rows[0];
+    const { amountReceived, status, paymentMode } = req.body;
+
+    // Parse old meta
+    let oldMeta = {};
+    if (oldInvoice.meta) {
+      try {
+        oldMeta = typeof oldInvoice.meta === 'string' 
+          ? JSON.parse(oldInvoice.meta) 
+          : oldInvoice.meta;
+      } catch (e) {
+        console.error("Error parsing old invoice meta:", e);
+      }
+    }
+
+    const changes = {};
+    
+    // Track amount received changes
+    if (parseFloat(oldMeta.amountReceived || 0) !== parseFloat(amountReceived || 0)) {
+      changes.amountReceived = { 
+        from: parseFloat(oldMeta.amountReceived || 0), 
+        to: parseFloat(amountReceived || 0) 
+      };
+    }
+
+    // Track status changes
+    if (oldInvoice.status !== status) {
+      changes.status = { from: oldInvoice.status, to: status };
+    }
+
+    // Track payment mode changes
+    const oldPaymentMode = oldMeta.paymentMode || "Cash";
+    if (oldPaymentMode !== (paymentMode || "Cash")) {
+      changes.paymentMode = { from: oldPaymentMode, to: paymentMode || "Cash" };
+    }
+
+    // Update meta with new payment information
+    const updatedMeta = {
+      ...oldMeta,
+      amountReceived: parseFloat(amountReceived || 0),
+      paymentMode: paymentMode || oldMeta.paymentMode || "Cash"
+    };
+
+    await conn.execute(
+      `UPDATE invoices SET 
+        status = ?, 
+        meta = ?, 
+        updatedAt = NOW() 
+      WHERE id = ? AND type = 'sales'`,
+      [status, JSON.stringify(updatedMeta), req.params.id]
+    );
+
+    await conn.commit();
+
+    // Log payment status update
+    logInvoiceAction(
+      req.params.id,
+      'payment_updated',
+      `Payment status updated for sales invoice ${oldInvoice.invoiceNumber}`,
+      changes,
+      req
+    );
+
+    res.json({ 
+      message: "Payment status updated successfully",
+      invoiceId: req.params.id,
+      status: status,
+      amountReceived: amountReceived,
+      paymentMode: paymentMode || "Cash"
+    });
+  } catch (err) {
+    await conn.rollback();
+    console.error("Error updating payment status:", err);
+    res.status(500).json({ 
+      message: "Error updating payment status", 
+      error: err.message
+    });
+  } finally {
+    conn.release();
+  }
+};
+
+// Remove signature from an invoice - WITH LOGGING
+exports.removeSignature = async (req, res) => {
+  const conn = await db.getConnection();
+  
+  try {
+    await conn.beginTransaction();
+
+    const [rows] = await conn.execute(
+      "SELECT id, invoiceNumber FROM invoices WHERE id = ? AND type = 'sales'",
+      [req.params.id]
+    );
+    
+    if (rows.length === 0) {
+      await conn.rollback();
+      return res.status(404).json({ message: "Invoice not found" });
+    }
+
+    const invoice = rows[0];
+
+    await conn.execute(
+      "UPDATE invoices SET signature = NULL WHERE id = ?",
+      [req.params.id]
+    );
+
+    await conn.commit();
+
+    // Log signature removal
+    logInvoiceAction(
+      req.params.id,
+      'signature_removed',
+      `Signature removed from sales invoice ${invoice.invoiceNumber}`,
+      {
+        signature: { from: 'Had signature', to: 'No signature' }
+      },
+      req
+    );
+
+    res.json({ 
+      message: "Signature removed successfully",
+      id: req.params.id
+    });
+  } catch (err) {
+    await conn.rollback();
+    console.error("Error removing signature:", err);
+    res.status(500).json({ message: "Database error" });
+  } finally {
+    conn.release();
+  }
+};
+
 // Migration script to add originalProjectBudget to existing invoices
 exports.migrateInvoiceBudgets = async (req, res) => {
   const conn = await db.getConnection();
@@ -1049,30 +1551,6 @@ exports.migrateInvoiceBudgets = async (req, res) => {
   }
 };
 
-// Delete SALES invoice
-exports.delete = async (req, res) => {
-  try {
-    const [rows] = await db.execute(
-      "SELECT * FROM invoices WHERE id = ? AND type = 'sales'", 
-      [req.params.id]
-    );
-    if (rows.length === 0) return res.status(404).json({ message: "Sales invoice not found" });
-
-    await db.execute("DELETE FROM invoice_items WHERE invoiceId = ?", [req.params.id]);
-    const [result] = await db.execute(
-      "DELETE FROM invoices WHERE id = ? AND type = 'sales'", 
-      [req.params.id]
-    );
-
-    if (result.affectedRows === 0) return res.status(404).json({ message: "Sales invoice not found" });
-
-    res.json({ message: "Sales invoice deleted" });
-  } catch (err) {
-    console.error("Error deleting sales invoice:", err);
-    res.status(500).json({ message: "Database error" });
-  }
-};
-
 // Get balance (paid vs unpaid) for SALES invoices
 exports.balance = async (req, res) => {
   try {
@@ -1125,39 +1603,33 @@ exports.getSignature = async (req, res) => {
   }
 };
 
-// Remove signature from an invoice
-exports.removeSignature = async (req, res) => {
-  const conn = await db.getConnection();
-  
+// Get sales invoice stats
+exports.getSalesInvoiceStats = async (req, res) => {
   try {
-    await conn.beginTransaction();
-
-    const [rows] = await conn.execute(
-      "SELECT id FROM invoices WHERE id = ? AND type = 'sales'",
-      [req.params.id]
+    const [totalCount] = await db.execute(
+      "SELECT COUNT(*) as count FROM invoices WHERE type = 'sales'"
     );
     
-    if (rows.length === 0) {
-      await conn.rollback();
-      return res.status(404).json({ message: "Invoice not found" });
-    }
-
-    await conn.execute(
-      "UPDATE invoices SET signature = NULL WHERE id = ?",
-      [req.params.id]
+    const [totalAmount] = await db.execute(
+      "SELECT COALESCE(SUM(total), 0) as total FROM invoices WHERE type = 'sales'"
+    );
+    
+    const [paidCount] = await db.execute(
+      "SELECT COUNT(*) as count FROM invoices WHERE type = 'sales' AND status = 'paid'"
+    );
+    
+    const [draftCount] = await db.execute(
+      "SELECT COUNT(*) as count FROM invoices WHERE type = 'sales' AND status = 'draft'"
     );
 
-    await conn.commit();
-
-    res.json({ 
-      message: "Signature removed successfully",
-      id: req.params.id
+    res.json({
+      totalSalesInvoices: totalCount[0].count,
+      totalAmount: totalAmount[0].total,
+      paidSalesInvoices: paidCount[0].count,
+      draftSalesInvoices: draftCount[0].count
     });
   } catch (err) {
-    await conn.rollback();
-    console.error("Error removing signature:", err);
+    console.error("Error fetching sales invoice stats:", err);
     res.status(500).json({ message: "Database error" });
-  } finally {
-    conn.release();
   }
 };
