@@ -525,8 +525,9 @@ exports.resetPassword = async (req, res) => {
 
 exports.getCurrentUser = async (req, res) => {
   try {
-    
-    if (!req.user || !req.user.id) {
+    console.log('Request user:', req.user);
+
+    if (!req.user?.id) {
       return res.status(401).json({
         success: false,
         message: "Authentication required. Please log in again."
@@ -534,75 +535,150 @@ exports.getCurrentUser = async (req, res) => {
     }
 
     const userId = req.user.id;
+    console.log('Fetching data for user ID:', userId);
 
-    const [results] = await pool.query(
-      `SELECT u.*, e.* 
-       FROM users u 
-       LEFT JOIN employees e ON u.id = e.user_id 
-       WHERE u.id = ?`,
+    // Simple direct query to check what's actually in the database
+    const [userResults] = await pool.query(
+      `SELECT * FROM users WHERE id = ?`,
       [userId]
     );
 
-    if (results.length === 0) {
+    console.log('Raw user data from DB:', userResults[0]);
+
+    if (userResults.length === 0) {
       return res.status(404).json({
         success: false,
         message: "User not found"
       });
     }
 
-    const userData = results[0];
-    
-    // Parse meta fields if they are strings
-    if (typeof userData.meta === 'string') {
-      try {
-        userData.meta = JSON.parse(userData.meta);
-      } catch (parseError) {
-        console.error('Error parsing user meta:', parseError);
-        userData.meta = {};
-      }
-    }
+    const rawUser = userResults[0];
 
-    // Remove employee-specific fields from user object
-    const user = {};
-    const employee = {};
-    
-    // Separate user and employee data
-    Object.keys(userData).forEach(key => {
-      if (key.startsWith('user_') || 
-          ['id', 'name', 'email', 'role', 'meta', 'photo', 'employee_id', 'createdAt', 'updatedAt'].includes(key)) {
-        user[key] = userData[key];
-      } else if (!['user_id'].includes(key)) {
-        employee[key] = userData[key];
-      }
-    });
-
-    // Parse employee meta if it exists
-    if (typeof employee.meta === 'string') {
-      try {
-        employee.meta = JSON.parse(employee.meta);
-      } catch (parseError) {
-        console.error('Error parsing employee meta:', parseError);
-        employee.meta = {};
-      }
-    }
+    // Build safe user object with explicit fallbacks
+    const user = {
+      id: rawUser.id || userId,
+      name: rawUser.name || 'Unknown User',
+      email: rawUser.email || `${rawUser.id}@unknown.com`,
+      role: rawUser.role || 'user',
+      photo: rawUser.photo || '',
+      employee_id: rawUser.employee_id || null,
+      createdAt: rawUser.createdAt || new Date(),
+      updatedAt: rawUser.updatedAt || new Date(),
+      reset_token: rawUser.reset_token || null,
+      reset_token_expiry: rawUser.reset_token_expiry || null,
+      meta: safeJsonParse(rawUser.meta) // Use the helper function
+    };
 
     const response = {
       success: true,
       user: user
     };
 
-    // Add employee data if employee record exists
-    if (employee.id) {
-      response.employee = employee;
+    // Check if we should look for employee data
+    if (rawUser.employee_id || rawUser.role === 'staff') {
+      console.log('Looking for employee data...');
+
+      const [employeeResults] = await pool.query(
+        `SELECT * FROM employees WHERE user_id = ? OR id = ?`,
+        [userId, rawUser.employee_id]
+      );
+
+      console.log('Employee results:', employeeResults);
+
+      if (employeeResults.length > 0) {
+        const rawEmployee = employeeResults[0];
+        const employee = {
+          id: rawEmployee.id,
+          employeeName: rawEmployee.employeeName || user.name,
+          employeeNo: rawEmployee.employeeNo || '',
+          photo: rawEmployee.photo || user.photo,
+          position: rawEmployee.position || '',
+          department: rawEmployee.department || '',
+          employeeEmail: rawEmployee.email || user.email,
+          phone: rawEmployee.phone || '',
+          birthday: rawEmployee.birthday,
+          location: rawEmployee.location || '',
+          address: rawEmployee.address || '',
+          hiredOn: rawEmployee.hiredOn,
+          hours: rawEmployee.hours || '',
+          salary: rawEmployee.salary || 0,
+          last_month_due: rawEmployee.last_month_due || 0,
+          balance: rawEmployee.balance || 0,
+          status: rawEmployee.status || 'active',
+          active: rawEmployee.active !== undefined ? rawEmployee.active : true,
+          account_active: rawEmployee.account_active !== undefined ? rawEmployee.account_active : true,
+          meta: safeJsonParse(rawEmployee.meta) // Use the helper function
+        };
+
+        response.employee = employee;
+      }
     }
 
+    console.log('Final response user data:', {
+      id: response.user.id,
+      name: response.user.name,
+      email: response.user.email,
+      role: response.user.role,
+      hasEmployee: !!response.employee
+    });
+
     res.json(response);
+
   } catch (err) {
     console.error("Get current user error:", err);
     res.status(500).json({
       success: false,
-      message: "Error fetching user data",
+      message: "Failed to fetch user data",
       error: process.env.NODE_ENV === 'development' ? err.message : 'Internal server error'
     });
   }
 };
+
+// Improved helper function for safe JSON parsing
+function safeJsonParse(data) {
+  if (!data) return {};
+
+  // If it's already an object, return it directly
+  if (typeof data === 'object') return data;
+
+  // If it's not a string, return empty object
+  if (typeof data !== 'string') return {};
+
+  // Remove any extra characters and trim
+  const cleanStr = data.trim();
+
+  // If empty string after trimming, return empty object
+  if (!cleanStr) return {};
+
+  // Handle the specific error case where it's "[object Object]"
+  if (cleanStr === '[object Object]') {
+    console.warn('Found "[object Object]" string, returning empty object');
+    return {};
+  }
+
+  try {
+    const parsed = JSON.parse(cleanStr);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch (error) {
+    console.error('JSON parse error:', error.message, 'for string:', cleanStr.substring(0, 200));
+
+    // Try to fix common JSON issues
+    try {
+      // Try wrapping in quotes if it's a simple string
+      if (!cleanStr.startsWith('{') && !cleanStr.startsWith('[')) {
+        return { value: cleanStr };
+      }
+
+      // Try to fix common JSON syntax errors
+      const fixedStr = cleanStr
+        .replace(/(\w+):/g, '"$1":') // Add quotes to keys
+        .replace(/'/g, '"'); // Replace single quotes with double quotes
+
+      const parsed = JSON.parse(fixedStr);
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch (secondError) {
+      console.error('Second JSON parse attempt failed:', secondError.message);
+      return {};
+    }
+  }
+}

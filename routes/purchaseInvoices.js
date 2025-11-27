@@ -1,6 +1,9 @@
 const express = require('express');
 const router = express.Router();
 const purchaseInvoiceController = require('../controllers/purchaseInvoiceController');
+const authMiddleware = require('../middleware/authMiddleware');
+
+router.use(authMiddleware);
 
 // Purchase Invoice routes
 router.get('/', purchaseInvoiceController.list);

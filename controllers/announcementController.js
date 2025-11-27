@@ -4,11 +4,17 @@ const NotificationService = require('../services/notificationService');
 const twilio = require('twilio');
 const nodemailer = require('nodemailer');
 
-// Initialize Twilio client
-const twilioClient = twilio(
-  process.env.TWILIO_ACCOUNT_SID,
-  process.env.TWILIO_AUTH_TOKEN
-);
+// Initialize Twilio client only if in production
+let twilioClient = null;
+if (process.env.NODE_ENV === 'production' && process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
+  twilioClient = twilio(
+    process.env.TWILIO_ACCOUNT_SID,
+    process.env.TWILIO_AUTH_TOKEN
+  );
+  console.log('✅ Twilio client initialized for production environment');
+} else {
+  console.log('ℹ️ Twilio notifications disabled - not in production environment');
+}
 
 class AnnouncementController {
     constructor() {
@@ -33,6 +39,10 @@ class AnnouncementController {
         this.testAnnouncementNotifications = this.testAnnouncementNotifications.bind(this);
         this.testConnection = this.testConnection.bind(this);
         this.getEmployeesForBirthday = this.getEmployeesForBirthday.bind(this);
+        
+        // Environment detection
+        this.isProduction = process.env.NODE_ENV === 'production';
+        console.log(`🔧 Announcement Controller initialized in ${this.isProduction ? 'production' : 'development/staging'} mode`);
     }
 
     // Get all announcements
@@ -83,7 +93,8 @@ class AnnouncementController {
                 expiry_date, 
                 createdBy, 
                 is_birthday_announcement, 
-                employee_id 
+                employee_id,
+                environment: this.isProduction ? 'production' : 'development/staging'
             });
 
             // Validation
@@ -182,7 +193,8 @@ class AnnouncementController {
                     'Birthday announcement created successfully and notifications sent' : 
                     'Announcement created successfully and notifications sent',
                 id: announcementId,
-                notificationResult: notificationResult
+                notificationResult: notificationResult,
+                environment: this.isProduction ? 'production' : 'development/staging'
             });
         } catch (error) {
             if (connection) await connection.rollback();
@@ -204,7 +216,9 @@ class AnnouncementController {
             const { employee_id, custom_message } = req.body;
             const createdBy = req.user?.id || 1;
 
-            console.log('Sending birthday announcement for employee:', employee_id);
+            console.log('Sending birthday announcement for employee:', employee_id, {
+                environment: this.isProduction ? 'production' : 'development/staging'
+            });
 
             if (!employee_id) {
                 return res.status(400).json({
@@ -294,7 +308,8 @@ class AnnouncementController {
                     name: employeeName,
                     position: position
                 },
-                notificationResult: notificationResult
+                notificationResult: notificationResult,
+                environment: this.isProduction ? 'production' : 'development/staging'
             });
 
         } catch (error) {
@@ -313,7 +328,10 @@ class AnnouncementController {
     // Send birthday notifications
     async sendBirthdayNotifications(announcementId, title, message, excludeUserId, creatorName, employeeName, position, employeeEmail, employeePhone) {
         try {
-            console.log(`🎂 Starting birthday notifications for ${employeeName}`);
+            console.log(`🎂 Starting birthday notifications for ${employeeName}`, {
+                environment: this.isProduction ? 'production' : 'development/staging',
+                smsEnabled: this.isProduction
+            });
             
             // Get all active users except the birthday person
             const [users] = await pool.query(`
@@ -356,7 +374,7 @@ class AnnouncementController {
                 );
             }
 
-            if (employeePhone) {
+            if (employeePhone && this.isProduction) {
                 notificationPromises.push(
                     this.sendBirthdayWishSMS(employeePhone, employeeName, creatorName, announcementId)
                         .then(() => ({ type: 'birthday_wish_sms', success: true }))
@@ -365,6 +383,9 @@ class AnnouncementController {
                             return { type: 'birthday_wish_sms', success: false, error: err.message };
                         })
                 );
+            } else if (employeePhone && !this.isProduction) {
+                console.log(`ℹ️ Birthday wish SMS skipped for ${employeeName} - not in production environment`);
+                notificationPromises.push(Promise.resolve({ type: 'birthday_wish_sms', success: true, skipped: 'not_production' }));
             }
 
             // Collect all emails for CC
@@ -402,8 +423,8 @@ class AnnouncementController {
                     );
                 }
 
-                // SMS notification
-                if (user.phone) {
+                // SMS notification - only in production
+                if (user.phone && this.isProduction) {
                     userNotificationPromises.push(
                         this.sendBirthdaySMSToUser(user, title, message, employeeName, announcementId)
                             .then(() => ({ type: 'sms', success: true }))
@@ -412,6 +433,9 @@ class AnnouncementController {
                                 return { type: 'sms', success: false, error: err.message };
                             })
                     );
+                } else if (user.phone && !this.isProduction) {
+                    console.log(`ℹ️ SMS skipped for user ${user.name} - not in production environment`);
+                    userNotificationPromises.push(Promise.resolve({ type: 'sms', success: true, skipped: 'not_production' }));
                 }
 
                 // Execute all notifications for this user
@@ -460,7 +484,9 @@ class AnnouncementController {
                 totalNotifications: totalSuccessful + totalFailed,
                 successful: totalSuccessful,
                 failed: totalFailed,
-                details: allResults
+                details: allResults,
+                environment: this.isProduction ? 'production' : 'development/staging',
+                smsEnabled: this.isProduction
             };
 
         } catch (error) {
@@ -557,7 +583,13 @@ class AnnouncementController {
     // Send special birthday wish SMS to the birthday employee
     async sendBirthdayWishSMS(employeePhone, employeeName, creatorName, announcementId) {
         try {
-            if (!employeePhone || !process.env.TWILIO_ACCOUNT_SID) {
+            // Only send SMS in production environment
+            if (!this.isProduction) {
+                console.log(`ℹ️ Birthday wish SMS skipped for ${employeeName} - not in production environment`);
+                return { skipped: true, reason: 'not_production' };
+            }
+
+            if (!employeePhone || !twilioClient) {
                 console.log(`No phone number or Twilio not configured for birthday employee ${employeeName}`);
                 return;
             }
@@ -692,7 +724,13 @@ ${creatorName} & Icebergs India Team
     // Send birthday SMS to other users (not the birthday person)
     async sendBirthdaySMSToUser(user, title, message, employeeName, announcementId) {
         try {
-            if (!user.phone || !process.env.TWILIO_ACCOUNT_SID) {
+            // Only send SMS in production environment
+            if (!this.isProduction) {
+                console.log(`ℹ️ Birthday SMS skipped for user ${user.name} - not in production environment`);
+                return { skipped: true, reason: 'not_production' };
+            }
+
+            if (!user.phone || !twilioClient) {
                 console.log(`No phone number or Twilio not configured for user ${user.name}`);
                 return;
             }
@@ -778,7 +816,10 @@ Let's wish ${employeeName} a wonderful birthday! 🎂
     // Updated comprehensive announcement notifications to handle birthday announcements
     async sendAnnouncementNotificationsComprehensive(announcementId, title, message, priority, expiry_date, excludeUserId, creatorName, isBirthdayAnnouncement = false, employeeName = null, birthdayEmployeeEmail = null, birthdayEmployeePhone = null) {
         try {
-            console.log(`🔔 Starting comprehensive announcement notifications for announcement ${announcementId}`);
+            console.log(`🔔 Starting comprehensive announcement notifications for announcement ${announcementId}`, {
+                environment: this.isProduction ? 'production' : 'development/staging',
+                smsEnabled: this.isProduction
+            });
             
             // Get all active users except the excluded user
             const [users] = await pool.query(`
@@ -821,7 +862,7 @@ Let's wish ${employeeName} a wonderful birthday! 🎂
                 );
             }
 
-            if (isBirthdayAnnouncement && birthdayEmployeePhone) {
+            if (isBirthdayAnnouncement && birthdayEmployeePhone && this.isProduction) {
                 notificationPromises.push(
                     this.sendBirthdayWishSMS(birthdayEmployeePhone, employeeName, creatorName, announcementId)
                         .then(() => ({ type: 'birthday_wish_sms', success: true }))
@@ -830,6 +871,9 @@ Let's wish ${employeeName} a wonderful birthday! 🎂
                             return { type: 'birthday_wish_sms', success: false, error: err.message };
                         })
                 );
+            } else if (isBirthdayAnnouncement && birthdayEmployeePhone && !this.isProduction) {
+                console.log(`ℹ️ Birthday wish SMS skipped for ${employeeName} - not in production environment`);
+                notificationPromises.push(Promise.resolve({ type: 'birthday_wish_sms', success: true, skipped: 'not_production' }));
             }
 
             // Collect all emails for CC (for birthday announcements)
@@ -878,8 +922,8 @@ Let's wish ${employeeName} a wonderful birthday! 🎂
                     }
                 }
 
-                // SMS notification
-                if (user.phone) {
+                // SMS notification - only in production
+                if (user.phone && this.isProduction) {
                     if (isBirthdayAnnouncement) {
                         userNotificationPromises.push(
                             this.sendBirthdaySMSToUser(user, title, message, employeeName, announcementId)
@@ -899,6 +943,9 @@ Let's wish ${employeeName} a wonderful birthday! 🎂
                                 })
                         );
                     }
+                } else if (user.phone && !this.isProduction) {
+                    console.log(`ℹ️ SMS skipped for user ${user.name} - not in production environment`);
+                    userNotificationPromises.push(Promise.resolve({ type: 'sms', success: true, skipped: 'not_production' }));
                 }
 
                 // Execute all notifications for this user
@@ -948,7 +995,9 @@ Let's wish ${employeeName} a wonderful birthday! 🎂
                 totalNotifications: totalSuccessful + totalFailed,
                 successful: totalSuccessful,
                 failed: totalFailed,
-                details: allResults
+                details: allResults,
+                environment: this.isProduction ? 'production' : 'development/staging',
+                smsEnabled: this.isProduction
             };
 
         } catch (error) {
@@ -1060,7 +1109,13 @@ Let's wish ${employeeName} a wonderful birthday! 🎂
     // Send announcement SMS to user (for regular announcements)
     async sendAnnouncementSMSToUser(user, title, message, priority, announcementId) {
         try {
-            if (!user.phone || !process.env.TWILIO_ACCOUNT_SID) {
+            // Only send SMS in production environment
+            if (!this.isProduction) {
+                console.log(`ℹ️ Announcement SMS skipped for user ${user.name} - not in production environment`);
+                return { skipped: true, reason: 'not_production' };
+            }
+
+            if (!user.phone || !twilioClient) {
                 console.log(`No phone number or Twilio not configured for user ${user.name}`);
                 return;
             }
@@ -1362,7 +1417,9 @@ Please check the staff portal for details.`;
             console.log(`Testing notifications for user: ${user.name}`, {
                 email: user.email,
                 phone: user.phone,
-                employeeName: user.employee_name
+                employeeName: user.employee_name,
+                environment: this.isProduction ? 'production' : 'development/staging',
+                smsEnabled: this.isProduction
             });
 
             // Test all notification types
@@ -1384,11 +1441,16 @@ Please check the staff portal for details.`;
                     .catch(err => ({ type: 'email', success: false, error: err.message })) 
                     : Promise.resolve({ type: 'email', success: true, skipped: 'No email' }),
                 
-                // SMS notification
-                user.phone ? this.sendAnnouncementSMSToUser(user, testTitle, testMessage, testPriority, testAnnouncementId)
+                // SMS notification - only in production
+                (user.phone && this.isProduction) ? this.sendAnnouncementSMSToUser(user, testTitle, testMessage, testPriority, testAnnouncementId)
                     .then(() => ({ type: 'sms', success: true }))
                     .catch(err => ({ type: 'sms', success: false, error: err.message }))
-                    : Promise.resolve({ type: 'sms', success: true, skipped: 'No phone' })
+                    : Promise.resolve({ 
+                        type: 'sms', 
+                        success: true, 
+                        skipped: !user.phone ? 'No phone' : 'not_production',
+                        environment: this.isProduction ? 'production' : 'development/staging'
+                    })
             ]);
 
             const successful = results.filter(result => 
@@ -1408,6 +1470,8 @@ Please check the staff portal for details.`;
                         phone: user.phone,
                         employeeName: user.employee_name
                     },
+                    environment: this.isProduction ? 'production' : 'development/staging',
+                    smsEnabled: this.isProduction,
                     results: {
                         successful,
                         failed,
@@ -1438,7 +1502,9 @@ Please check the staff portal for details.`;
             res.json({
                 success: true,
                 message: 'Database connected successfully',
-                test: results[0].test
+                test: results[0].test,
+                environment: this.isProduction ? 'production' : 'development/staging',
+                smsEnabled: this.isProduction
             });
         } catch (error) {
             console.log('Database connection failed:', error);

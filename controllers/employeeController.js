@@ -56,11 +56,17 @@ const upload = multer({
   }
 });
 
-// Initialize Twilio client
-const twilioClient = twilio(
-  process.env.TWILIO_ACCOUNT_SID,
-  process.env.TWILIO_AUTH_TOKEN
-);
+// Initialize Twilio client only if in production
+let twilioClient = null;
+if (process.env.NODE_ENV === 'production' && process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
+  twilioClient = twilio(
+    process.env.TWILIO_ACCOUNT_SID,
+    process.env.TWILIO_AUTH_TOKEN
+  );
+  console.log('✅ Twilio client initialized for production environment');
+} else {
+  console.log('ℹ️ Twilio notifications disabled - not in production environment');
+}
 
 // Utility functions for time calculations
 const parseTimeToMinutes = (timeString) => {
@@ -156,6 +162,16 @@ const calculateOvertime = (checkinTime, actualCheckoutTime, requiredCheckoutTime
   }
 };
 
+// NEW: Utility function to check if today is a working day
+const isWorkingDay = () => {
+  const today = new Date();
+  const dayOfWeek = today.getDay(); // 0 = Sunday, 1 = Monday, ..., 6 = Saturday
+  
+  // Only Monday (1) to Friday (5) are working days
+  // Exclude Sunday (0) and Saturday (6)
+  return dayOfWeek >= 1 && dayOfWeek <= 5;
+};
+
 class ReminderScheduler {
   constructor() {
     this.isRunning = false;
@@ -165,6 +181,7 @@ class ReminderScheduler {
     this.absentCheckMinutes = 10; // 10 minutes after checkout to check for absence
     this.finalReminderMinutes = 120; // 120 minutes after checkout for final reminder
     this.endOfDayTime = '23:59'; // End of day for auto absent marking
+    this.isProduction = process.env.NODE_ENV === 'production';
   }
 
   // Get attendance settings from database
@@ -190,7 +207,7 @@ class ReminderScheduler {
         workingHours: '09:00',
         weeklyOff: {
           sun: true, mon: false, tue: false, wed: false, 
-          thu: false, fri: false, sat: false
+          thu: false, fri: false, sat: true
         }
       };
     } catch (error) {
@@ -337,6 +354,22 @@ class ReminderScheduler {
     } catch (error) {
       console.error('Error getting employee check-in time:', error);
       return null;
+    }
+  }
+
+  // NEW: Check if employee has already checked out today
+  async hasEmployeeCheckedOut(employeeId) {
+    try {
+      const today = new Date().toISOString().split('T')[0];
+      const [attendance] = await db.query(`
+        SELECT check_out FROM attendance 
+        WHERE employee_id = ? AND DATE(date) = ? AND check_out IS NOT NULL
+      `, [employeeId, today]);
+
+      return attendance.length > 0 && attendance[0].check_out !== null;
+    } catch (error) {
+      console.error('Error checking employee checkout status:', error);
+      return false;
     }
   }
 
@@ -630,6 +663,20 @@ ${process.env.EMAIL_USER || 'garan6104@gmail.com'}
 
       const employee = employees[0];
       
+      // NEW: For checkout reminders, check if employee has already checked out
+      if (reminderType.includes('checkout')) {
+        const hasCheckedOut = await this.hasEmployeeCheckedOut(employeeId);
+        if (hasCheckedOut) {
+          console.log(`⏭️  Skipping ${reminderType} reminder for ${employee.employeeName} - already checked out`);
+          return {
+            skipped: true,
+            reason: 'already_checked_out',
+            employeeName: employee.employeeName,
+            reminderType: reminderType
+          };
+        }
+      }
+      
       let title = '';
       let message = '';
 
@@ -661,7 +708,9 @@ ${process.env.EMAIL_USER || 'garan6104@gmail.com'}
       console.log(`📱 Preparing to send ${reminderType} reminder to ${employee.employeeName}:`, {
         phone: employee.phone,
         email: employee.email,
-        message: message
+        message: message,
+        environment: this.isProduction ? 'production' : 'development/staging',
+        smsEnabled: this.isProduction
       });
 
       const results = {
@@ -670,7 +719,8 @@ ${process.env.EMAIL_USER || 'garan6104@gmail.com'}
         emailSent: false,
         employeeName: employee.employeeName,
         phone: employee.phone,
-        email: employee.email
+        email: employee.email,
+        environment: this.isProduction ? 'production' : 'development/staging'
       };
 
       // Send panel notification if user exists
@@ -690,8 +740,8 @@ ${process.env.EMAIL_USER || 'garan6104@gmail.com'}
         }
       }
 
-      // Send SMS if phone number exists and is valid
-      if (employee.phone && employee.phone.trim() !== '') {
+      // Send SMS only in production environment
+      if (this.isProduction && employee.phone && employee.phone.trim() !== '') {
         try {
           // Clean phone number - remove any non-digit characters except +
           const cleanPhone = employee.phone.replace(/[^\d+]/g, '');
@@ -712,7 +762,11 @@ ${process.env.EMAIL_USER || 'garan6104@gmail.com'}
           console.error(`❌ SMS error for ${employee.employeeName}:`, smsError.message);
         }
       } else {
-        console.log(`ℹ️ No phone number available for ${employee.employeeName}`);
+        if (!this.isProduction) {
+          console.log(`ℹ️ SMS skipped for ${employee.employeeName} - not in production environment`);
+        } else {
+          console.log(`ℹ️ No phone number available for ${employee.employeeName}`);
+        }
       }
 
       // Send email reminder
@@ -743,7 +797,13 @@ ${process.env.EMAIL_USER || 'garan6104@gmail.com'}
 
   async sendSMS(to, message) {
     try {
-      if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN) {
+      // Only send SMS in production environment
+      if (!this.isProduction) {
+        console.log(`ℹ️ SMS skipped - not in production environment (NODE_ENV: ${process.env.NODE_ENV})`);
+        return { skipped: true, reason: 'not_production' };
+      }
+
+      if (!twilioClient) {
         console.log('Twilio not configured, skipping SMS');
         return null;
       }
@@ -759,17 +819,6 @@ ${process.env.EMAIL_USER || 'garan6104@gmail.com'}
         console.error('Error: Cannot send SMS to empty phone number');
         return null;
       }
-
-      // Use the same Twilio client configuration as your OTP code
-      const twilioClient = twilio(
-        process.env.TWILIO_ACCOUNT_SID,
-        process.env.TWILIO_AUTH_TOKEN,
-        {
-          timeout: 120000, // 2 minutes
-          region: "us1",
-          edge: "ashburn",
-        }
-      );
 
       // Use the same phone sanitization as your OTP code
       const sanitizePhone = (phone) => phone.replace(/\D/g, "");
@@ -893,9 +942,19 @@ ${process.env.EMAIL_USER || 'garan6104@gmail.com'}
     }
   }
 
-  // Send check-in reminders
+  // Send check-in reminders ONLY on working days
   async sendCheckinReminders() {
     try {
+      // NEW: Check if today is a working day
+      if (!isWorkingDay()) {
+        console.log('📅 Today is not a working day. Skipping check-in reminders.');
+        return {
+          skipped: true,
+          reason: 'not_working_day',
+          message: 'Check-in reminders are only sent on working days'
+        };
+      }
+
       console.log('Sending check-in reminders...');
       
       const employees = await this.getEmployeesWithoutCheckin();
@@ -934,177 +993,193 @@ ${process.env.EMAIL_USER || 'garan6104@gmail.com'}
   }
 
   // Send dynamic checkout reminders based on individual check-in times
-async sendDynamicCheckoutReminders() {
-  try {
-    console.log('🕒 Sending dynamic checkout reminders...');
-    const currentTime = new Date();
-    console.log('📊 Current server time:', currentTime.toLocaleTimeString('en-IN', { 
-      hour12: false,
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit'
-    }));
-    
-    const employees = await this.getEmployeesWithoutCheckout();
-    console.log(`👥 Found ${employees.length} employees without check-out`);
+  async sendDynamicCheckoutReminders() {
+    try {
+      console.log('🕒 Sending dynamic checkout reminders...');
+      const currentTime = new Date();
+      console.log('📊 Current server time:', currentTime.toLocaleTimeString('en-IN', { 
+        hour12: false,
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit'
+      }));
+      
+      const employees = await this.getEmployeesWithoutCheckout();
+      console.log(`👥 Found ${employees.length} employees without check-out`);
 
-    if (employees.length === 0) {
-      console.log('ℹ️ No employees found without checkout');
-      return [];
-    }
+      if (employees.length === 0) {
+        console.log('ℹ️ No employees found without checkout');
+        return [];
+      }
 
-    const results = [];
-    const today = new Date().toISOString().split('T')[0];
-    
-    for (const employee of employees) {
-      try {
-        // Check if employee is already marked as absent for today
-        const [attendanceRecords] = await db.query(`
-          SELECT status FROM attendance 
-          WHERE employee_id = ? AND DATE(date) = ? AND status = 'Absent'
-        `, [employee.id, today]);
+      const results = [];
+      const today = new Date().toISOString().split('T')[0];
+      
+      for (const employee of employees) {
+        try {
+          // Check if employee is already marked as absent for today
+          const [attendanceRecords] = await db.query(`
+            SELECT status FROM attendance 
+            WHERE employee_id = ? AND DATE(date) = ? AND status = 'Absent'
+          `, [employee.id, today]);
 
-        if (attendanceRecords.length > 0) {
-          console.log(`⏭️  Skipping ${employee.employeeName} - already marked as absent for today`);
-          continue; // Skip this employee
-        }
-
-        // Check if final reminder was already sent today
-        const [existingFinalReminders] = await db.query(`
-          SELECT id FROM notifications 
-          WHERE user_id IN (SELECT id FROM users WHERE employee_id = ?)
-          AND type = 'attendance'
-          AND title LIKE '%Final Attendance Alert%'
-          AND DATE(created_at) = ?
-          LIMIT 1
-        `, [employee.id, today]);
-
-        const finalReminderAlreadySent = existingFinalReminders.length > 0;
-
-        // Calculate checkout time based on check-in time and working hours
-        const checkoutTime = this.calculateCheckoutTime(employee.check_in, this.workingHours);
-        const reminderTimes = this.calculateReminderTimes(checkoutTime);
-        
-        const currentTime = new Date();
-        const currentHours = currentTime.getHours();
-        const currentMinutes = currentTime.getMinutes();
-        const totalCurrentMinutes = currentHours * 60 + currentMinutes;
-        
-        const [checkoutHours, checkoutMinutes] = checkoutTime.split(':').map(Number);
-        const totalCheckoutMinutes = checkoutHours * 60 + checkoutMinutes;
-        
-        // Calculate time differences
-        const timeDiff = totalCheckoutMinutes - totalCurrentMinutes;
-        const timeSinceCheckout = -timeDiff; // Positive if after checkout time
-        
-        console.log(`\n🔍 Processing employee: ${employee.employeeName}`);
-        console.log(`   Check-in: ${employee.check_in}`);
-        console.log(`   Working Hours: ${this.workingHours}`);
-        console.log(`   Calculated Checkout: ${checkoutTime}`);
-        console.log(`   Current Time: ${currentHours}:${currentMinutes.toString().padStart(2, '0')}`);
-        console.log(`   Time Difference: ${timeDiff} minutes (${timeDiff > 0 ? 'before' : 'after'} checkout)`);
-        console.log(`   Time Since Checkout: ${timeSinceCheckout} minutes`);
-        console.log(`   Final Reminder Already Sent: ${finalReminderAlreadySent}`);
-        console.log(`   Reminder Times:`, reminderTimes);
-        
-        let reminderType = null;
-        let customMessage = '';
-        let shouldSendReminder = false;
-        
-        // FINAL REMINDER: 10 minutes after checkout (ONLY ONCE)
-        if (timeSinceCheckout >= 10 && timeSinceCheckout < 120 && !finalReminderAlreadySent) {
-          reminderType = 'checkout_final';
-          customMessage = `Dear ${employee.employeeName}, you have not checked out yet. Today will be marked as absent at the end of the day (11:59 PM) if you don't check out. This is your final reminder.`;
-          shouldSendReminder = true;
-          
-          console.log(`   ⚠️  Sending FINAL reminder (${timeSinceCheckout} minutes after checkout)`);
-          
-        } 
-        // OVERDUE REMINDER: 10 minutes after checkout (if final reminder not sent yet)
-        else if (timeSinceCheckout >= 10 && timeSinceCheckout < 120 && finalReminderAlreadySent) {
-          console.log(`   ℹ️  Final reminder already sent to ${employee.employeeName}, skipping additional reminders`);
-          continue;
-        }
-        // BEFORE CHECKOUT REMINDER: 5 minutes before checkout
-        else if (timeDiff <= this.reminderBufferMinutes && timeDiff > 0) {
-          reminderType = 'checkout_before';
-          const workingMinutes = this.workingHoursToMinutes(this.workingHours);
-          const workingHoursReadable = formatMinutesToReadable(workingMinutes);
-          customMessage = `Dear ${employee.employeeName}, please remember to check out. Your calculated checkout time is ${checkoutTime} (based on ${workingHoursReadable} working hours). You have ${timeDiff} minutes remaining.`;
-          shouldSendReminder = true;
-          
-          console.log(`   🔔 Sending BEFORE checkout reminder (${timeDiff} minutes before checkout)`);
-        } else {
-          console.log(`   ℹ️  No reminder needed yet:`);
-          if (timeDiff > this.reminderBufferMinutes) {
-            console.log(`      Too early for reminder (${timeDiff} minutes before checkout)`);
-          } else if (timeSinceCheckout < 10) {
-            console.log(`      Just checked out recently (${timeSinceCheckout} minutes ago)`);
-          } else if (timeSinceCheckout >= 120) {
-            console.log(`      Already past final reminder window (${timeSinceCheckout} minutes ago)`);
-          } else if (finalReminderAlreadySent) {
-            console.log(`      Final reminder already sent (${timeSinceCheckout} minutes after checkout)`);
+          if (attendanceRecords.length > 0) {
+            console.log(`⏭️  Skipping ${employee.employeeName} - already marked as absent for today`);
+            continue; // Skip this employee
           }
-          continue;
-        }
-        
-        if (shouldSendReminder && reminderType) {
-          console.log(`   📤 Sending ${reminderType} reminder...`);
+
+          // Check if final reminder was already sent today
+          const [existingFinalReminders] = await db.query(`
+            SELECT id FROM notifications 
+            WHERE user_id IN (SELECT id FROM users WHERE employee_id = ?)
+            AND type = 'attendance'
+            AND title LIKE '%Final Attendance Alert%'
+            AND DATE(created_at) = ?
+            LIMIT 1
+          `, [employee.id, today]);
+
+          const finalReminderAlreadySent = existingFinalReminders.length > 0;
+
+          // Calculate checkout time based on check-in time and working hours
+          const checkoutTime = this.calculateCheckoutTime(employee.check_in, this.workingHours);
+          const reminderTimes = this.calculateReminderTimes(checkoutTime);
           
-          const result = await this.sendReminder(
-            employee.id, 
-            reminderType,
-            customMessage,
-            checkoutTime
-          );
+          const currentTime = new Date();
+          const currentHours = currentTime.getHours();
+          const currentMinutes = currentTime.getMinutes();
+          const totalCurrentMinutes = currentHours * 60 + currentMinutes;
           
+          const [checkoutHours, checkoutMinutes] = checkoutTime.split(':').map(Number);
+          const totalCheckoutMinutes = checkoutHours * 60 + checkoutMinutes;
+          
+          // Calculate time differences
+          const timeDiff = totalCheckoutMinutes - totalCurrentMinutes;
+          const timeSinceCheckout = -timeDiff; // Positive if after checkout time
+          
+          console.log(`\n🔍 Processing employee: ${employee.employeeName}`);
+          console.log(`   Check-in: ${employee.check_in}`);
+          console.log(`   Working Hours: ${this.workingHours}`);
+          console.log(`   Calculated Checkout: ${checkoutTime}`);
+          console.log(`   Current Time: ${currentHours}:${currentMinutes.toString().padStart(2, '0')}`);
+          console.log(`   Time Difference: ${timeDiff} minutes (${timeDiff > 0 ? 'before' : 'after'} checkout)`);
+          console.log(`   Time Since Checkout: ${timeSinceCheckout} minutes`);
+          console.log(`   Final Reminder Already Sent: ${finalReminderAlreadySent}`);
+          console.log(`   Reminder Times:`, reminderTimes);
+          
+          let reminderType = null;
+          let customMessage = '';
+          let shouldSendReminder = false;
+          
+          // FINAL REMINDER: 10 minutes after checkout (ONLY ONCE)
+          if (timeSinceCheckout >= 10 && timeSinceCheckout < 120 && !finalReminderAlreadySent) {
+            reminderType = 'checkout_final';
+            customMessage = `Dear ${employee.employeeName}, you have not checked out yet. Today will be marked as absent at the end of the day (11:59 PM) if you don't check out. This is your final reminder.`;
+            shouldSendReminder = true;
+            
+            console.log(`   ⚠️  Sending FINAL reminder (${timeSinceCheckout} minutes after checkout)`);
+            
+          } 
+          // OVERDUE REMINDER: 10 minutes after checkout (if final reminder not sent yet)
+          else if (timeSinceCheckout >= 10 && timeSinceCheckout < 120 && finalReminderAlreadySent) {
+            console.log(`   ℹ️  Final reminder already sent to ${employee.employeeName}, skipping additional reminders`);
+            continue;
+          }
+          // BEFORE CHECKOUT REMINDER: 5 minutes before checkout
+          else if (timeDiff <= this.reminderBufferMinutes && timeDiff > 0) {
+            reminderType = 'checkout_before';
+            const workingMinutes = this.workingHoursToMinutes(this.workingHours);
+            const workingHoursReadable = formatMinutesToReadable(workingMinutes);
+            customMessage = `Dear ${employee.employeeName}, please remember to check out. Your calculated checkout time is ${checkoutTime} (based on ${workingHoursReadable} working hours). You have ${timeDiff} minutes remaining.`;
+            shouldSendReminder = true;
+            
+            console.log(`   🔔 Sending BEFORE checkout reminder (${timeDiff} minutes before checkout)`);
+          } else {
+            console.log(`   ℹ️  No reminder needed yet:`);
+            if (timeDiff > this.reminderBufferMinutes) {
+              console.log(`      Too early for reminder (${timeDiff} minutes before checkout)`);
+            } else if (timeSinceCheckout < 10) {
+              console.log(`      Just checked out recently (${timeSinceCheckout} minutes ago)`);
+            } else if (timeSinceCheckout >= 120) {
+              console.log(`      Already past final reminder window (${timeSinceCheckout} minutes ago)`);
+            } else if (finalReminderAlreadySent) {
+              console.log(`      Final reminder already sent (${timeSinceCheckout} minutes after checkout)`);
+            }
+            continue;
+          }
+          
+          if (shouldSendReminder && reminderType) {
+            console.log(`   📤 Sending ${reminderType} reminder...`);
+            
+            const result = await this.sendReminder(
+              employee.id, 
+              reminderType,
+              customMessage,
+              checkoutTime
+            );
+            
+            // Check if reminder was skipped due to already checked out
+            if (result && result.skipped) {
+              console.log(`   ⏭️  Reminder skipped: ${result.reason}`);
+              results.push({
+                employeeId: employee.id,
+                employeeName: employee.employeeName,
+                reminderType: reminderType,
+                reminderSent: false,
+                skipped: true,
+                reason: result.reason
+              });
+            } else {
+              results.push({
+                employeeId: employee.id,
+                employeeName: employee.employeeName,
+                checkinTime: employee.check_in,
+                workingHours: this.workingHours,
+                workingHoursReadable: formatMinutesToReadable(this.workingHoursToMinutes(this.workingHours)),
+                checkoutTime: checkoutTime,
+                reminderType: reminderType,
+                timeDifference: timeDiff,
+                timeSinceCheckout: timeSinceCheckout,
+                finalReminderAlreadySent: finalReminderAlreadySent,
+                reminderSent: true,
+                ...result
+              });
+              
+              console.log(`   ✅ ${reminderType} reminder sent successfully`);
+            }
+          }
+          
+        } catch (error) {
+          console.error(`❌ Failed to process checkout reminder for ${employee.employeeName}:`, error);
           results.push({
             employeeId: employee.id,
             employeeName: employee.employeeName,
-            checkinTime: employee.check_in,
-            workingHours: this.workingHours,
-            workingHoursReadable: formatMinutesToReadable(this.workingHoursToMinutes(this.workingHours)),
-            checkoutTime: checkoutTime,
-            reminderType: reminderType,
-            timeDifference: timeDiff,
-            timeSinceCheckout: timeSinceCheckout,
-            finalReminderAlreadySent: finalReminderAlreadySent,
-            reminderSent: true,
-            ...result
+            error: error.message,
+            reminderSent: false
           });
-          
-          console.log(`   ✅ ${reminderType} reminder sent successfully`);
         }
-        
-      } catch (error) {
-        console.error(`❌ Failed to process checkout reminder for ${employee.employeeName}:`, error);
-        results.push({
-          employeeId: employee.id,
-          employeeName: employee.employeeName,
-          error: error.message,
-          reminderSent: false
-        });
       }
-    }
 
-    console.log('✅ Dynamic checkout reminders completed. Results:', {
-      totalProcessed: employees.length,
-      remindersSent: results.length,
-      details: results.map(r => ({
-        employee: r.employeeName,
-        type: r.reminderType,
-        sent: r.reminderSent,
-        finalReminderAlreadySent: r.finalReminderAlreadySent,
-        error: r.error || 'None'
-      }))
-    });
-    
-    return results;
-  } catch (error) {
-    console.error('❌ Error in sendDynamicCheckoutReminders:', error);
-    throw error;
+      console.log('✅ Dynamic checkout reminders completed. Results:', {
+        totalProcessed: employees.length,
+        remindersSent: results.filter(r => r.reminderSent).length,
+        remindersSkipped: results.filter(r => r.skipped).length,
+        details: results.map(r => ({
+          employee: r.employeeName,
+          type: r.reminderType,
+          sent: r.reminderSent,
+          skipped: r.skipped || false,
+          reason: r.reason || 'None',
+          finalReminderAlreadySent: r.finalReminderAlreadySent,
+          error: r.error || 'None'
+        }))
+      });
+      
+      return results;
+    } catch (error) {
+      console.error('❌ Error in sendDynamicCheckoutReminders:', error);
+      throw error;
+    }
   }
-}
 
   // NEW: Auto mark absent at end of day for employees who checked in but didn't check out
   async autoMarkAbsentAtEndOfDay() {
@@ -1325,7 +1400,12 @@ async sendDynamicCheckoutReminders() {
       endOfDayTime: this.endOfDayTime,
       checkinCron: `${checkinTime.minutes} ${checkinTime.hours} * * *`,
       checkinFormatted: `${checkinTime.hours}:${checkinTime.minutes.toString().padStart(2, '0')}`,
-      endOfDayCron: `${endOfDayTime.minutes} ${endOfDayTime.hours} * * *`
+      endOfDayCron: `${endOfDayTime.minutes} ${endOfDayTime.hours} * * *`,
+      environment: this.isProduction ? 'production' : 'development/staging',
+      smsEnabled: this.isProduction,
+      // NEW: Add working day information
+      isWorkingDayToday: isWorkingDay(),
+      workingDayLogic: 'Weekdays + 1st & 3rd Saturdays only (excludes Sundays, 2nd & 4th Saturdays)'
     };
   }
 
@@ -1352,12 +1432,22 @@ async sendDynamicCheckoutReminders() {
       reminderBuffer: `${this.reminderBufferMinutes} minutes before checkout`,
       absentCheck: `${this.absentCheckMinutes} minutes after checkout`,
       finalReminder: `${this.finalReminderMinutes} minutes after checkout`,
-      endOfDay: `${endOfDayTime.hours}:${endOfDayTime.minutes.toString().padStart(2, '0')} (auto absent marking)`
+      endOfDay: `${endOfDayTime.hours}:${endOfDayTime.minutes.toString().padStart(2, '0')} (auto absent marking)`,
+      environment: this.isProduction ? 'production' : 'development/staging',
+      smsEnabled: this.isProduction,
+      workingDayLogic: 'Weekdays + 1st & 3rd Saturdays only'
     });
 
-    // Schedule check-in reminder (fixed time)
+    // Schedule check-in reminder (fixed time) - ONLY ON WORKING DAYS
     cron.schedule(`${checkinTime.minutes} ${checkinTime.hours} * * *`, async () => {
       console.log(`⏰ Running check-in reminder job at ${checkinTime.hours}:${checkinTime.minutes.toString().padStart(2, '0')}`);
+      
+      // NEW: Check if today is a working day
+      if (!isWorkingDay()) {
+        console.log('📅 Today is not a working day. Skipping check-in reminders.');
+        return;
+      }
+      
       try {
         await this.sendCheckinReminders();
       } catch (error) {
@@ -1743,7 +1833,7 @@ const getEmployeeById = async (req, res) => {
   }
 };
 
-// Create employee
+// Create employee - FIXED VERSION
 const createEmployee = async (req, res) => {
   const {
     employeeName,
@@ -1760,6 +1850,7 @@ const createEmployee = async (req, res) => {
     hours,
     lanNo,
     gender,
+    wfhEnabled, // Add wfhEnabled from request body
     bank, // Add bank data from request body
     salary // Add salary data from request body
   } = req.body;
@@ -1782,20 +1873,24 @@ const createEmployee = async (req, res) => {
       });
     }
 
-      const metaData = {};
+    const metaData = {};
     if (lanNo && lanNo.trim() !== '') {
       metaData.lan_no = lanNo.trim();
       metaData.lan_updated_at = new Date().toISOString();
     }
 
-    if (gender && lanNo.trim() !== '') {
+    if (gender && gender.trim() !== '') {
       metaData.gender = gender.trim();
     }
+
+    // FIX: Use wfhEnabled from request body instead of undefined formData
+    metaData.wfh_enabled = wfhEnabled || false;
+    metaData.wfh_updated_at = new Date().toISOString();
 
     // Insert employee
     const [result] = await connection.query(
       `INSERT INTO employees 
-      (employeeName, employeeNo, photo, position, department, email, phone, birthday, location, address, hiredOn, hours,meta) 
+      (employeeName, employeeNo, photo, position, department, email, phone, birthday, location, address, hiredOn, hours, meta) 
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         employeeName,
@@ -1920,6 +2015,7 @@ const updateEmployee = async (req, res) => {
     hours,
     lanNo,
     gender,
+    wfhEnabled, // Add wfhEnabled from request body
     bank, // Add bank data from request body
     salary // Add salary data from request body
   } = req.body;
@@ -1936,7 +2032,7 @@ const updateEmployee = async (req, res) => {
       return res.status(404).json({ message: 'Employee not found' });
     }
 
-     let metaData = {};
+    let metaData = {};
     try {
       metaData = existing[0].meta ? JSON.parse(existing[0].meta) : {};
     } catch (e) {
@@ -1961,6 +2057,12 @@ const updateEmployee = async (req, res) => {
       } else {
         delete metaData.gender;
       }
+    }
+
+    // FIX: Use wfhEnabled from request body instead of undefined formData
+    if (wfhEnabled !== undefined) {
+      metaData.wfh_enabled = wfhEnabled || false;
+      metaData.wfh_updated_at = new Date().toISOString();
     }
 
     // Update employee
@@ -2923,10 +3025,24 @@ const manualProcessOvertime = async (req, res) => {
   }
 };
 
-// Test SMS
+// Test SMS - Updated to respect environment
 const testSMS = async (req, res) => {
   try {
     const { phone, message } = req.body;
+    
+    if (process.env.NODE_ENV !== 'production') {
+      return res.json({
+        success: true,
+        message: 'SMS would be sent in production environment',
+        data: {
+          skipped: true,
+          environment: process.env.NODE_ENV,
+          phone: phone,
+          message: message,
+          note: 'SMS is only sent in production environment to avoid Twilio charges'
+        }
+      });
+    }
     
     const result = await reminderScheduler.sendSMS(phone, message || 'Test message from attendance system');
     
@@ -3149,5 +3265,6 @@ module.exports = {
   parseTimeToMinutes,
   formatMinutesToTime,
   formatMinutesToReadable,
-  calculateOvertime
+  calculateOvertime,
+  isWorkingDay
 };

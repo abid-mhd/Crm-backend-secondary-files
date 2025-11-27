@@ -65,15 +65,62 @@ const validateAndStringify = (value) => {
 
 // Safe JSON parsing function
 const safeJsonParse = (str, defaultValue = null) => {
-  if (!str || str === 'null' || str === 'undefined') return defaultValue;
+  // If it's already an object, return it directly
+  if (typeof str === 'object' && str !== null) {
+    return str;
+  }
+
+  // Handle null, undefined, or empty strings
+  if (!str || str === 'null' || str === 'undefined' || str === '') {
+    return defaultValue;
+  }
+
+  // Handle the specific case of "[object Object]" string
+  if (str === '[object Object]') {
+    console.warn('Found "[object Object]" string, returning defaultValue');
+    return defaultValue;
+  }
+
   try {
-    return JSON.parse(str);
+    // If it's a string that looks like JSON, parse it
+    if (typeof str === 'string') {
+      const trimmed = str.trim();
+      if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || 
+          (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+        return JSON.parse(trimmed);
+      } else {
+        // If it's a simple string, return it as is
+        return trimmed;
+      }
+    }
+
+    // For any other type, return as is
+    return str;
   } catch (error) {
-    console.error('JSON parse error:', error, 'for string:', str);
+    console.error('JSON parse error:', error.message, 'for value:', typeof str === 'string' ? str.substring(0, 100) : str);
+
+    // Try to fix common JSON issues
+    if (typeof str === 'string') {
+      try {
+        // Try to fix common JSON syntax errors
+        const fixedStr = str
+          .replace(/(\w+):/g, '"$1":') // Add quotes to keys
+          .replace(/'/g, '"') // Replace single quotes with double quotes
+          .replace(/,\s*}/g, '}') // Remove trailing commas
+          .replace(/,\s*]/g, ']'); // Remove trailing commas in arrays
+
+        if ((fixedStr.trim().startsWith('{') && fixedStr.trim().endsWith('}')) || 
+            (fixedStr.trim().startsWith('[') && fixedStr.trim().endsWith(']'))) {
+          return JSON.parse(fixedStr);
+        }
+      } catch (secondError) {
+        console.error('Second JSON parse attempt failed:', secondError.message);
+      }
+    }
+
     return defaultValue;
   }
 };
-
 // Check email uniqueness
 const checkEmailUnique = async (req, res) => {
   try {
