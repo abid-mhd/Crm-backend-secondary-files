@@ -2265,6 +2265,7 @@ exports.addOvertime = async (req, res) => {
 };
 
 // Get attendance history for an employee with location data
+// Get attendance history for an employee with location data - FIXED VERSION
 exports.getAttendanceHistory = async (req, res) => {
   try {
     const { employeeId } = req.params;
@@ -2272,6 +2273,12 @@ exports.getAttendanceHistory = async (req, res) => {
 
     const startDate = `${year}-${month.toString().padStart(2, '0')}-01`;
     const endDate = new Date(year, month, 0).toISOString().split('T')[0];
+
+    console.log('📅 Fetching attendance history for:', { 
+      employeeId, 
+      startDate, 
+      endDate 
+    });
 
     const [history] = await db.query(`
       SELECT 
@@ -2288,26 +2295,74 @@ exports.getAttendanceHistory = async (req, res) => {
         work_from_home as workFromHome
       FROM attendance 
       WHERE employee_id = ? 
-        AND updated_at BETWEEN ? AND ?
+        AND date BETWEEN ? AND ?
       ORDER BY date DESC
     `, [employeeId, startDate, endDate]);
 
-    // Parse location data for each record
-    const historyWithLocation = history.map(record => {
+    console.log(`📊 Found ${history.length} records for employee ${employeeId}`);
+
+    // Enhanced location data parsing with better error handling
+    const historyWithLocation = history.map((record, index) => {
+      console.log(`🔍 Record ${index + 1} locationData:`, {
+        hasLocationData: !!record.locationData,
+        type: typeof record.locationData,
+        rawValue: record.locationData
+      });
+
       if (record.locationData) {
         try {
-          record.locationData = JSON.parse(record.locationData);
+          // Handle different possible formats
+          let parsedData;
+          
+          if (typeof record.locationData === 'string') {
+            parsedData = JSON.parse(record.locationData);
+          } else if (typeof record.locationData === 'object') {
+            // Already parsed or stored as object
+            parsedData = record.locationData;
+          } else {
+            console.warn(`❓ Unexpected locationData type: ${typeof record.locationData}`);
+            parsedData = null;
+          }
+          
+          record.locationData = parsedData;
+          console.log(`✅ Successfully parsed location data for record ${index + 1}:`, parsedData);
         } catch (e) {
+          console.error(`❌ Error parsing location data for record ${index + 1}:`, e.message);
+          console.log('📄 Raw location data that failed to parse:', record.locationData);
           record.locationData = null;
         }
+      } else {
+        console.log(`📭 No location data for record ${index + 1}`);
+        record.locationData = null;
       }
       return record;
     });
 
-    res.json({ success: true, data: historyWithLocation });
+    // Debug: Count records with valid location data
+    const recordsWithLocation = historyWithLocation.filter(record => 
+      record.locationData && 
+      typeof record.locationData === 'object' && 
+      Object.keys(record.locationData).length > 0
+    ).length;
+
+    console.log(`📈 Summary: ${recordsWithLocation}/${history.length} records have location data`);
+
+    res.json({ 
+      success: true, 
+      data: historyWithLocation,
+      stats: {
+        totalRecords: history.length,
+        recordsWithLocation: recordsWithLocation,
+        recordsWithoutLocation: history.length - recordsWithLocation
+      }
+    });
   } catch (error) {
-    console.error('Error fetching attendance history:', error);
-    res.status(500).json({ success: false, message: 'Server error' });
+    console.error('❌ Error fetching attendance history:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Server error while fetching attendance history',
+      error: error.message 
+    });
   }
 };
 
@@ -3482,6 +3537,9 @@ exports.getMyAttendanceStats = async (req, res) => {
   }
 };
 
+// In your attendanceService.js or backend API
+
+// Enhanced getAttendanceByPeriod function with leaves data
 exports.getAttendanceByPeriod = async (req, res) => {
   try {
     const { period, startDate, endDate } = req.query;
@@ -3493,7 +3551,7 @@ exports.getAttendanceByPeriod = async (req, res) => {
       });
     }
 
-    console.log('Fetching attendance for period:', { period, startDate, endDate });
+    console.log('Fetching enhanced attendance for period:', { period, startDate, endDate });
 
     // Get attendance records for the date range
     const [attendance] = await db.query(`
@@ -3507,18 +3565,46 @@ exports.getAttendanceByPeriod = async (req, res) => {
         a.remarks,
         a.location_data as locationData,
         a.date as attendance_date,
+        a.work_from_home,
         e.id as employee_id,
         e.employeeName as employee_name,
         e.department,
         e.position,
         e.phone,
         e.balance,
-        e.last_month_due
+        e.last_month_due,
+        e.employeeNo
       FROM attendance a
       JOIN employees e ON a.employee_id = e.id
       WHERE a.date BETWEEN ? AND ?
       ORDER BY a.date DESC, e.employeeName
     `, [startDate, endDate]);
+
+    // Get leaves data for the same period
+    const [leaves] = await db.query(`
+      SELECT 
+        l.employee_id,
+        l.employee_name,
+        l.leave_type,
+        l.leave_reason,
+        l.start_date,
+        l.end_date,
+        l.days,
+        l.status as leave_status,
+        l.applied_date,
+        l.approved_by,
+        l.approved_date,
+        l.comments,
+        u.name as handled_by_name
+      FROM leaves l
+      LEFT JOIN users u ON l.approved_by = u.id
+      WHERE (
+        (l.start_date BETWEEN ? AND ?) OR
+        (l.end_date BETWEEN ? AND ?) OR
+        (l.start_date <= ? AND l.end_date >= ?)
+      )
+      AND l.status IN ('Applied', 'Approved', 'Rejected')
+    `, [startDate, endDate, startDate, endDate, startDate, endDate]);
 
     // Calculate summary statistics
     const [summary] = await db.query(`
@@ -3533,21 +3619,50 @@ exports.getAttendanceByPeriod = async (req, res) => {
       WHERE date BETWEEN ? AND ?
     `, [startDate, endDate]);
 
-    // Parse location data
-    const attendanceWithLocation = attendance.map(record => {
+    // Parse location data and combine with leaves
+    const enhancedAttendance = attendance.map(record => {
+      // Find matching leaves for this employee and date
+      const employeeLeaves = leaves.filter(leave => 
+        leave.employee_id === record.employee_id && 
+        new Date(record.attendance_date) >= new Date(leave.start_date) &&
+        new Date(record.attendance_date) <= new Date(leave.end_date)
+      );
+
+      let leaveInfo = null;
+      if (employeeLeaves.length > 0) {
+        const latestLeave = employeeLeaves[0]; // Take the first matching leave
+        leaveInfo = {
+          leave_type: latestLeave.leave_type,
+          leave_status: latestLeave.leave_status,
+          leave_reason: latestLeave.leave_reason,
+          handled_by: latestLeave.handled_by_name,
+          applied_date: latestLeave.applied_date,
+          approved_date: latestLeave.approved_date,
+          comments: latestLeave.comments
+        };
+      }
+
+      // Parse location data
+      let locationData = null;
       if (record.locationData) {
         try {
-          record.locationData = JSON.parse(record.locationData);
+          locationData = JSON.parse(record.locationData);
         } catch (e) {
-          record.locationData = null;
+          locationData = null;
         }
       }
-      return record;
+
+      return {
+        ...record,
+        locationData,
+        leaveInfo
+      };
     });
 
     res.json({
       success: true,
-      data: attendanceWithLocation,
+      data: enhancedAttendance,
+      leaves: leaves, // Also return raw leaves data for reference
       summary: {
         present: summary[0]?.present || 0,
         absent: summary[0]?.absent || 0,
@@ -3564,10 +3679,478 @@ exports.getAttendanceByPeriod = async (req, res) => {
       count: attendance.length
     });
   } catch (error) {
-    console.error('Error fetching attendance by period:', error);
+    console.error('Error fetching enhanced attendance by period:', error);
     res.status(500).json({ 
       success: false, 
       message: 'Server error while fetching attendance by period' 
+    });
+  }
+};
+
+// Get non-working days (Saturdays, Sundays, and holidays)
+exports.getNonWorkingDays = async (req, res) => {
+  try {
+    const { startDate, endDate } = req.query;
+
+    if (!startDate || !endDate) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Start date and end date are required' 
+      });
+    }
+
+    // Generate all dates between start and end
+    const dates = [];
+    const currentDate = new Date(startDate);
+    const end = new Date(endDate);
+
+    while (currentDate <= end) {
+      dates.push(new Date(currentDate));
+      currentDate.setDate(currentDate.getDate() + 1);
+    }
+
+    // Identify weekends (Saturdays and Sundays)
+    const nonWorkingDays = dates.filter(date => {
+      const dayOfWeek = date.getDay();
+      return dayOfWeek === 0 || dayOfWeek === 6; // 0 = Sunday, 6 = Saturday
+    }).map(date => date.toISOString().split('T')[0]);
+
+    // You can also add holidays from a holidays table here if you have one
+    // const [holidays] = await db.query('SELECT date FROM holidays WHERE date BETWEEN ? AND ?', [startDate, endDate]);
+    // holidays.forEach(holiday => nonWorkingDays.push(holiday.date));
+
+    res.json({
+      success: true,
+      data: nonWorkingDays,
+      count: nonWorkingDays.length
+    });
+  } catch (error) {
+    console.error('Error fetching non-working days:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Server error while fetching non-working days' 
+    });
+  }
+};
+
+// Enhanced getAttendanceByPeriod function with leaves and location data
+exports.getEnhancedAttendanceReport = async (req, res) => {
+  try {
+    const { period, startDate, endDate, employeeId } = req.query;
+
+    if (!startDate || !endDate) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Start date and end date are required' 
+      });
+    }
+
+    console.log('Fetching enhanced attendance report:', { period, startDate, endDate, employeeId });
+
+    // Build base query to get ALL attendance records for the period (including weekends)
+    let baseQuery = `
+      SELECT 
+        a.id as attendance_id,
+        a.employee_id,
+        a.status,
+        a.check_in,
+        a.check_out,
+        a.overtime_hours,
+        a.remarks,
+        a.location_data as locationData,
+        a.date as attendance_date,
+        a.work_from_home,
+        a.created_at as attendance_created,
+        a.updated_at as attendance_updated,
+        e.id as employee_id,
+        e.employeeName as employee_name,
+        e.department,
+        e.position,
+        e.phone,
+        e.balance,
+        e.last_month_due,
+        e.employeeNo,
+        e.meta as employee_meta
+      FROM attendance a
+      JOIN employees e ON a.employee_id = e.id
+      WHERE a.date BETWEEN ? AND ?
+      AND e.active = 1
+    `;
+
+    const queryParams = [startDate, endDate];
+
+    if (employeeId) {
+      baseQuery += ' AND e.id = ?';
+      queryParams.push(employeeId);
+    }
+
+    baseQuery += ' ORDER BY e.employeeName, a.date DESC';
+
+    // Get ALL attendance records (including weekends)
+    const [attendance] = await db.query(baseQuery, queryParams);
+
+    // Get leaves data for the same period
+    const [leaves] = await db.query(`
+      SELECT 
+        l.employee_id,
+        l.employee_name,
+        l.leave_type,
+        l.leave_reason,
+        l.start_date,
+        l.end_date,
+        l.days,
+        l.status as leave_status,
+        l.applied_date,
+        l.approved_by,
+        l.approved_date,
+        l.comments,
+        u.name as handled_by_name,
+        u.id as handled_by_id
+      FROM leaves l
+      LEFT JOIN users u ON l.approved_by = u.id
+      WHERE (
+        (l.start_date BETWEEN ? AND ?) OR
+        (l.end_date BETWEEN ? AND ?) OR
+        (l.start_date <= ? AND l.end_date >= ?)
+      )
+      AND l.status IN ('Applied', 'Approved', 'Rejected')
+      ${employeeId ? ' AND l.employee_id = ?' : ''}
+    `, employeeId ? [startDate, endDate, startDate, endDate, startDate, endDate, employeeId] 
+                   : [startDate, endDate, startDate, endDate, startDate, endDate]);
+
+    // Get employee requests data for the same period - FIXED QUERY
+    const [employeeRequests] = await db.query(`
+      SELECT 
+        er.id as request_id,
+        er.employee_id,
+        er.attendance_id,
+        er.request_type,
+        er.request_date,
+        er.reason,
+        er.supporting_document,
+        er.status as request_status,
+        er.admin_remarks,
+        er.handled_by,
+        er.handled_at,
+        er.created_at as request_created,
+        er.updated_at as request_updated,
+        u.name as handled_by_name,
+        e.employeeName as employee_name,
+        a.date as attendance_date  -- Join with attendance to get the date
+      FROM employee_requests er
+      LEFT JOIN users u ON er.handled_by = u.id
+      JOIN employees e ON er.employee_id = e.id
+      LEFT JOIN attendance a ON er.attendance_id = a.id  -- Join with attendance table
+      WHERE (
+        er.request_date BETWEEN ? AND ? 
+        OR a.date BETWEEN ? AND ?
+      )
+      AND er.status IN ('pending', 'approved', 'rejected')
+      ${employeeId ? ' AND er.employee_id = ?' : ''}
+      ORDER BY er.request_date DESC, a.date DESC
+    `, employeeId ? [startDate, endDate, startDate, endDate, employeeId] : [startDate, endDate, startDate, endDate]);
+
+    // Get attendance logs for changes tracking
+    const [attendanceLogs] = await db.query(`
+      SELECT 
+        al.attendanceId,
+        al.action,
+        al.changes,
+        al.details,
+        al.userName,
+        al.createdAt as log_created
+      FROM attendance_logs al
+      JOIN attendance a ON al.attendanceId = a.id
+      WHERE a.date BETWEEN ? AND ?
+      ${employeeId ? ' AND a.employee_id = ?' : ''}
+      ORDER BY al.createdAt DESC
+    `, employeeId ? [startDate, endDate, employeeId] : [startDate, endDate]);
+
+    // Get all active employees who have attendance records in this period
+    const [allEmployees] = await db.query(`
+      SELECT DISTINCT
+        e.id as employee_id,
+        e.employeeName as employee_name,
+        e.department,
+        e.position,
+        e.phone,
+        e.balance,
+        e.last_month_due,
+        e.employeeNo,
+        e.meta as employee_meta
+      FROM employees e
+      JOIN attendance a ON e.id = a.employee_id
+      WHERE a.date BETWEEN ? AND ?
+      AND e.active = 1
+      ${employeeId ? ' AND e.id = ?' : ''}
+      ORDER BY e.employeeName
+    `, employeeId ? [startDate, endDate, employeeId] : [startDate, endDate]);
+
+    // Group data by employee
+    const employeeMap = new Map();
+
+    // Initialize employee groups with employees who have attendance records
+    allEmployees.forEach(employee => {
+      employeeMap.set(employee.employee_id, {
+        employee_id: employee.employee_id,
+        employee_name: employee.employee_name,
+        department: employee.department,
+        position: employee.position,
+        phone: employee.phone,
+        employeeNo: employee.employeeNo,
+        balance: employee.balance,
+        last_month_due: employee.last_month_due,
+        attendance: [],
+        summary: {
+          present: 0,
+          absent: 0,
+          halfDay: 0,
+          paidLeave: 0,
+          weeklyOff: 0,
+          total: 0,
+          workFromHome: 0
+        }
+      });
+    });
+
+    // Process attendance records for each employee
+    allEmployees.forEach(employee => {
+      const empId = employee.employee_id;
+      const employeeData = employeeMap.get(empId);
+
+      // Get all attendance records for this employee in the period
+      const employeeAttendance = attendance.filter(att => att.employee_id === empId);
+
+      // Process each attendance record
+      employeeAttendance.forEach(record => {
+        const date = record.attendance_date;
+        
+        // Check if it's weekend
+        const currentDate = new Date(date);
+        const dayOfWeek = currentDate.getDay(); // 0 = Sunday, 6 = Saturday
+        const isWeekend = dayOfWeek === 0 || dayOfWeek === 6;
+
+        // Find matching leaves for this specific date
+        const dateLeaves = leaves.filter(leave => 
+          leave.employee_id === empId && 
+          new Date(date) >= new Date(leave.start_date) &&
+          new Date(date) <= new Date(leave.end_date)
+        );
+
+        // Find employee requests for this date - FIXED LOGIC
+        const dateRequests = employeeRequests.filter(req => {
+          // Check if request matches by date OR by attendance_id
+          const requestDate = req.request_date;
+          const attendanceDate = req.attendance_date;
+          
+          return (
+            req.employee_id === empId && 
+            (
+              requestDate === date || 
+              attendanceDate === date ||
+              (req.attendance_id && req.attendance_id === record.attendance_id)
+            )
+          );
+        });
+
+        console.log(`Employee ${empId}, Date ${date}: Found ${dateRequests.length} requests`, {
+          employeeId: empId,
+          date: date,
+          requests: dateRequests.map(req => ({
+            request_id: req.request_id,
+            request_date: req.request_date,
+            attendance_date: req.attendance_date,
+            attendance_id: req.attendance_id,
+            request_type: req.request_type
+          }))
+        });
+
+        // Get attendance logs for this record
+        const recordLogs = attendanceLogs.filter(log => log.attendanceId === record.attendance_id);
+
+        // Parse location data
+        let locationData = null;
+        let locationChanges = [];
+        
+        if (record.locationData) {
+          try {
+            locationData = typeof record.locationData === 'string' 
+              ? JSON.parse(record.locationData) 
+              : record.locationData;
+          } catch (e) {
+            locationData = null;
+          }
+        }
+
+        // Extract location changes from logs
+        recordLogs.forEach(log => {
+          if (log.changes) {
+            try {
+              const changes = typeof log.changes === 'string' ? JSON.parse(log.changes) : log.changes;
+              if (changes.location_data) {
+                locationChanges.push({
+                  action: log.action,
+                  userName: log.userName,
+                  timestamp: log.log_created,
+                  changes: changes.location_data
+                });
+              }
+            } catch (e) {
+              console.error('Error parsing log changes:', e);
+            }
+          }
+        });
+
+        // Prepare leave info
+        let leaveInfo = null;
+        if (dateLeaves.length > 0) {
+          const latestLeave = dateLeaves[0];
+          leaveInfo = {
+            leave_type: latestLeave.leave_type,
+            leave_status: latestLeave.leave_status,
+            leave_reason: latestLeave.leave_reason,
+            handled_by: latestLeave.handled_by_name,
+            handled_by_id: latestLeave.handled_by_id,
+            applied_date: latestLeave.applied_date,
+            approved_date: latestLeave.approved_date,
+            comments: latestLeave.comments,
+            days: latestLeave.days
+          };
+        }
+
+        // Prepare employee request info - FIXED LOGIC
+        let requestInfo = null;
+        if (dateRequests.length > 0) {
+          // Get the most relevant request (prefer requests with matching attendance_id)
+          let latestRequest = dateRequests[0];
+          
+          // If there are multiple requests, find the one that matches attendance_id
+          const matchingAttendanceRequest = dateRequests.find(req => 
+            req.attendance_id === record.attendance_id
+          );
+          
+          if (matchingAttendanceRequest) {
+            latestRequest = matchingAttendanceRequest;
+          }
+          
+          requestInfo = {
+            request_id: latestRequest.request_id,
+            request_type: latestRequest.request_type,
+            request_status: latestRequest.request_status,
+            reason: latestRequest.reason,
+            admin_remarks: latestRequest.admin_remarks,
+            handled_by: latestRequest.handled_by_name,
+            handled_at: latestRequest.handled_at,
+            supporting_document: latestRequest.supporting_document,
+            created_at: latestRequest.request_created,
+            updated_at: latestRequest.request_updated,
+            attendance_id: latestRequest.attendance_id
+          };
+          
+          console.log(`Setting request info for employee ${empId}, date ${date}:`, requestInfo);
+        }
+
+        // Use the actual status from attendance record, but mark if it's weekend
+        const status = record.status;
+
+        // Create enhanced attendance record
+        const enhancedRecord = {
+          id: record.attendance_id,
+          date: date,
+          status: status,
+          check_in: record.check_in,
+          check_out: record.check_out,
+          overtime_hours: record.overtime_hours,
+          remarks: record.remarks,
+          work_from_home: record.work_from_home,
+          location_data: locationData,
+          location_changes: locationChanges,
+          leave_info: leaveInfo,
+          request_info: requestInfo,
+          attendance_logs: recordLogs,
+          created_at: record.attendance_created,
+          updated_at: record.attendance_updated,
+          is_weekend: isWeekend,
+          day_name: ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][dayOfWeek]
+        };
+
+        employeeData.attendance.push(enhancedRecord);
+        
+        // Update summary - count actual status from records
+        if (employeeData.summary.hasOwnProperty(status.toLowerCase().replace(' ', ''))) {
+          employeeData.summary[status.toLowerCase().replace(' ', '')]++;
+        }
+        employeeData.summary.total++;
+        
+        if (record.work_from_home) {
+          employeeData.summary.workFromHome++;
+        }
+      });
+
+      // Sort attendance by date descending
+      employeeData.attendance.sort((a, b) => new Date(b.date) - new Date(a.date));
+    });
+
+    // Convert map to array
+    const groupedAttendance = Array.from(employeeMap.values());
+
+    // Calculate overall summary
+    const overallSummary = {
+      present: groupedAttendance.reduce((sum, emp) => sum + emp.summary.present, 0),
+      absent: groupedAttendance.reduce((sum, emp) => sum + emp.summary.absent, 0),
+      halfDay: groupedAttendance.reduce((sum, emp) => sum + emp.summary.halfDay, 0),
+      paidLeave: groupedAttendance.reduce((sum, emp) => sum + emp.summary.paidLeave, 0),
+      weeklyOff: groupedAttendance.reduce((sum, emp) => sum + emp.summary.weeklyOff, 0),
+      workFromHome: groupedAttendance.reduce((sum, emp) => sum + emp.summary.workFromHome, 0),
+      totalEmployees: groupedAttendance.length,
+      totalRecords: groupedAttendance.reduce((sum, emp) => sum + emp.attendance.length, 0)
+    };
+
+    // Debug: Check if requests are being found
+    console.log('Employee Requests Summary:', {
+      totalRequests: employeeRequests.length,
+      requestsByEmployee: Array.from(employeeMap.entries()).map(([empId, empData]) => ({
+        employeeId: empId,
+        employeeName: empData.employee_name,
+        totalRecords: empData.attendance.length,
+        recordsWithRequests: empData.attendance.filter(att => att.request_info).length,
+        requests: empData.attendance
+          .filter(att => att.request_info)
+          .map(att => ({
+            date: att.date,
+            request_type: att.request_info.request_type,
+            request_status: att.request_info.request_status
+          }))
+      }))
+    });
+
+    res.json({
+      success: true,
+      data: groupedAttendance,
+      summary: overallSummary,
+      period: {
+        type: period,
+        startDate,
+        endDate
+      },
+      metadata: {
+        totalEmployees: groupedAttendance.length,
+        totalRecords: overallSummary.totalRecords,
+        generatedAt: new Date().toISOString(),
+        debug: {
+          totalEmployeeRequests: employeeRequests.length,
+          employeesWithRequests: groupedAttendance.filter(emp => 
+            emp.attendance.some(att => att.request_info)
+          ).length
+        }
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching enhanced attendance report:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Server error while fetching enhanced attendance report',
+      error: error.message 
     });
   }
 };
