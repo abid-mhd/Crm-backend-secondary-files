@@ -10,7 +10,9 @@
     "cron:backfill": "node cron/backfillAttendance.js",
     "cron:backfill-month": "node cron/backfillAttendance.js 2024-11-01 2024-11-30",
     "cron:manual-absent": "node cron/manualAbsentMarking.js",
-    "cron:manual-absent-month": "node cron/manualAbsentMarking.js 2025-11-01 2025-11-30"
+    "cron:manual-absent-month": "node cron/manualAbsentMarking.js 2025-11-01 2025-11-30",
+    "cron:weekly-off": "node cron/manualWeeklyOffRecords.js",
+    "cron:weekly-off-month": "node cron/manualWeeklyOffRecords.js 2025-11-01 2025-11-30"
   },
   "dependencies": {
     "bcrypt": "^5.1.0",
