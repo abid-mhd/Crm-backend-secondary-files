@@ -3234,6 +3234,63 @@ const getAttendanceSettingsWithDetails = async (req, res) => {
   }
 };
 
+// Manual absent marking for date range (API endpoint)
+const manualAbsentMarking = async (req, res) => {
+  try {
+    const { startDate, endDate } = req.body;
+
+    if (!startDate || !endDate) {
+      return res.status(400).json({
+        success: false,
+        message: 'Both startDate and endDate are required (YYYY-MM-DD format)'
+      });
+    }
+
+    // Validate date format
+    const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+    if (!dateRegex.test(startDate) || !dateRegex.test(endDate)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Dates must be in YYYY-MM-DD format'
+      });
+    }
+
+    const start = new Date(startDate);
+    const end = new Date(endDate);
+    
+    if (isNaN(start.getTime()) || isNaN(end.getTime())) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid date format'
+      });
+    }
+
+    if (start > end) {
+      return res.status(400).json({
+        success: false,
+        message: 'startDate cannot be after endDate'
+      });
+    }
+
+    const marker = new ManualAbsentMarker();
+    const results = await marker.processAbsentMarkingForDateRange(startDate, endDate);
+
+    res.json({
+      success: true,
+      message: 'Manual absent marking completed successfully',
+      data: results
+    });
+
+  } catch (error) {
+    console.error('Error in manual absent marking:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to process manual absent marking',
+      error: error.message
+    });
+  }
+};
+
 // Export all functions
 module.exports = {
   getAllEmployees,
@@ -3266,5 +3323,6 @@ module.exports = {
   formatMinutesToTime,
   formatMinutesToReadable,
   calculateOvertime,
-  isWorkingDay
+  isWorkingDay,
+  manualAbsentMarking
 };
