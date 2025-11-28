@@ -2,6 +2,7 @@
 const express = require('express');
 const router = express.Router();
 const attendanceController = require('../controllers/AttendanceController');
+const leavesController = require('../controllers/leaveController');
 const authMiddleware = require('../middleware/authMiddleware');
 
 // Apply authentication middleware to all routes
@@ -27,6 +28,9 @@ router.delete('/attendance/:id', attendanceController.deleteAttendance);
 // Add to your backend routes
 router.get('/attendance/today',attendanceController.todayAttendance);
 router.get('/by-period', attendanceController.getAttendanceByPeriod);
+router.get('/attendance/non-working-days', attendanceController.getNonWorkingDays);
+router.get('/enhanced-report', attendanceController.getEnhancedAttendanceReport);
+
 
 // Attendance settings routes
 router.get('/settings', attendanceController.getAttendanceSettings);
