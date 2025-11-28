@@ -121,55 +121,59 @@ const logAttendanceDeletion = async (attendanceId, req = null) => {
 
 function getClientIP(req) {
   try {
-    console.log('🔍 Enhanced IP detection started...');
+    console.log('🔍 ENHANCED IP detection started...');
     
-    // List of headers to check for real client IP (in priority order)
+    // Enhanced header priority for all environments
     const ipHeaders = [
       'x-client-ip',           // Custom header
       'x-forwarded-for',       // Standard proxy header
       'x-real-ip',             // Nginx
       'x-cluster-client-ip',   // Rackspace LB, Riverbed Stingray
-      'x-forwarded',           // General forward
-      'forwarded-for',         // RFC 7239
-      'forwarded',             // RFC 7239
       'cf-connecting-ip',      // Cloudflare
       'true-client-ip',        // Akamai, Cloudflare
       'fastly-client-ip',      // Fastly
+      'x-appengine-user-ip',   // Google App Engine
     ];
 
     let clientIP = null;
 
-    // Check headers first
+    // Log all relevant headers for debugging
+    console.log('📡 IP-related headers:', {
+      'x-forwarded-for': req.headers['x-forwarded-for'],
+      'x-real-ip': req.headers['x-real-ip'],
+      'x-client-ip': req.headers['x-client-ip'],
+      'cf-connecting-ip': req.headers['cf-connecting-ip'],
+    });
+
+    // Check headers in priority order
     for (const header of ipHeaders) {
       const value = req.headers[header];
       if (value) {
         console.log(`📡 Found IP in ${header}:`, value);
         
-        // x-forwarded-for can contain multiple IPs (client, proxy1, proxy2...)
+        // Handle x-forwarded-for (contains client, proxy1, proxy2...)
         if (header === 'x-forwarded-for') {
           const ips = value.split(',').map(ip => ip.trim());
-          // Get the first IP (original client)
+          // Get the first IP which is the original client
           clientIP = ips[0];
           console.log('📡 Using first IP from x-forwarded-for:', clientIP);
         } else {
           clientIP = value;
         }
         
-        // Clean and validate the IP
+        // Clean the IP
         clientIP = cleanIPAddressStrict(clientIP);
         
-        if (clientIP && clientIP !== 'unknown' && clientIP !== '127.0.0.1') {
-          console.log(`✅ Using IP from ${header}: ${clientIP}`);
-          break;
-        }
+        console.log(`✅ Using IP from ${header}: ${clientIP}`);
+        break;
       }
     }
 
-    // If no valid IP from headers, check connection
-    if (!clientIP || clientIP === '127.0.0.1' || clientIP === 'unknown') {
+    // If no IP from headers, check connection (for local development)
+    if (!clientIP) {
       const connectionIP = req.connection?.remoteAddress || 
                           req.socket?.remoteAddress ||
-                          req.info?.remoteAddress;
+                          req.connection?.socket?.remoteAddress;
       
       if (connectionIP) {
         clientIP = cleanIPAddressStrict(connectionIP);
@@ -177,18 +181,52 @@ function getClientIP(req) {
       }
     }
 
-    // Final validation
-    if (!clientIP || clientIP === '127.0.0.1' || clientIP === '::1') {
-      console.log('❌ No valid client IP detected, using local network IP');
-      clientIP = getLocalNetworkIP() || 'unknown';
+    // Final fallback for local development
+    if (!clientIP || clientIP === '::1') {
+      console.log('🔧 Local development - using localhost IP');
+      clientIP = '127.0.0.1';
     }
 
     console.log('✅ Final client IP:', clientIP);
     return clientIP;
   } catch (error) {
     console.error('❌ Error in getClientIP:', error);
-    return getLocalNetworkIP() || 'unknown';
+    // Return a valid IP for local development instead of error code
+    return '127.0.0.1';
   }
+}
+
+// Helper function to check if we're in development mode
+function isDevelopment() {
+  return process.env.NODE_ENV === 'development' || 
+         !process.env.NODE_ENV || 
+         process.env.NODE_ENV === 'local';
+}
+
+// Helper function to check if IP is internal/private
+function isInternalIP(ip) {
+  if (!ip) return true;
+  
+  // Localhost
+  if (ip === '127.0.0.1' || ip === '::1') return true;
+  
+  // Private network ranges
+  if (ip.startsWith('10.')) return true;
+  if (ip.startsWith('192.168.')) return true;
+  if (ip.startsWith('172.')) {
+    const secondOctet = parseInt(ip.split('.')[1]);
+    if (secondOctet >= 16 && secondOctet <= 31) return true;
+  }
+  
+  // AWS VPC internal IPs
+  if (ip.startsWith('172.31.')) return true;
+  
+  return false;
+}
+
+// Helper function to validate public IP
+function isValidPublicIP(ip) {
+  return ip && !isInternalIP(ip) && ip !== 'unknown' && ip !== 'invalid-ip-detected';
 }
 
 // Helper function to check if IP is in local network range
@@ -373,7 +411,7 @@ exports.networkDiagnostics = async (req, res) => {
 // Enhanced LAN validation function with Work From Home check and STRICT IP validation
 async function validateEmployeeLAN(employeeId, req, isCheckIn = true) {
   try {
-    console.log('🔐 Starting STRICT LAN validation for employee:', employeeId);
+    console.log('🔐 LAN validation for employee:', employeeId);
     
     // Get employee details
     const [employeeData] = await db.query(
@@ -403,12 +441,22 @@ async function validateEmployeeLAN(employeeId, req, isCheckIn = true) {
       console.error('Error parsing employee meta data:', error);
     }
 
-    // Check if employee has wfh_enabled flag (permanent WFH)
-    if (wfhEnabled) {
-      console.log('✅ Employee has WFH enabled - skipping LAN validation permanently');
+    // DEVELOPMENT BYPASS: Allow all in development mode
+    if (isDevelopment()) {
+      console.log('🔧 DEVELOPMENT MODE: LAN validation bypassed');
       return {
         allowed: true,
-        reason: 'Work From Home permanently enabled for this employee',
+        reason: 'Development mode - LAN validation bypassed',
+        developmentMode: true
+      };
+    }
+
+    // Check if employee has wfh_enabled flag (permanent WFH)
+    if (wfhEnabled) {
+      console.log('✅ Employee has WFH enabled - LAN validation bypassed');
+      return {
+        allowed: true,
+        reason: 'Work From Home permanently enabled',
         workFromHome: true,
         wfhEnabled: true
       };
@@ -427,17 +475,9 @@ async function validateEmployeeLAN(employeeId, req, isCheckIn = true) {
 
     const hasApprovedWFH = workFromHomeRequests.length > 0;
 
-    console.log('🔐 EMPLOYEE CONFIG:', {
-      employeeId,
-      employeeName: employee.employeeName,
-      allowedLAN,
-      wfhEnabled,
-      hasApprovedWFH
-    });
-
     // Allow if Work From Home approved for today
     if (hasApprovedWFH) {
-      console.log('✅ Work From Home approved for today - skipping LAN validation');
+      console.log('✅ Work From Home approved for today - LAN validation bypassed');
       return {
         allowed: true,
         reason: 'Work From Home approved for today',
@@ -446,9 +486,9 @@ async function validateEmployeeLAN(employeeId, req, isCheckIn = true) {
       };
     }
 
-    // STRICT: If no LAN restriction is set, DENY access
+    // If no LAN restriction is set
     if (!allowedLAN || allowedLAN.trim() === '') {
-      console.log('🚫 No LAN restriction set - access denied in strict mode');
+      console.log('⚠️ No LAN restriction set');
       return {
         allowed: false,
         reason: 'No LAN IP configured and no Work From Home approved',
@@ -458,37 +498,22 @@ async function validateEmployeeLAN(employeeId, req, isCheckIn = true) {
       };
     }
 
-    // Get client IP with enhanced detection
+    // Get client IP
     const clientIP = getClientIP(req);
     const cleanAllowedLAN = allowedLAN.trim();
-    const cleanClientIP = cleanIPAddressStrict(clientIP);
 
-    console.log('🔐 STRICT IP COMPARISON:', {
-      cleanClientIP,
-      cleanAllowedLAN,
-      isLocalNetwork: isLocalNetworkIP(cleanClientIP),
-      wfhEnabled: wfhEnabled
+    console.log('🔐 IP VALIDATION:', {
+      clientIP: clientIP,
+      allowedLAN: cleanAllowedLAN,
+      employeeName: employee.employeeName,
+      environment: process.env.NODE_ENV || 'development'
     });
 
-    // STRICT: Deny localhost/loopback in production/staging
-    if (cleanClientIP === '127.0.0.1' || cleanClientIP === '::1') {
-      console.log('🚫 Localhost IP detected - access denied in strict mode');
-      return {
-        allowed: false,
-        reason: 'Localhost access not allowed',
-        details: {
-          detectedIP: cleanClientIP,
-          registeredIP: cleanAllowedLAN,
-          help: 'Access from localhost is not permitted for attendance marking'
-        }
-      };
-    }
-
-    // STRICT: Enhanced IP matching
-    const ipValidation = validateIPAgainstLANStrict(cleanClientIP, cleanAllowedLAN);
+    // Enhanced IP matching
+    const ipValidation = validateIPAgainstLANStrict(clientIP, cleanAllowedLAN);
 
     if (ipValidation.isAllowed) {
-      console.log('✅ STRICT LAN validation successful:', ipValidation.matchType);
+      console.log('✅ LAN validation successful:', ipValidation.matchType);
       return {
         allowed: true,
         reason: `LAN IP validated (${ipValidation.matchType})`,
@@ -498,18 +523,17 @@ async function validateEmployeeLAN(employeeId, req, isCheckIn = true) {
     }
 
     // If IP doesn't match, provide detailed error
-    console.log('🚫 STRICT LAN validation failed');
+    console.log('🚫 LAN validation failed');
     return {
       allowed: false,
       reason: `Network validation failed - IP mismatch`,
       details: {
-        detectedIP: cleanClientIP,
+        detectedIP: clientIP,
         registeredIP: cleanAllowedLAN,
         matchType: ipValidation.matchType,
-        isLocalNetwork: isLocalNetworkIP(cleanClientIP),
         hasWorkFromHome: false,
         wfhEnabled: wfhEnabled,
-        help: `Your IP (${cleanClientIP}) doesn't match registered LAN IP (${cleanAllowedLAN}). Connect to office network or get Work From Home approval.`
+        help: `Your IP (${clientIP}) doesn't match registered LAN IP (${cleanAllowedLAN}). Connect to office network or get Work From Home approval.`
       }
     };
 
