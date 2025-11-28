@@ -36,7 +36,6 @@ router.get('/validate-invitation', employeeController.validateInvitation);
 router.post('/complete-invitation', employeeController.completeInvitation);
 
 router.post('/manual-absent-marking', employeeController.manualAbsentMarking);
-router.post('/manual-weekly-off-records', employeeController.manualWeeklyOffRecords);
 
 
 router.post('/import', 

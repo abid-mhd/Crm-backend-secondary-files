@@ -3291,68 +3291,6 @@ const manualAbsentMarking = async (req, res) => {
   }
 };
 
-// Manual weekly off records creation for date range (API endpoint)
-const manualWeeklyOffRecords = async (req, res) => {
-  try {
-    const { startDate, endDate, createMissing = true, updateExisting = false, dryRun = false } = req.body;
-
-    if (!startDate || !endDate) {
-      return res.status(400).json({
-        success: false,
-        message: 'Both startDate and endDate are required (YYYY-MM-DD format)'
-      });
-    }
-
-    // Validate date format
-    const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
-    if (!dateRegex.test(startDate) || !dateRegex.test(endDate)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Dates must be in YYYY-MM-DD format'
-      });
-    }
-
-    const start = new Date(startDate);
-    const end = new Date(endDate);
-    
-    if (isNaN(start.getTime()) || isNaN(end.getTime())) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid date format'
-      });
-    }
-
-    if (start > end) {
-      return res.status(400).json({
-        success: false,
-        message: 'startDate cannot be after endDate'
-      });
-    }
-
-    const manager = new ManualWeeklyOffManager();
-    const results = await manager.processWeeklyOffForDateRange(startDate, endDate, {
-      createMissing,
-      updateExisting,
-      dryRun
-    });
-
-    res.json({
-      success: true,
-      message: dryRun ? 'Weekly off processing simulation completed' : 'Weekly off records processed successfully',
-      data: results,
-      dryRun: dryRun
-    });
-
-  } catch (error) {
-    console.error('Error in manual weekly off processing:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to process weekly off records',
-      error: error.message
-    });
-  }
-};
-
 // Export all functions
 module.exports = {
   getAllEmployees,
@@ -3386,6 +3324,5 @@ module.exports = {
   formatMinutesToReadable,
   calculateOvertime,
   isWorkingDay,
-  manualAbsentMarking,
-  manualWeeklyOffRecords
+  manualAbsentMarking
 };
