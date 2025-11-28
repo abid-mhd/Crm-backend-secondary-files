@@ -35,8 +35,6 @@ router.post('/:id/send-invite', employeeController.sendStaffInvite);
 router.get('/validate-invitation', employeeController.validateInvitation);
 router.post('/complete-invitation', employeeController.completeInvitation);
 
-router.post('/manual-absent-marking', employeeController.manualAbsentMarking);
-
 
 router.post('/import', 
   employeeController.upload.single('file'), 
