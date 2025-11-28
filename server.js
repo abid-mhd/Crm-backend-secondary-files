@@ -8,11 +8,33 @@ const employeeController = require('./controllers/employeeController');
 
 const app = express();
 // Add this middleware to trust proxy headers
-app.set('trust proxy', true);
-app.set('trust proxy', ['loopback', '172.31.14.188', '172.31.21.72']);  // Or specific settings
+if (process.env.NODE_ENV === 'production') {
+  // In production, trust all proxies to get real client IP
+  app.set('trust proxy', true);
+  console.log('🔧 Production: Trust proxy enabled');
+} else {
+  // In development, use simpler trust settings
+  app.set('trust proxy', 'loopback');
+  console.log('🔧 Development: Trust localhost only');
+}
 
-// Or for specific IP ranges:
-// app.set('trust proxy', ['192.168.0.0/16', '10.0.0.0/8', '172.16.0.0/12']);
+// Alternative: Trust specific AWS and cloud provider IP ranges
+app.set('trust proxy', ['loopback', 'linklocal', 'uniquelocal']);
+
+// Or be more specific for AWS:
+app.set('trust proxy', function (ip) {
+  // Trust AWS internal IPs and common cloud providers
+  if (ip.startsWith('172.31.') || // AWS VPC
+      ip.startsWith('10.') ||     // Private network
+      ip.startsWith('192.168.') || // Private network
+      ip === '127.0.0.1' ||       // Localhost
+      ip === '::1') {             // IPv6 localhost
+    return true;
+  }
+  return false;
+});
+
+console.log('🔧 Proxy trust configuration enabled');
 
 const cron = require('node-cron');
 const { checkAndSendReminderNotifications } = require('./controllers/employeeController');
