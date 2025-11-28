@@ -121,12 +121,12 @@ const logAttendanceDeletion = async (attendanceId, req = null) => {
 
 function getClientIP(req) {
   try {
-    console.log('🔍 ENHANCED IP detection started...');
+    console.log('🔍 PRODUCTION IP detection started...');
     
-    // Enhanced header priority for all environments
+    // Enhanced header priority for production environments
     const ipHeaders = [
       'x-client-ip',           // Custom header
-      'x-forwarded-for',       // Standard proxy header
+      'x-forwarded-for',       // Standard proxy header (most important)
       'x-real-ip',             // Nginx
       'x-cluster-client-ip',   // Rackspace LB, Riverbed Stingray
       'cf-connecting-ip',      // Cloudflare
@@ -138,7 +138,7 @@ function getClientIP(req) {
     let clientIP = null;
 
     // Log all relevant headers for debugging
-    console.log('📡 IP-related headers:', {
+    console.log('📡 All IP-related headers:', {
       'x-forwarded-for': req.headers['x-forwarded-for'],
       'x-real-ip': req.headers['x-real-ip'],
       'x-client-ip': req.headers['x-client-ip'],
@@ -161,46 +161,54 @@ function getClientIP(req) {
           clientIP = value;
         }
         
-        // Clean the IP
+        // Clean and validate the IP
         clientIP = cleanIPAddressStrict(clientIP);
         
-        console.log(`✅ Using IP from ${header}: ${clientIP}`);
-        break;
+        // Validate it's a real IP and not internal
+        if (clientIP && isValidPublicIP(clientIP)) {
+          console.log(`✅ Using valid client IP from ${header}: ${clientIP}`);
+          break;
+        } else {
+          console.log(`⚠️ IP from ${header} is internal/invalid: ${clientIP}`);
+          clientIP = null; // Reset if invalid
+        }
       }
     }
 
-    // If no IP from headers, check connection (for local development)
+    // If no valid IP from headers, check connection (fallback)
     if (!clientIP) {
       const connectionIP = req.connection?.remoteAddress || 
                           req.socket?.remoteAddress ||
-                          req.connection?.socket?.remoteAddress;
+                          req.info?.remoteAddress;
       
       if (connectionIP) {
         clientIP = cleanIPAddressStrict(connectionIP);
-        console.log(`📡 Using connection IP: ${clientIP}`);
+        console.log(`📡 Using connection IP (fallback): ${clientIP}`);
       }
     }
 
-    // Final fallback for local development
-    if (!clientIP || clientIP === '::1') {
-      console.log('🔧 Local development - using localhost IP');
-      clientIP = '127.0.0.1';
+    // Final validation - deny if it's still an internal IP
+    if (!clientIP || isInternalIP(clientIP)) {
+      console.log('🚫 No valid external client IP detected');
+      console.log('🔧 IP Detection Debug:', {
+        finalIP: clientIP,
+        headers: {
+          'x-forwarded-for': req.headers['x-forwarded-for'],
+          'x-real-ip': req.headers['x-real-ip'],
+        },
+        connection: req.connection?.remoteAddress
+      });
+      
+      // In production, we should not allow internal IPs
+      return 'invalid-ip-detected';
     }
 
-    console.log('✅ Final client IP:', clientIP);
+    console.log('✅ Final validated client IP:', clientIP);
     return clientIP;
   } catch (error) {
     console.error('❌ Error in getClientIP:', error);
-    // Return a valid IP for local development instead of error code
-    return '127.0.0.1';
+    return 'ip-detection-error';
   }
-}
-
-// Helper function to check if we're in development mode
-function isDevelopment() {
-  return process.env.NODE_ENV === 'development' || 
-         !process.env.NODE_ENV || 
-         process.env.NODE_ENV === 'local';
 }
 
 // Helper function to check if IP is internal/private
@@ -411,7 +419,7 @@ exports.networkDiagnostics = async (req, res) => {
 // Enhanced LAN validation function with Work From Home check and STRICT IP validation
 async function validateEmployeeLAN(employeeId, req, isCheckIn = true) {
   try {
-    console.log('🔐 LAN validation for employee:', employeeId);
+    console.log('🔐 PRODUCTION LAN validation for employee:', employeeId);
     
     // Get employee details
     const [employeeData] = await db.query(
@@ -439,16 +447,6 @@ async function validateEmployeeLAN(employeeId, req, isCheckIn = true) {
       wfhEnabled = metaData.wfh_enabled || false;
     } catch (error) {
       console.error('Error parsing employee meta data:', error);
-    }
-
-    // DEVELOPMENT BYPASS: Allow all in development mode
-    if (isDevelopment()) {
-      console.log('🔧 DEVELOPMENT MODE: LAN validation bypassed');
-      return {
-        allowed: true,
-        reason: 'Development mode - LAN validation bypassed',
-        developmentMode: true
-      };
     }
 
     // Check if employee has wfh_enabled flag (permanent WFH)
@@ -486,9 +484,9 @@ async function validateEmployeeLAN(employeeId, req, isCheckIn = true) {
       };
     }
 
-    // If no LAN restriction is set
+    // STRICT: If no LAN restriction is set, DENY access in production
     if (!allowedLAN || allowedLAN.trim() === '') {
-      console.log('⚠️ No LAN restriction set');
+      console.log('🚫 No LAN restriction set - access denied');
       return {
         allowed: false,
         reason: 'No LAN IP configured and no Work From Home approved',
@@ -498,22 +496,47 @@ async function validateEmployeeLAN(employeeId, req, isCheckIn = true) {
       };
     }
 
-    // Get client IP
+    // Get client IP with production detection
     const clientIP = getClientIP(req);
     const cleanAllowedLAN = allowedLAN.trim();
 
-    console.log('🔐 IP VALIDATION:', {
+    console.log('🔐 PRODUCTION IP VALIDATION:', {
       clientIP: clientIP,
       allowedLAN: cleanAllowedLAN,
-      employeeName: employee.employeeName,
-      environment: process.env.NODE_ENV || 'development'
+      employeeName: employee.employeeName
     });
+
+    // CRITICAL: Deny if IP detection failed or internal IP detected
+    if (clientIP === 'invalid-ip-detected' || clientIP === 'ip-detection-error') {
+      console.log('🚫 IP detection failed - access denied');
+      return {
+        allowed: false,
+        reason: 'Cannot verify your network location',
+        details: {
+          help: 'Network detection failed. Please try again or contact IT support.'
+        }
+      };
+    }
+
+    // CRITICAL: Deny internal IPs in production (unless specifically allowed)
+    if (isInternalIP(clientIP) && !isInternalIP(cleanAllowedLAN)) {
+      console.log('🚫 Internal IP detected but employee registered with external IP');
+      return {
+        allowed: false,
+        reason: 'Internal network IP detected',
+        details: {
+          detectedIP: clientIP,
+          registeredIP: cleanAllowedLAN,
+          help: 'You appear to be on internal network but employee is registered with external IP'
+        }
+      };
+    }
 
     // Enhanced IP matching
     const ipValidation = validateIPAgainstLANStrict(clientIP, cleanAllowedLAN);
 
     if (ipValidation.isAllowed) {
-      console.log('✅ LAN validation successful:', ipValidation.matchType);
+      console.log('✅ PRODUCTION LAN validation successful:', ipValidation.matchType);
       return {
         allowed: true,
         reason: `LAN IP validated (${ipValidation.matchType})`,
@@ -523,7 +546,7 @@ async function validateEmployeeLAN(employeeId, req, isCheckIn = true) {
     }
 
     // If IP doesn't match, provide detailed error
-    console.log('🚫 LAN validation failed');
+    console.log('🚫 PRODUCTION LAN validation failed');
     return {
       allowed: false,
       reason: `Network validation failed - IP mismatch`,
@@ -531,6 +554,7 @@ async function validateEmployeeLAN(employeeId, req, isCheckIn = true) {
         detectedIP: clientIP,
         registeredIP: cleanAllowedLAN,
         matchType: ipValidation.matchType,
+        isLocalNetwork: isInternalIP(clientIP),
         hasWorkFromHome: false,
         wfhEnabled: wfhEnabled,
         help: `Your IP (${clientIP}) doesn't match registered LAN IP (${cleanAllowedLAN}). Connect to office network or get Work From Home approval.`
