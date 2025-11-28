@@ -9,7 +9,7 @@ const employeeController = require('./controllers/employeeController');
 const app = express();
 // Add this middleware to trust proxy headers
 app.set('trust proxy', true);
-app.set('trust proxy', 'loopback, 172.31.14.188');  // Or specific settings
+app.set('trust proxy', ['loopback', '172.31.14.188', '172.31.21.72']);  // Or specific settings
 
 // Or for specific IP ranges:
 // app.set('trust proxy', ['192.168.0.0/16', '10.0.0.0/8', '172.16.0.0/12']);
