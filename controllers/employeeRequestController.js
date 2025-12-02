@@ -52,57 +52,63 @@ class EmployeeRequestController {
 
   // Get overdue records for employee
   async getMyOverdueRecords(req, res) {
-    try {
-      const employeeId = await this.getEmployeeId(req);
-      console.log("Employee ID:", employeeId);
-      
-      if (!employeeId) {
-        return res.status(400).json({
-          success: false,
-          message: 'Employee ID not found in user data'
-        });
-      }
-
-      // Get overdue records
-      const [overdueRecords] = await db.query(`
-        SELECT 
-          a.id as attendance_id,
-          DATE(a.date) as date,
-          a.status,
-          a.check_in,
-          a.check_out,
-          a.remarks,
-          a.created_at
-        FROM attendance a
-        WHERE a.employee_id = ?
-          AND a.status = 'Absent'
-          AND DATE(a.date) < CURDATE()
-          AND a.check_out IS NULL
-          AND NOT EXISTS (
-            SELECT 1 FROM employee_requests er 
-            WHERE er.employee_id = ? 
-            AND DATE(er.request_date) = DATE(a.date)
-            AND er.request_type = 'unmark_absent'
-            AND er.status IN ('pending', 'approved')
-          )
-        ORDER BY a.date DESC
-      `, [employeeId, employeeId]);
-
-      res.json({
-        success: true,
-        data: overdueRecords,
-        message: overdueRecords.length > 0 ? 'Overdue records found' : 'No overdue records found'
-      });
-
-    } catch (error) {
-      console.error('Error fetching overdue records:', error);
-      res.status(500).json({
+  try {
+    const employeeId = await this.getEmployeeId(req);
+    console.log("Employee ID:", employeeId);
+    
+    if (!employeeId) {
+      return res.status(400).json({
         success: false,
-        message: 'Failed to fetch overdue records',
-        error: error.message
+        message: 'Employee ID not found in user data'
       });
     }
+
+    // Get overdue records
+    const [overdueRecords] = await db.query(`
+      SELECT 
+        a.id as attendance_id,
+        DATE(a.date) as date,
+        a.status,
+        a.check_in,
+        a.check_out,
+        a.remarks,
+        a.created_at
+      FROM attendance a
+      WHERE a.employee_id = ?
+        AND a.status = 'Absent'
+        AND DATE(a.date) < CURDATE()
+        AND a.check_in IS NOT NULL  
+        AND a.check_out IS NULL   
+        AND NOT EXISTS (
+          SELECT 1 FROM employee_requests er 
+          WHERE er.employee_id = ? 
+          AND DATE(er.request_date) = DATE(a.date)
+          AND er.request_type = 'unmark_absent'
+          AND er.status IN ('pending', 'approved')
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM leaves l
+          WHERE l.employee_id = ?
+            AND DATE(a.date) BETWEEN l.start_date AND l.end_date
+        )
+      ORDER BY a.date DESC
+    `, [employeeId, employeeId, employeeId]);
+
+    res.json({
+      success: true,
+      data: overdueRecords,
+      message: overdueRecords.length > 0 ? 'Overdue records found' : 'No overdue records found'
+    });
+
+  } catch (error) {
+    console.error('Error fetching overdue records:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch overdue records',
+      error: error.message
+    });
   }
+}
 
   // Create unmark absent request
   async createUnmarkAbsentRequest(req, res) {
