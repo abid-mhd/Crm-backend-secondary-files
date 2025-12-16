@@ -22,6 +22,20 @@ const extractPincode = (address) => {
   return pincodeMatch ? pincodeMatch[0] : null;
 };
 
+// Helper function to get prefix by invoice type
+const getPrefixByType = (type) => {
+  switch(type) {
+    case 'sales': return 'ICE/25-26/INV/';
+    case 'purchase_order': return 'ICE/25-26/PO/';
+    case 'purchase': return 'ICE/25-26/PI/';
+    case 'debit': return 'ICE/25-26/DN/';
+    case 'credit': return 'ICE/25-26/CN/';
+    case 'proforma': return 'ICE/25-26/PRO/';
+    case 'delivery_challan': return 'ICE/25-26/DC/';
+    default: return 'ICE/25-26/INV/';
+  }
+};
+
 // Updated helper function for purchase order calculations with tax type
 function calculateItemAmounts(item, taxType = 'sgst_cgst') {
   const baseAmount = calculateItemBaseAmount(item);
@@ -59,9 +73,8 @@ function calculateItemAmounts(item, taxType = 'sgst_cgst') {
   };
 }
 
-// Helper function to log purchase order actions - RUNS OUTSIDE TRANSACTION
+// Helper function to log purchase order actions
 const logPurchaseOrderAction = async (orderId, action, details, changes = {}, req = null) => {
-  // Run in a separate connection to avoid transaction locks
   setImmediate(async () => {
     try {
       const userId = req?.user?.id || null;
@@ -109,41 +122,205 @@ const logPurchaseOrderAction = async (orderId, action, details, changes = {}, re
       console.log(`📝 Purchase order history created for action: ${action} by user: ${userName}`);
     } catch (err) {
       console.error("❌ Error logging purchase order action:", err);
-      // Don't throw - logging should not break the main operation
     }
   });
 };
 
+// Helper function to parse invoice number with type-based prefix
+const parseInvoiceNumberWithType = (fullNumber, invoiceType = 'purchase_order') => {
+  if (!fullNumber) return { sequence: null, number: null, prefix: getPrefixByType(invoiceType) };
+  
+  const prefix = getPrefixByType(invoiceType);
+  const lastSlashIndex = fullNumber.lastIndexOf('/');
+  let actualPrefix = prefix;
+  let sequenceStr = fullNumber;
+  
+  if (lastSlashIndex !== -1) {
+    actualPrefix = fullNumber.substring(0, lastSlashIndex + 1);
+    sequenceStr = fullNumber.substring(lastSlashIndex + 1);
+  }
+  
+  let sequence;
+  if (/^\d+$/.test(sequenceStr)) {
+    sequence = parseInt(sequenceStr);
+  } else {
+    sequence = null;
+  }
+  
+  return {
+    sequence: sequence,
+    number: fullNumber,
+    sequenceStr: sequenceStr,
+    prefix: actualPrefix
+  };
+};
+
+// Updated validateInvoiceNumber helper function
+const validateInvoiceNumber = async (conn, invoiceNumber, projectId = null, excludeId = null, invoiceType = 'purchase_order') => {
+  try {
+    console.log('Validating invoice number:', {
+      invoiceNumber,
+      projectId,
+      excludeId,
+      invoiceType
+    });
+    
+    let query = `
+      SELECT COUNT(*) as count 
+      FROM invoices 
+      WHERE invoice_number_generated = ? 
+        AND type = ?
+    `;
+    
+    const params = [invoiceNumber, invoiceType];
+    
+    if (projectId === null) {
+      query += ' AND project_id IS NULL';
+    } else {
+      query += ' AND project_id = ?';
+      params.push(projectId);
+    }
+    
+    if (excludeId) {
+      query += ' AND id != ?';
+      params.push(excludeId);
+    }
+    
+    console.log('Validation query:', query);
+    console.log('Validation params:', params);
+    
+    const [result] = await conn.execute(query, params);
+    const isValid = result[0].count === 0;
+    
+    console.log('Validation result:', {
+      count: result[0].count,
+      isValid: isValid
+    });
+    
+    return isValid;
+  } catch (error) {
+    console.error('Error validating invoice number:', error);
+    throw error;
+  }
+};
+
 // Get next purchase order number
 exports.getNextPurchaseOrderNumber = async (req, res) => {
+  const conn = await db.getConnection();
+  
   try {
-    const [purchaseOrders] = await db.execute(`
-      SELECT invoiceNumber FROM invoices 
-      WHERE type = 'purchase_order' 
-      AND invoiceNumber LIKE 'ICE/25-26/PO/%'
-      ORDER BY createdAt DESC 
-      LIMIT 1
-    `);
-
-    let nextNumber = "ICE/25-26/PO/001";
+    const { projectId, prefix = 'ICE/25-26/PO/', invoiceType = 'purchase_order' } = req.query;
     
-    if (purchaseOrders.length > 0) {
-      const lastInvoiceNumber = purchaseOrders[0].invoiceNumber;
-      console.log('Last invoice number:', lastInvoiceNumber);
+    // Get current max sequence
+    const [sequences] = await conn.execute(
+      'SELECT last_sequence FROM invoice_sequences WHERE project_id = ? AND prefix = ? AND invoice_type = ?',
+      [projectId || null, prefix, invoiceType]
+    );
+    
+    let nextSequence = 1;
+    if (sequences.length > 0) {
+      nextSequence = sequences[0].last_sequence + 1;
+    } else {
+      // Check if there's any existing purchase order for this project/global
+      let query = `
+        SELECT MAX(invoice_sequence) as max_sequence 
+        FROM invoices 
+        WHERE invoice_prefix = ? 
+          AND type = ?
+      `;
       
-      // Extract the numeric part from the last invoice number
-      const matches = lastInvoiceNumber.match(/ICE\/25-26\/PO\/(\d+)/);
-      if (matches && matches[1]) {
-        const lastNumber = parseInt(matches[1]);
-        nextNumber = `ICE/25-26/PO/${(lastNumber + 1).toString().padStart(3, '0')}`;
+      const params = [prefix, invoiceType];
+      
+      if (projectId) {
+        query += ' AND project_id = ?';
+        params.push(projectId);
+      } else {
+        query += ' AND project_id IS NULL';
+      }
+      
+      const [orders] = await conn.execute(query, params);
+      
+      if (orders[0].max_sequence) {
+        nextSequence = orders[0].max_sequence + 1;
       }
     }
+    
+    conn.release();
+    
+    res.json({
+      success: true,
+      nextSequence,
+      nextInvoiceNumber: `${prefix}${nextSequence.toString().padStart(4, '0')}`,
+      projectId: projectId || null,
+      prefix
+    });
+  } catch (error) {
+    if (conn) conn.release();
+    console.error('Error getting next purchase order number:', error);
+    res.status(500).json({ 
+      success: false,
+      message: 'Database error' 
+    });
+  }
+};
 
-    console.log('Generated next PO number:', nextNumber);
-    res.json({ nextNumber });
-  } catch (err) {
-    console.error("Error generating purchase order number:", err);
-    res.status(500).json({ message: "Database error" });
+// Check purchase order number availability
+exports.checkPurchaseOrderNumber = async (req, res) => {
+  const conn = await db.getConnection();
+  
+  try {
+    const { invoiceNumber, projectId, invoiceType = 'purchase_order' } = req.query;
+    
+    if (!invoiceNumber) {
+      return res.status(400).json({ 
+        success: false,
+        message: 'Invoice number is required' 
+      });
+    }
+    
+    let parsedProjectId = null;
+    if (projectId !== undefined && projectId !== null && projectId !== '') {
+      if (projectId === 'null' || projectId === 'undefined') {
+        parsedProjectId = null;
+      } else {
+        parsedProjectId = parseInt(projectId);
+        if (isNaN(parsedProjectId)) {
+          parsedProjectId = null;
+        }
+      }
+    }
+    
+    console.log('Checking purchase order number:', {
+      invoiceNumber,
+      projectId,
+      parsedProjectId,
+      invoiceType
+    });
+    
+    // Check if the number already exists for purchase orders
+    const isValid = await validateInvoiceNumber(
+      conn,
+      invoiceNumber,
+      parsedProjectId,
+      null,
+      invoiceType
+    );
+    
+    conn.release();
+    
+    res.json({
+      success: true,
+      available: isValid,
+      invoiceNumber,
+      projectId: parsedProjectId
+    });
+  } catch (error) {
+    if (conn) conn.release();
+    console.error('Error checking purchase order number:', error);
+    res.status(500).json({ 
+      success: false,
+      message: 'Database error' 
+    });
   }
 };
 
@@ -212,40 +389,7 @@ async function findOrCreateSupplier(supplierName, gstin, pan, conn = db) {
   }
 }
 
-// Helper function to generate next PO number
-async function getNextPurchaseOrderNumber(conn) {
-  try {
-    const [purchaseOrders] = await conn.execute(`
-      SELECT invoiceNumber FROM invoices 
-      WHERE type = 'purchase_order' 
-      AND invoiceNumber LIKE 'ICE/25-26/PO/%'
-      ORDER BY createdAt DESC 
-      LIMIT 1
-    `);
-
-    let nextNumber = "ICE/25-26/PO/001";
-    
-    if (purchaseOrders.length > 0) {
-      const lastInvoiceNumber = purchaseOrders[0].invoiceNumber;
-      console.log('Last invoice number in import:', lastInvoiceNumber);
-      
-      // Extract the numeric part from the last invoice number
-      const matches = lastInvoiceNumber.match(/ICE\/25-26\/PO\/(\d+)/);
-      if (matches && matches[1]) {
-        const lastNumber = parseInt(matches[1]);
-        nextNumber = `ICE/25-26/PO/${(lastNumber + 1).toString().padStart(3, '0')}`;
-      }
-    }
-
-    console.log('Generated next PO number for import:', nextNumber);
-    return nextNumber;
-  } catch (err) {
-    console.error("Error generating purchase order number in import:", err);
-    return "ICE/25-26/PO/001";
-  }
-}
-
-// Import purchase orders from Excel
+// Helper function to find or create supplier with address
 async function findOrCreateSupplierWithAddress(supplierName, gstin, pan, billingAddress, shippingAddress, mobile = '', email = '', conn = db) {
   if (!supplierName) {
     console.error('Supplier name is required');
@@ -267,7 +411,6 @@ async function findOrCreateSupplierWithAddress(supplierName, gstin, pan, billing
     if (existingSuppliers.length > 0) {
       console.log(`Found existing supplier: ${trimmedName}, ID: ${existingSuppliers[0].id}`);
       
-      // Update existing supplier with address if needed
       const supplierId = existingSuppliers[0].id;
       try {
         await conn.execute(
@@ -282,7 +425,6 @@ async function findOrCreateSupplierWithAddress(supplierName, gstin, pan, billing
         );
       } catch (updateError) {
         console.error('Error updating supplier:', updateError);
-        // Continue with existing supplier even if update fails
       }
       return supplierId;
     }
@@ -295,8 +437,8 @@ async function findOrCreateSupplierWithAddress(supplierName, gstin, pan, billing
       VALUES (?, ?, ?, 'Supplier', 'Wholesale', ?, ?, ?, ?, NOW(), NOW())`,
       [
         trimmedName,
-        mobile || '0000000000', // Default mobile number
-        email || `${trimmedName.replace(/\s+/g, '').toLowerCase()}@supplier.com`, // Default email
+        mobile || '0000000000',
+        email || `${trimmedName.replace(/\s+/g, '').toLowerCase()}@supplier.com`,
         gstin || null, 
         pan || null, 
         billingAddress || '', 
@@ -310,10 +452,8 @@ async function findOrCreateSupplierWithAddress(supplierName, gstin, pan, billing
   } catch (error) {
     console.error('Error in findOrCreateSupplierWithAddress:', error);
     
-    // Check for specific MySQL errors
     if (error.code === 'ER_DUP_ENTRY') {
       console.error('Duplicate entry error - supplier might already exist');
-      // Try to find the supplier again
       try {
         const [suppliers] = await conn.execute(
           'SELECT id FROM parties WHERE LOWER(partyName) = LOWER(?) AND partyType = "Supplier" LIMIT 1',
@@ -331,7 +471,7 @@ async function findOrCreateSupplierWithAddress(supplierName, gstin, pan, billing
   }
 }
 
-// Enhanced import purchase orders from Excel with logging
+// Import purchase orders from Excel
 exports.importPurchaseOrders = async (req, res) => {
   const conn = await db.getConnection();
   
@@ -365,7 +505,6 @@ exports.importPurchaseOrders = async (req, res) => {
     const sheetName = workbook.SheetNames[0];
     const worksheet = workbook.Sheets[sheetName];
     
-    // Convert to JSON with header row
     const jsonData = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
     
     if (jsonData.length <= 1) {
@@ -381,7 +520,6 @@ exports.importPurchaseOrders = async (req, res) => {
       });
     }
 
-    // Extract headers and data
     const headers = jsonData[0].map(header => header ? header.toString().trim() : '');
     const dataRows = jsonData.slice(1);
 
@@ -393,14 +531,10 @@ exports.importPurchaseOrders = async (req, res) => {
       failed: []
     };
 
-    // Get the starting PO number for this import batch
-    let currentPONumber = await getNextPurchaseOrderNumber(conn);
-    console.log('Starting PO number for import batch:', currentPONumber);
-
     // Process each row
     for (const [index, row] of dataRows.entries()) {
       let rowData = {};
-      let rowPDF = individualPDFs[index.toString()]; // Get PDF for this specific row
+      let rowPDF = individualPDFs[index.toString()];
       
       try {
         // Skip empty rows
@@ -417,28 +551,44 @@ exports.importPurchaseOrders = async (req, res) => {
         });
 
         console.log(`Processing row ${index + 2}:`, rowData);
-        console.log(`PDF for row ${index + 2}:`, rowPDF ? rowPDF.filename : 'No PDF');
 
         // Check if custom PO number is provided
-        let orderNumber = currentPONumber;
+        let orderNumber = null;
         if (rowData['PO Number'] && rowData['PO Number'].toString().trim() !== '') {
-          // Use custom PO number if provided
           orderNumber = rowData['PO Number'].toString().trim();
           console.log(`Using custom PO number: ${orderNumber}`);
         } else {
-          // Use auto-generated number and increment for next row
-          console.log(`Using auto-generated PO number: ${orderNumber}`);
+          // Auto-generate PO number
+          const prefix = getPrefixByType('purchase_order');
           
-          // Extract current number and prepare next one
-          const matches = currentPONumber.match(/ICE\/25-26\/PO\/(\d+)/);
-          if (matches && matches[1]) {
-            const currentNumber = parseInt(matches[1]);
-            const nextNumber = currentNumber + 1;
-            currentPONumber = `ICE/25-26/PO/${nextNumber.toString().padStart(3, '0')}`;
+          // Get next sequence for this project (if any)
+          const projectId = rowData['Project ID'] ? parseInt(rowData['Project ID']) : null;
+          
+          const [existing] = await conn.execute(
+            'SELECT * FROM invoice_sequences WHERE project_id <=> ? AND prefix = ? AND invoice_type = "purchase_order" FOR UPDATE',
+            [projectId, prefix]
+          );
+          
+          let invoiceSequence;
+          if (existing.length === 0) {
+            invoiceSequence = 1;
+            await conn.execute(
+              'INSERT INTO invoice_sequences (project_id, prefix, invoice_type, last_sequence) VALUES (?, ?, "purchase_order", ?)',
+              [projectId, prefix, 1]
+            );
+          } else {
+            invoiceSequence = existing[0].last_sequence + 1;
+            await conn.execute(
+              'UPDATE invoice_sequences SET last_sequence = ? WHERE project_id <=> ? AND prefix = ? AND invoice_type = "purchase_order"',
+              [invoiceSequence, projectId, prefix]
+            );
           }
+          
+          orderNumber = `${prefix}${invoiceSequence.toString().padStart(4, '0')}`;
+          console.log(`Generated PO number: ${orderNumber}`);
         }
 
-        // Validate required fields - updated for multi-item support
+        // Validate required fields
         const requiredFields = [
           'Vendor Name*', 'GSTIN / PAN*', 'Billing Address*', 'Shipping Address*',
           'Contact Mobile*', 'Contact Email*'
@@ -501,7 +651,6 @@ exports.importPurchaseOrders = async (req, res) => {
         let pan = null;
         const gstinPan = rowData['GSTIN / PAN*'].toString().trim();
         
-        // Validate GSTIN/PAN format
         if (gstinPan.length === 15) {
           gstin = gstinPan;
         } else if (gstinPan.length === 10) {
@@ -538,7 +687,7 @@ exports.importPurchaseOrders = async (req, res) => {
           totalAmount += itemTotalAmount;
         });
 
-        // Find or create supplier with complete details including mobile and email
+        // Find or create supplier
         const supplierId = await findOrCreateSupplierWithAddress(
           rowData['Vendor Name*'],
           gstin,
@@ -563,21 +712,18 @@ exports.importPurchaseOrders = async (req, res) => {
 
         console.log(`Supplier created/found with ID: ${supplierId}`);
 
-        // Prepare PDF meta data for this specific row if PDF exists
+        // Prepare PDF meta data
         let pdfMeta = null;
         if (rowPDF) {
-          // Create uploads directory if it doesn't exist
           const uploadDir = 'uploads/purchase-orders';
           if (!fs.existsSync(uploadDir)) {
             fs.mkdirSync(uploadDir, { recursive: true });
           }
 
-          // Generate unique filename
           const fileExtension = path.extname(rowPDF.originalname);
           const uniqueFileName = `po_pdf_${Date.now()}_${Math.random().toString(36).substring(7)}${fileExtension}`;
           const filePath = path.join(uploadDir, uniqueFileName);
 
-          // Move file to permanent location
           fs.renameSync(rowPDF.path, filePath);
 
           pdfMeta = {
@@ -593,7 +739,11 @@ exports.importPurchaseOrders = async (req, res) => {
           console.log(`PDF associated with row ${index + 2}: ${uniqueFileName}`);
         }
 
-        // Create purchase order data WITH INDIVIDUAL PDF META
+        // Parse order number for database
+        const parsed = parseInvoiceNumberWithType(orderNumber, 'purchase_order');
+        const isManualInvoice = rowData['PO Number'] ? true : false;
+
+        // Create purchase order meta
         const purchaseOrderMeta = {
           orderStatus: (rowData['Payment Status'] || 'Unpaid') === 'Paid' ? 'confirmed' : 'draft',
           priority: 'medium',
@@ -608,7 +758,9 @@ exports.importPurchaseOrders = async (req, res) => {
           taxableAmount: totalGrossAmount,
           contactMobile: mobile,
           contactEmail: email,
-          // Add individual PDF file information if available
+          isManualInvoice: isManualInvoice,
+          invoicePrefix: parsed.prefix,
+          generatedInvoiceNumber: orderNumber,
           ...(pdfMeta && { pdfFile: pdfMeta })
         };
 
@@ -630,13 +782,19 @@ exports.importPurchaseOrders = async (req, res) => {
 
         console.log(`Creating purchase order: ${orderNumber} with ${items.length} items`);
 
-        // Insert purchase order
+        // Insert purchase order with invoice number fields
         const [orderResult] = await conn.execute(
           `INSERT INTO invoices 
-          (invoiceNumber, date, dueDate, clientId, status, subTotal, tax, discount, total, notes, type, meta, createdAt, updatedAt) 
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+          (invoice_prefix, invoice_sequence, invoice_number_generated, is_manual_invoice, original_sequence, 
+           invoiceNumber, date, dueDate, clientId, status, subTotal, tax, discount, total, notes, type, meta, createdAt, updatedAt) 
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
           [
-            purchaseOrder.invoiceNumber,
+            parsed.prefix,
+            parsed.sequence || 0,
+            orderNumber,
+            isManualInvoice,
+            parsed.sequence || null,
+            parsed.sequenceStr || orderNumber,
             purchaseOrder.date,
             purchaseOrder.dueDate,
             purchaseOrder.clientId,
@@ -646,7 +804,7 @@ exports.importPurchaseOrders = async (req, res) => {
             purchaseOrder.discount,
             purchaseOrder.total,
             JSON.stringify(purchaseOrder.notes),
-            purchaseOrder.type,
+            'purchase_order',
             JSON.stringify(purchaseOrder.meta)
           ]
         );
@@ -704,7 +862,7 @@ exports.importPurchaseOrders = async (req, res) => {
         // Commit transaction FIRST for this order
         await conn.commit();
 
-        // THEN log the import action OUTSIDE the transaction
+        // THEN log the import action
         logPurchaseOrderAction(
           orderId,
           'imported',
@@ -806,7 +964,6 @@ exports.importPurchaseOrders = async (req, res) => {
 function parseMultipleItems(rowData) {
   const items = [];
   
-  // Define the pattern for item fields
   const itemPatterns = [
     { prefix: 'Item 1', required: true },
     { prefix: 'Item 2', required: false },
@@ -820,38 +977,34 @@ function parseMultipleItems(rowData) {
     const quantity = rowData[`${pattern.prefix} - Quantity`];
     const rate = rowData[`${pattern.prefix} - Rate`];
     
-    // If this is the first item and required fields are missing, skip the row
     if (pattern.required && (!description || !quantity || !rate)) {
       if (items.length === 0) {
-        return []; // No valid items found
+        return [];
       }
-      break; // Stop processing further items
+      break;
     }
     
-    // If this is an optional item and required fields are missing, stop processing
     if (!pattern.required && (!description || !quantity || !rate)) {
       break;
     }
 
-    // Validate numeric fields
     const parsedQuantity = parseFloat(quantity);
     const parsedRate = parseFloat(rate);
     
     if (isNaN(parsedQuantity) || parsedQuantity <= 0) {
       if (pattern.required) {
-        return []; // Invalid required item
+        return [];
       }
-      continue; // Skip this optional item
+      continue;
     }
     
     if (isNaN(parsedRate) || parsedRate < 0) {
       if (pattern.required) {
-        return []; // Invalid required item
+        return [];
       }
-      continue; // Skip this optional item
+      continue;
     }
 
-    // Create item object
     const item = {
       description: description.toString().trim(),
       quantity: parsedQuantity,
@@ -890,7 +1043,6 @@ exports.uploadPOPDF = async (req, res) => {
       );
 
       if (rows.length === 0) {
-        // Clean up file if order not found
         fs.unlinkSync(req.file.path);
         return res.status(404).json({
           success: false,
@@ -903,7 +1055,6 @@ exports.uploadPOPDF = async (req, res) => {
         meta = typeof rows[0].meta === 'string' ? JSON.parse(rows[0].meta) : rows[0].meta;
       }
 
-      // Store PDF information in meta
       meta.pdfFile = {
         fileName: fileName,
         originalName: originalName,
@@ -937,7 +1088,6 @@ exports.uploadPOPDF = async (req, res) => {
     });
 
   } catch (error) {
-    // Clean up file in case of error
     if (req.file && fs.existsSync(req.file.path)) {
       fs.unlinkSync(req.file.path);
     }
@@ -1006,7 +1156,6 @@ exports.getPOPDF = async (req, res) => {
 // Download Excel Template with multi-item support
 exports.downloadTemplate = (req, res) => {
   try {
-    // Create comprehensive template data with multi-item support
     const templateData = [
       {
         'PO Number': 'ICE/25-26/PO/001',
@@ -1045,7 +1194,7 @@ exports.downloadTemplate = (req, res) => {
         'Item 3 - GST %': '12',
         'Item 3 - GST Amount': '288',
         
-        // Totals (Auto-calculated, can be provided for verification)
+        // Totals
         'Gross Amount*': '101600',
         'Total GST Amount': '19008',
         'Total Amount*': '120608',
@@ -1056,13 +1205,11 @@ exports.downloadTemplate = (req, res) => {
       }
     ];
 
-    // Create workbook
     const workbook = XLSX.utils.book_new();
     const worksheet = XLSX.utils.json_to_sheet(templateData);
     
     XLSX.utils.book_append_sheet(workbook, worksheet, 'Purchase Orders Template');
 
-    // Set column widths for better readability
     const colWidths = [
       { wch: 18 },  // PO Number
       { wch: 15 },  // Category
@@ -1111,7 +1258,6 @@ exports.downloadTemplate = (req, res) => {
     ];
     worksheet['!cols'] = colWidths;
 
-    // Generate buffer
     const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
 
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
@@ -1202,12 +1348,11 @@ exports.getHistory = async (req, res) => {
   try {
     const [logs] = await db.execute(
       `SELECT * FROM invoice_history 
-       WHERE orderId = ? 
+       WHERE invoiceId = ? 
        ORDER BY createdAt DESC`,
       [req.params.id]
     );
 
-    // Parse JSON changes field
     const parsedLogs = logs.map(log => ({
       ...log,
       changes: log.changes ? (typeof log.changes === 'string' ? JSON.parse(log.changes) : log.changes) : {}
@@ -1232,7 +1377,6 @@ exports.list = async (req, res) => {
     `);
 
     for (const order of orders) {
-      // Get invoice items with full item details
       const [items] = await db.execute(`
         SELECT 
           ii.*,
@@ -1249,7 +1393,6 @@ exports.list = async (req, res) => {
         WHERE ii.invoiceId = ?
       `, [order.id]);
       
-      // Parse meta data for order
       if (order.meta && typeof order.meta === 'string') {
         try {
           order.meta = JSON.parse(order.meta);
@@ -1261,7 +1404,6 @@ exports.list = async (req, res) => {
         order.meta = {};
       }
 
-      // Parse meta data for each item
       order.items = items.map(item => {
         if (item.meta) {
           if (typeof item.meta === 'string') {
@@ -1285,7 +1427,6 @@ exports.list = async (req, res) => {
           item.meta = {};
         }
         
-        // Add original item details to the response
         item.originalItem = item.original_item_id ? {
           id: item.original_item_id,
           name: item.original_item_name,
@@ -1323,7 +1464,6 @@ exports.getPurchaseOrdersByProject = async (req, res) => {
     `, [projectId]);
 
     for (const order of orders) {
-      // Get invoice items with full item details
       const [items] = await db.execute(`
         SELECT 
           ii.*,
@@ -1340,7 +1480,6 @@ exports.getPurchaseOrdersByProject = async (req, res) => {
         WHERE ii.invoiceId = ?
       `, [order.id]);
       
-      // Parse meta data for order
       if (order.meta && typeof order.meta === 'string') {
         try {
           order.meta = JSON.parse(order.meta);
@@ -1352,7 +1491,6 @@ exports.getPurchaseOrdersByProject = async (req, res) => {
         order.meta = {};
       }
 
-      // Parse meta data for each item
       order.items = items.map(item => {
         if (item.meta) {
           if (typeof item.meta === 'string') {
@@ -1376,7 +1514,6 @@ exports.getPurchaseOrdersByProject = async (req, res) => {
           item.meta = {};
         }
         
-        // Add original item details to the response
         item.originalItem = item.original_item_id ? {
           id: item.original_item_id,
           name: item.original_item_name,
@@ -1431,7 +1568,6 @@ exports.get = async (req, res) => {
     );
     order.supplier = supplier[0] || null;
 
-    // Get invoice items with full item details
     const [items] = await db.execute(`
       SELECT 
         ii.*,
@@ -1448,7 +1584,6 @@ exports.get = async (req, res) => {
       WHERE ii.invoiceId = ?
     `, [order.id]);
     
-    // Parse meta data for each item
     order.items = items.map(item => {
       if (item.meta) {
         if (typeof item.meta === 'string') {
@@ -1472,7 +1607,6 @@ exports.get = async (req, res) => {
         item.meta = {};
       }
       
-      // Add original item details to the response
       item.originalItem = item.original_item_id ? {
         id: item.original_item_id,
         name: item.original_item_name,
@@ -1488,7 +1622,6 @@ exports.get = async (req, res) => {
       return item;
     });
 
-    // Add project information from meta if available
     if (order.meta.projectId) {
       order.projectId = order.meta.projectId;
       order.projectName = order.meta.projectName || order.projectName;
@@ -1509,22 +1642,127 @@ exports.create = async (req, res) => {
   try {
     await conn.beginTransaction();
 
-    console.log("Creating purchase order with tax type:", payload.taxType);
-    console.log("Project ID:", payload.projectId);
+    console.log("Creating purchase order for project:", payload.projectId);
+    console.log("Manual order number:", payload.manualInvoiceNumber);
 
-    // Get tax type from payload or determine from supplier address
-    let taxType = payload.taxType || 'sgst_cgst';
-    
-    // If tax type not provided, determine from supplier address
-    if (!payload.taxType && payload.shippingAddress) {
-      const pincode = extractPincode(payload.shippingAddress);
-      const isTN = isTamilNaduPincode(pincode);
-      taxType = isTN ? 'sgst_cgst' : 'igst';
-    }
-
+    const taxType = payload.taxType || 'sgst_cgst';
     console.log("Using tax type:", taxType);
 
-    // Calculate subtotal using the helper function
+    // ==================== INVOICE NUMBER HANDLING ====================
+    let invoiceSequence;
+    let generatedNumber;
+    let isManualInvoice = false;
+    let originalSequence = null;
+    let sequenceStr = null;
+    const invoicePrefix = getPrefixByType('purchase_order');
+
+    if (payload.manualInvoiceNumber) {
+      // User provided manual order number
+      console.log("Using manual order number:", payload.manualInvoiceNumber);
+      
+      const parsed = parseInvoiceNumberWithType(payload.manualInvoiceNumber, 'purchase_order');
+      
+      if (!parsed.number) {
+        await conn.rollback();
+        return res.status(400).json({ 
+          message: "Invalid order number format" 
+        });
+      }
+      
+      generatedNumber = parsed.number;
+      
+      // Validate uniqueness
+      const isValid = await validateInvoiceNumber(
+        conn,
+        generatedNumber,
+        payload.projectId !== undefined ? payload.projectId : null,
+        null,
+        'purchase_order'
+      );
+      
+      if (!isValid) {
+        await conn.rollback();
+        return res.status(400).json({
+          message: `Order number "${generatedNumber}" already exists ${payload.projectId ? 'for this project' : 'globally'}`,
+          available: false,
+          existingInvoice: true
+        });
+      }
+      
+      invoiceSequence = parsed.sequence || 0;
+      isManualInvoice = true;
+      originalSequence = parsed.sequence || null;
+      sequenceStr = parsed.sequenceStr;
+      
+      // Update sequence tracker if needed
+      if (parsed.sequence && !isNaN(parsed.sequence)) {
+        const [existing] = await conn.execute(
+          'SELECT * FROM invoice_sequences WHERE project_id <=> ? AND prefix = ? AND invoice_type = "purchase_order" FOR UPDATE',
+          [payload.projectId !== undefined ? payload.projectId : null, invoicePrefix]
+        );
+        
+        if (existing.length === 0) {
+          await conn.execute(
+            'INSERT INTO invoice_sequences (project_id, prefix, invoice_type, last_sequence) VALUES (?, ?, "purchase_order", ?)',
+            [payload.projectId !== undefined ? payload.projectId : null, invoicePrefix, parsed.sequence]
+          );
+        } else if (parsed.sequence > existing[0].last_sequence) {
+          await conn.execute(
+            'UPDATE invoice_sequences SET last_sequence = ? WHERE project_id <=> ? AND prefix = ? AND invoice_type = "purchase_order"',
+            [parsed.sequence, payload.projectId !== undefined ? payload.projectId : null, invoicePrefix]
+          );
+        }
+      }
+    } else {
+      // Auto-generate order number
+      console.log("Auto-generating order number for project:", payload.projectId);
+      
+      // Get next sequence number
+      const [existing] = await conn.execute(
+        'SELECT * FROM invoice_sequences WHERE project_id <=> ? AND prefix = ? AND invoice_type = "purchase_order" FOR UPDATE',
+        [payload.projectId !== undefined ? payload.projectId : null, invoicePrefix]
+      );
+      
+      if (existing.length === 0) {
+        invoiceSequence = 1;
+        await conn.execute(
+          'INSERT INTO invoice_sequences (project_id, prefix, invoice_type, last_sequence) VALUES (?, ?, "purchase_order", ?)',
+          [payload.projectId !== undefined ? payload.projectId : null, invoicePrefix, 1]
+        );
+      } else {
+        invoiceSequence = existing[0].last_sequence + 1;
+        await conn.execute(
+          'UPDATE invoice_sequences SET last_sequence = ? WHERE project_id <=> ? AND prefix = ? AND invoice_type = "purchase_order"',
+          [invoiceSequence, payload.projectId !== undefined ? payload.projectId : null, invoicePrefix]
+        );
+      }
+      
+      // Generate the full order number with padding
+      generatedNumber = payload.projectId == undefined || payload.projectId == null ? 
+        payload.invoiceNumber : `${invoicePrefix}${invoiceSequence.toString().padStart(4, '0')}`;
+      
+      // Double-check uniqueness
+      const isValid = await validateInvoiceNumber(
+        conn,
+        generatedNumber,
+        payload.projectId !== undefined ? payload.projectId : null,
+        null,
+        'purchase_order'
+      );
+      
+      if (!isValid) {
+        await conn.rollback();
+        return res.status(400).json({
+          message: `Generated order number "${generatedNumber}" already exists. Please try again.`,
+          available: false
+        });
+      }
+      
+      sequenceStr = invoiceSequence.toString().padStart(4, '0');
+      console.log("Generated order number:", generatedNumber);
+    }
+
+    // Calculate subtotal
     const subtotal = payload.items.reduce((sum, item) => {
       return sum + calculateItemBaseAmount(item);
     }, 0);
@@ -1551,8 +1789,6 @@ exports.create = async (req, res) => {
       cgstTotal += amounts.cgstAmount;
       igstTotal += amounts.igstAmount;
     });
-
-    console.log("Tax totals - totalTax:", totalTax, "sgstTotal:", sgstTotal, "cgstTotal:", cgstTotal, "igstTotal:", igstTotal);
     
     // Apply rounding if enabled
     const calculatedTotal = taxable + tcs + totalTax + sgstTotal + cgstTotal + igstTotal;
@@ -1562,28 +1798,17 @@ exports.create = async (req, res) => {
 
     // Create meta object for purchase order specific fields with tax type
     const meta = {
-      // Tax type information
       taxType: taxType,
-      
-      // Order information
-      orderNumber: payload.orderNumber || "",
+      orderNumber: generatedNumber,
       orderDate: payload.orderDate || payload.date,
       expectedDeliveryDate: payload.expectedDeliveryDate || "",
-      
-      // Discount information
       discount: payload.discount || { type: "flat", value: 0 },
       discountValue: discountValue,
-      
-      // Additional charges
       additionalCharges: payload.additionalCharges || [],
       additionalChargesTotal: additionalChargesTotal,
-      
-      // TCS information
       applyTCS: payload.applyTCS || false,
       tcs: tcs,
       taxableAmount: taxable,
-      
-      // GST information
       sgstTotal: sgstTotal,
       cgstTotal: cgstTotal,
       igstTotal: igstTotal,
@@ -1619,17 +1844,29 @@ exports.create = async (req, res) => {
       orderStatus: payload.orderStatus || "draft",
       priority: payload.priority || "medium",
 
-      // Project information (also stored in meta for easy access)
+      // Project information
       projectId: payload.projectId || null,
-      projectName: payload.projectName || null
+      projectName: payload.projectName || null,
+
+      // Invoice number information
+      isManualInvoice: isManualInvoice,
+      invoicePrefix: invoicePrefix,
+      generatedInvoiceNumber: generatedNumber
     };
 
     const [result] = await conn.execute(
       `INSERT INTO invoices 
-      (invoiceNumber, date, dueDate, clientId, status, subTotal, tax, discount, total, notes, signature, type, meta, project_id, createdAt, updatedAt) 
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+      (invoice_prefix, invoice_sequence, invoice_number_generated, is_manual_invoice, original_sequence, 
+       invoiceNumber, date, dueDate, clientId, status, subTotal, tax, discount, total, notes, signature, 
+       type, meta, project_id, createdAt, updatedAt) 
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
       [
-        payload.invoiceNumber,
+        invoicePrefix,
+        invoiceSequence,
+        generatedNumber,
+        isManualInvoice,
+        originalSequence,
+        sequenceStr,
         payload.date,
         payload.dueDate || payload.expectedDeliveryDate,
         payload.clientId,
@@ -1637,12 +1874,12 @@ exports.create = async (req, res) => {
         subtotal,
         totalTax,
         payload.totalDiscountAmount || discountValue,
-        payload.total ?? calculatedTotal, // Use the final rounded total here
+        payload.total ?? finalTotal,
         JSON.stringify(payload.notes || []),
         payload.signature || null,
         'purchase_order',
         JSON.stringify(meta),
-        payload.projectId || null // Store projectId in the main table
+        payload.projectId || null
       ]
     );
 
@@ -1686,7 +1923,7 @@ exports.create = async (req, res) => {
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           orderId,
-          item.itemId || null, // Save the original item ID
+          item.itemId || null,
           item.description,
           item.hsn || '',
           item.uom || '',
@@ -1708,11 +1945,14 @@ exports.create = async (req, res) => {
     logPurchaseOrderAction(
       orderId,
       'created',
-      `Purchase order ${payload.invoiceNumber} created with ${payload.items.length} items`,
+      `Purchase order ${generatedNumber} created with ${payload.items.length} items`,
       {
-        orderNumber: payload.invoiceNumber,
+        orderNumber: generatedNumber,
+        invoiceSequence: invoiceSequence,
+        sequenceString: sequenceStr,
+        isManualInvoice: isManualInvoice,
         supplier: payload.clientId,
-        total: payload.total ?? calculatedTotal,
+        total: payload.total ?? finalTotal,
         items: payload.items.length,
         taxType: taxType,
         status: payload.status || "draft",
@@ -1724,16 +1964,29 @@ exports.create = async (req, res) => {
     res.status(201).json({ 
       message: "Purchase order created", 
       id: orderId,
-      orderNumber: payload.invoiceNumber,
+      orderNumber: generatedNumber,
+      invoiceSequence: invoiceSequence,
+      sequenceString: sequenceStr,
+      isManualInvoice: isManualInvoice,
       taxType: taxType,
-      total: payload.total ?? calculatedTotal,
+      total: payload.total ?? finalTotal,
       roundingApplied: payload.roundingApplied || false,
       projectId: payload.projectId || null
     });
   } catch (err) {
     await conn.rollback();
     console.error("Error creating purchase order:", err);
-    res.status(500).json({ message: "Error creating purchase order", error: err.message });
+    
+    if (err.code === 'ER_DUP_ENTRY' || err.message.includes('Duplicate entry')) {
+      res.status(400).json({ 
+        message: "Order number already exists. Please use a different number."
+      });
+    } else {
+      res.status(500).json({ 
+        message: "Error creating purchase order", 
+        error: err.message 
+      });
+    }
   } finally {
     conn.release();
   }
@@ -1746,7 +1999,6 @@ exports.update = async (req, res) => {
   try {
     await conn.beginTransaction();
 
-    // Check if order exists and get old data for comparison
     const [rows] = await conn.execute(
       "SELECT * FROM invoices WHERE id = ? AND type = 'purchase_order'", 
       [req.params.id]
@@ -1759,7 +2011,6 @@ exports.update = async (req, res) => {
     const oldOrder = rows[0];
     const payload = req.body;
 
-    // Track changes for history log
     const changes = {};
     
     // Compare basic fields
@@ -1769,14 +2020,11 @@ exports.update = async (req, res) => {
     if (parseFloat(oldOrder.total).toFixed(2) !== parseFloat(payload.total).toFixed(2)) {
       changes.total = { from: parseFloat(oldOrder.total), to: parseFloat(payload.total) };
     }
-    if (oldOrder.invoiceNumber !== payload.invoiceNumber) {
-      changes.orderNumber = { from: oldOrder.invoiceNumber, to: payload.invoiceNumber };
-    }
     if (oldOrder.clientId !== payload.clientId) {
       changes.supplier = { from: oldOrder.clientId, to: payload.clientId };
     }
 
-    // Parse old meta to compare tax type and other fields
+    // Parse old meta
     let oldTaxType = 'sgst_cgst';
     let oldMeta = {};
     if (oldOrder.meta) {
@@ -1788,7 +2036,7 @@ exports.update = async (req, res) => {
       }
     }
 
-    // Format dates to YYYY-MM-DD for MySQL
+    // Format dates
     const formatDateForMySQL = (dateString) => {
       if (!dateString) return null;
       if (/^\d{4}-\d{2}-\d{2}$/.test(dateString)) {
@@ -1811,7 +2059,161 @@ exports.update = async (req, res) => {
       changes.taxType = { from: oldTaxType, to: taxType };
     }
 
-    // Calculate subtotal using the helper function
+    // ==================== INVOICE NUMBER HANDLING FOR UPDATE ====================
+    let newGeneratedNumber = oldOrder.invoice_number_generated;
+    let newInvoiceSequence = oldOrder.invoice_sequence;
+    let isManualInvoice = oldOrder.is_manual_invoice;
+    let originalSequence = oldOrder.original_sequence;
+    let sequenceStr = oldOrder.invoiceNumber;
+    let invoiceNumberChanged = false;
+    const invoicePrefix = getPrefixByType('purchase_order');
+
+    console.log("Current order number:", newGeneratedNumber);
+    console.log("New order number from payload:", payload.manualInvoiceNumber);
+    console.log("Invoice prefix:", invoicePrefix);
+
+    // Check if order number is being changed in manual mode
+    if (payload.manualInvoiceNumber && payload.manualInvoiceNumber !== newGeneratedNumber) {
+      console.log("Order number changed from", newGeneratedNumber, "to", payload.manualInvoiceNumber);
+      invoiceNumberChanged = true;
+      
+      const parsed = parseInvoiceNumberWithType(payload.manualInvoiceNumber, 'purchase_order');
+      
+      if (!parsed.number) {
+        await conn.rollback();
+        return res.status(400).json({ message: "Invalid order number format" });
+      }
+      
+      newGeneratedNumber = parsed.number;
+      
+      // Validate uniqueness ONLY if number has changed
+      const isValid = await validateInvoiceNumber(
+        conn,
+        newGeneratedNumber,
+        payload.projectId !== undefined ? payload.projectId : null,
+        req.params.id,
+        'purchase_order'
+      );
+      
+      if (!isValid) {
+        await conn.rollback();
+        return res.status(400).json({
+          message: `Order number "${newGeneratedNumber}" already exists ${payload.projectId ? 'for this project' : 'globally'}`,
+          available: false,
+          existingInvoice: true
+        });
+      }
+      
+      newInvoiceSequence = parsed.sequence || 0;
+      isManualInvoice = true;
+      originalSequence = parsed.sequence || null;
+      sequenceStr = parsed.sequenceStr;
+      
+      // Update sequence tracker if needed
+      if (parsed.sequence && !isNaN(parsed.sequence)) {
+        const [existing] = await conn.execute(
+          'SELECT * FROM invoice_sequences WHERE project_id <=> ? AND prefix = ? AND invoice_type = "purchase_order" FOR UPDATE',
+          [payload.projectId !== undefined ? payload.projectId : null, invoicePrefix]
+        );
+        
+        if (existing.length === 0) {
+          await conn.execute(
+            'INSERT INTO invoice_sequences (project_id, prefix, invoice_type, last_sequence) VALUES (?, ?, "purchase_order", ?)',
+            [payload.projectId !== undefined ? payload.projectId : null, invoicePrefix, parsed.sequence]
+          );
+        } else if (parsed.sequence > existing[0].last_sequence) {
+          await conn.execute(
+            'UPDATE invoice_sequences SET last_sequence = ? WHERE project_id <=> ? AND prefix = ? AND invoice_type = "purchase_order"',
+            [parsed.sequence, payload.projectId !== undefined ? payload.projectId : null, invoicePrefix]
+          );
+        }
+      }
+      
+      // Track invoice number change
+      changes.invoiceNumber = { 
+        from: oldOrder.invoice_number_generated, 
+        to: newGeneratedNumber 
+      };
+      changes.isManualInvoice = { from: oldOrder.is_manual_invoice, to: true };
+      changes.sequenceString = { from: oldOrder.invoiceNumber, to: sequenceStr };
+    } 
+    // Check if in auto mode and sequence is being changed
+    else if (!payload.manualInvoiceNumber) {
+      const oldSequence = oldOrder.invoiceNumber;
+      const newSequence = payload.invoiceNumber ? payload.invoiceNumber.padStart(4, '0') : oldSequence;
+      
+      if (oldSequence !== newSequence) {
+        invoiceNumberChanged = true;
+        
+        // Build full invoice number
+        newGeneratedNumber = `${invoicePrefix}${newSequence}`;
+        
+        // Only validate if the generated number is different from current
+        if (newGeneratedNumber !== oldOrder.invoice_number_generated) {
+          const isValid = await validateInvoiceNumber(
+            conn,
+            newGeneratedNumber,
+            payload.projectId !== undefined ? payload.projectId : null,
+            req.params.id,
+            'purchase_order'
+          );
+          
+          if (!isValid) {
+            await conn.rollback();
+            return res.status(400).json({
+              message: `Order number "${newGeneratedNumber}" already exists ${payload.projectId ? 'for this project' : 'globally'}`,
+              available: false,
+              existingInvoice: true
+            });
+          }
+        }
+        
+        // Update sequence
+        const sequenceNum = parseInt(newSequence, 10);
+        if (!isNaN(sequenceNum)) {
+          newInvoiceSequence = sequenceNum;
+          sequenceStr = newSequence;
+          
+          // Update sequence tracker if sequence increased
+          if (sequenceNum > oldOrder.invoice_sequence) {
+            const [existing] = await conn.execute(
+              'SELECT * FROM invoice_sequences WHERE project_id <=> ? AND prefix = ? AND invoice_type = "purchase_order" FOR UPDATE',
+              [payload.projectId !== undefined ? payload.projectId : null, invoicePrefix]
+            );
+            
+            if (existing.length === 0) {
+              await conn.execute(
+                'INSERT INTO invoice_sequences (project_id, prefix, invoice_type, last_sequence) VALUES (?, ?, "purchase_order", ?)',
+                [payload.projectId !== undefined ? payload.projectId : null, invoicePrefix, sequenceNum]
+              );
+            } else if (sequenceNum > existing[0].last_sequence) {
+              await conn.execute(
+                'UPDATE invoice_sequences SET last_sequence = ? WHERE project_id <=> ? AND prefix = ? AND invoice_type = "purchase_order"',
+                [sequenceNum, payload.projectId !== undefined ? payload.projectId : null, invoicePrefix]
+              );
+            }
+          }
+        }
+        
+        if (newGeneratedNumber !== oldOrder.invoice_number_generated) {
+          changes.invoiceNumber = { 
+            from: oldOrder.invoice_number_generated, 
+            to: newGeneratedNumber 
+          };
+        }
+        if (oldSequence !== newSequence) {
+          changes.sequenceString = { from: oldSequence, to: newSequence };
+        }
+      }
+    }
+    // If manualInvoiceNumber is provided but same as current, keep existing values
+    else if (payload.manualInvoiceNumber && payload.manualInvoiceNumber === newGeneratedNumber) {
+      // Number hasn't changed, keep existing values
+      console.log("Order number unchanged, keeping existing values");
+      // No validation needed since number is the same
+    }
+
+    // Calculate subtotal
     const subtotal = payload.items.reduce((sum, item) => {
       return sum + calculateItemBaseAmount(item);
     }, 0);
@@ -1846,7 +2248,7 @@ exports.update = async (req, res) => {
     // Create meta object for purchase order with tax type
     const meta = {
       taxType: taxType,
-      orderNumber: payload.orderNumber || "",
+      orderNumber: newGeneratedNumber,
       orderDate: payload.orderDate || payload.date,
       expectedDeliveryDate: payload.expectedDeliveryDate || "",
       discount: payload.discount || { type: "flat", value: 0 },
@@ -1882,31 +2284,46 @@ exports.update = async (req, res) => {
       orderStatus: payload.orderStatus || "draft",
       priority: payload.priority || "medium",
 
-      // Project information (also stored in meta for easy access)
+      // Project information
       projectId: payload.projectId || null,
-      projectName: payload.projectName || null
+      projectName: payload.projectName || null,
+
+      // Invoice number information
+      isManualInvoice: isManualInvoice,
+      invoicePrefix: invoicePrefix,
+      generatedInvoiceNumber: newGeneratedNumber
     };
 
     // Update main order record
     await conn.execute(
       `UPDATE invoices SET 
-        invoiceNumber=?, 
-        date=?, 
-        dueDate=?, 
-        clientId=?, 
-        status=?, 
-        subTotal=?, 
-        tax=?, 
-        discount=?, 
-        total=?, 
-        notes=?, 
-        signature=?, 
-        meta=?, 
-        project_id=?,
-        updatedAt=NOW() 
-      WHERE id=? AND type='purchase_order'`,
+        invoice_prefix = ?,
+        invoice_sequence = ?,
+        invoice_number_generated = ?,
+        is_manual_invoice = ?,
+        original_sequence = ?,
+        invoiceNumber = ?,
+        date = ?, 
+        dueDate = ?, 
+        clientId = ?, 
+        status = ?, 
+        subTotal = ?, 
+        tax = ?, 
+        discount = ?, 
+        total = ?, 
+        notes = ?, 
+        signature = ?, 
+        meta = ?, 
+        project_id = ?,
+        updatedAt = NOW() 
+      WHERE id = ? AND type = 'purchase_order'`,
       [
-        payload.invoiceNumber,
+        invoicePrefix,
+        newInvoiceSequence,
+        newGeneratedNumber,
+        isManualInvoice,
+        originalSequence,
+        sequenceStr,
         formattedDate,
         formattedDueDate,
         payload.clientId,
@@ -1914,11 +2331,11 @@ exports.update = async (req, res) => {
         subtotal,
         totalTax,
         payload.totalDiscountAmount || discountValue,
-        payload.total ?? calculatedTotal, // Use the final rounded total here
+        payload.total ?? finalTotal,
         JSON.stringify(payload.notes || []),
         payload.signature || null,
         JSON.stringify(meta),
-        payload.projectId || null, // Update projectId in the main table
+        payload.projectId || null,
         req.params.id,
       ]
     );
@@ -1934,66 +2351,67 @@ exports.update = async (req, res) => {
 
     // Insert updated items with tax type
     for (const item of payload.items) {
-  const amounts = calculateItemAmounts(item, taxType);
+      const amounts = calculateItemAmounts(item, taxType);
 
-  // Validate if item exists in items table
-  let validItemId = null;
-  if (item.itemId) {
-    try {
-      const [itemCheck] = await conn.execute(
-        "SELECT id FROM items WHERE id = ?",
-        [item.itemId]
-      );
-      if (itemCheck.length > 0) {
-        validItemId = item.itemId;
-      } else {
-        console.warn(`Item with ID ${item.itemId} not found in items table`);
-        // Continue without itemId - it's optional
+      // Validate if item exists in items table
+      let validItemId = null;
+      if (item.itemId) {
+        try {
+          const [itemCheck] = await conn.execute(
+            "SELECT id FROM items WHERE id = ?",
+            [item.itemId]
+          );
+          if (itemCheck.length > 0) {
+            validItemId = item.itemId;
+          } else {
+            console.warn(`Item with ID ${item.itemId} not found in items table`);
+          }
+        } catch (error) {
+          console.error(`Error checking item ${item.itemId}:`, error);
+        }
       }
-    } catch (error) {
-      console.error(`Error checking item ${item.itemId}:`, error);
-      // Continue without itemId
+
+      // Create item meta with tax type
+      const itemMeta = {
+        taxType: taxType,
+        sgst: taxType === 'sgst_cgst' ? (item.sgst || 9) : 0,
+        cgst: taxType === 'sgst_cgst' ? (item.cgst || 9) : 0,
+        igst: taxType === 'igst' ? (item.igst || 18) : 0,
+        sgstAmount: amounts.sgstAmount,
+        cgstAmount: amounts.cgstAmount,
+        igstAmount: amounts.igstAmount,
+        taxableAmount: amounts.taxableAmount
+      };
+
+      await conn.execute(
+        `INSERT INTO invoice_items 
+        (invoiceId, itemId, description, hsn, uom, quantity, rate, discount, tax, taxAmount, amount, meta) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          req.params.id,
+          validItemId,
+          item.description,
+          item.hsn || '',
+          item.uom || '',
+          item.quantity,
+          item.rate,
+          item.discountAmount || 0,
+          item.tax || 0,
+          amounts.taxAmount,
+          amounts.totalAmount,
+          JSON.stringify(itemMeta)
+        ]
+      );
     }
-  }
-
-  // Create item meta with tax type
-  const itemMeta = {
-    taxType: taxType,
-    sgst: taxType === 'sgst_cgst' ? (item.sgst || 9) : 0,
-    cgst: taxType === 'sgst_cgst' ? (item.cgst || 9) : 0,
-    igst: taxType === 'igst' ? (item.igst || 18) : 0,
-    sgstAmount: amounts.sgstAmount,
-    cgstAmount: amounts.cgstAmount,
-    igstAmount: amounts.igstAmount,
-    taxableAmount: amounts.taxableAmount
-  };
-
-  await conn.execute(
-    `INSERT INTO invoice_items 
-    (invoiceId, itemId, description, hsn, uom, quantity, rate, discount, tax, taxAmount, amount, meta) 
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [
-      req.params.id,
-      validItemId, // Use validated itemId or null
-      item.description,
-      item.hsn || '',
-      item.uom || '',
-      item.quantity,
-      item.rate,
-      item.discountAmount || 0,
-      item.tax || 0,
-      amounts.taxAmount,
-      amounts.totalAmount,
-      JSON.stringify(itemMeta)
-    ]
-  );
-}
 
     // Commit transaction FIRST
     await conn.commit();
 
     // THEN log the update action OUTSIDE the transaction
-    let details = `Purchase order ${payload.invoiceNumber} updated`;
+    let details = `Purchase order ${newGeneratedNumber} updated`;
+    if (invoiceNumberChanged) {
+      details += ' - Order number changed';
+    }
     if (Object.keys(changes).length > 0) {
       details += ` - ${Object.keys(changes).join(', ')} changed`;
     }
@@ -2009,19 +2427,31 @@ exports.update = async (req, res) => {
     res.json({ 
       message: "Purchase order updated successfully",
       id: req.params.id,
-      orderNumber: payload.invoiceNumber,
+      orderNumber: newGeneratedNumber,
+      invoiceSequence: newInvoiceSequence,
+      sequenceString: sequenceStr,
+      isManualInvoice: isManualInvoice,
       taxType: taxType,
-      total: payload.total ?? calculatedTotal,
+      total: payload.total ?? finalTotal,
       roundingApplied: payload.roundingApplied || false,
       projectId: payload.projectId || null
     });
   } catch (err) {
     await conn.rollback();
     console.error("Error updating purchase order:", err);
-    res.status(500).json({ 
-      message: "Error updating purchase order", 
-      error: err.message
-    });
+    
+    if (err.code === 'ER_DUP_ENTRY' || err.message.includes('Duplicate entry')) {
+      res.status(400).json({ 
+        message: "Order number already exists. Please use a different number.",
+        error: err.message
+      });
+    } else {
+      res.status(500).json({ 
+        message: "Error updating purchase order", 
+        error: err.message,
+        sql: err.sql
+      });
+    }
   } finally {
     conn.release();
   }
@@ -2045,6 +2475,17 @@ exports.delete = async (req, res) => {
 
     const order = rows[0];
 
+    // LOG THE DELETION ACTION BEFORE DELETING THE INVOICE
+    const logData = {
+      invoiceNumber: order.invoice_number_generated,
+      invoiceSequence: order.invoice_sequence,
+      isManualInvoice: order.is_manual_invoice,
+      total: order.total,
+      client: order.clientId,
+      status: order.status,
+      projectId: order.project_id
+    };
+
     // Delete items first
     await conn.execute("DELETE FROM invoice_items WHERE invoiceId = ?", [req.params.id]);
     
@@ -2061,17 +2502,12 @@ exports.delete = async (req, res) => {
 
     await conn.commit();
 
-    // Log the deletion AFTER successful deletion
+    // Log the deletion
     logPurchaseOrderAction(
       req.params.id,
       'deleted',
-      `Purchase order ${order.invoiceNumber} deleted`,
-      {
-        orderNumber: order.invoiceNumber,
-        total: order.total,
-        supplier: order.clientId,
-        status: order.status
-      },
+      `Purchase order ${logData.invoiceNumber} deleted`,
+      logData,
       req
     );
 
@@ -2169,6 +2605,28 @@ exports.getPurchaseOrderStats = async (req, res) => {
     });
   } catch (err) {
     console.error("Error fetching purchase order stats:", err);
+    res.status(500).json({ message: "Database error" });
+  }
+};
+
+exports.getHistory = async (req, res) => {
+  try {
+    const [logs] = await db.execute(
+      `SELECT * FROM invoice_history 
+       WHERE invoiceId = ? 
+       ORDER BY createdAt DESC`,
+      [req.params.id]
+    );
+
+    // Parse JSON changes field
+    const parsedLogs = logs.map(log => ({
+      ...log,
+      changes: log.changes ? (typeof log.changes === 'string' ? JSON.parse(log.changes) : log.changes) : {}
+    }));
+
+    res.json(parsedLogs);
+  } catch (err) {
+    console.error("Error fetching invoice history:", err);
     res.status(500).json({ message: "Database error" });
   }
 };

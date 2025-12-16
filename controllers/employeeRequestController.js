@@ -52,63 +52,58 @@ class EmployeeRequestController {
 
   // Get overdue records for employee
   async getMyOverdueRecords(req, res) {
-  try {
-    const employeeId = await this.getEmployeeId(req);
-    console.log("Employee ID:", employeeId);
-    
-    if (!employeeId) {
-      return res.status(400).json({
+    try {
+      const employeeId = await this.getEmployeeId(req);
+      console.log("Employee ID:", employeeId);
+      
+      if (!employeeId) {
+        return res.status(400).json({
+          success: false,
+          message: 'Employee ID not found in user data'
+        });
+      }
+
+      // Get overdue records
+      const [overdueRecords] = await db.query(`
+        SELECT 
+          a.id as attendance_id,
+          DATE(a.date) as date,
+          a.status,
+          a.check_in,
+          a.check_out,
+          a.remarks,
+          a.created_at
+        FROM attendance a
+        WHERE a.employee_id = ?
+          AND a.status = 'Absent'
+          AND DATE(a.date) >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)
+          AND DATE(a.date) < CURDATE()
+          AND a.check_out IS NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM employee_requests er 
+            WHERE er.employee_id = ? 
+            AND DATE(er.request_date) = DATE(a.date)
+            AND er.request_type = 'unmark_absent'
+            AND er.status IN ('pending', 'approved')
+          )
+        ORDER BY a.date DESC
+      `, [employeeId, employeeId]);
+
+      res.json({
+        success: true,
+        data: overdueRecords,
+        message: overdueRecords.length > 0 ? 'Overdue records found' : 'No overdue records found'
+      });
+
+    } catch (error) {
+      console.error('Error fetching overdue records:', error);
+      res.status(500).json({
         success: false,
-        message: 'Employee ID not found in user data'
+        message: 'Failed to fetch overdue records',
+        error: error.message
       });
     }
-
-    // Get overdue records
-    const [overdueRecords] = await db.query(`
-      SELECT 
-        a.id as attendance_id,
-        DATE(a.date) as date,
-        a.status,
-        a.check_in,
-        a.check_out,
-        a.remarks,
-        a.created_at
-      FROM attendance a
-      WHERE a.employee_id = ?
-        AND a.status = 'Absent'
-        AND DATE(a.date) < CURDATE()
-        AND a.check_in IS NOT NULL  
-        AND a.check_out IS NULL   
-        AND NOT EXISTS (
-          SELECT 1 FROM employee_requests er 
-          WHERE er.employee_id = ? 
-          AND DATE(er.request_date) = DATE(a.date)
-          AND er.request_type = 'unmark_absent'
-          AND er.status IN ('pending', 'approved')
-        )
-        AND NOT EXISTS (
-          SELECT 1 FROM leaves l
-          WHERE l.employee_id = ?
-            AND DATE(a.date) BETWEEN l.start_date AND l.end_date
-        )
-      ORDER BY a.date DESC
-    `, [employeeId, employeeId, employeeId]);
-
-    res.json({
-      success: true,
-      data: overdueRecords,
-      message: overdueRecords.length > 0 ? 'Overdue records found' : 'No overdue records found'
-    });
-
-  } catch (error) {
-    console.error('Error fetching overdue records:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to fetch overdue records',
-      error: error.message
-    });
   }
-}
 
   // Create unmark absent request
   async createUnmarkAbsentRequest(req, res) {
@@ -192,12 +187,12 @@ class EmployeeRequestController {
         AND status = 'pending'
       `, [employeeId, formattedDate]);
 
-      if (existingRequests.length > 0) {
-        return res.status(400).json({
-          success: false,
-          message: 'Pending request already exists for this date'
-        });
-      }
+      // if (existingRequests.length > 0) {
+      //   return res.status(400).json({
+      //     success: false,
+      //     message: 'Pending request already exists for this date'
+      //   });
+      // }
 
       // Get employee details
       const [employees] = await db.query(`
@@ -250,7 +245,7 @@ class EmployeeRequestController {
     }
   }
 
-  async createNewRequest(req, res) {
+async createNewRequest(req, res) {
   try {
     const employeeId = await this.getEmployeeId(req);
     const { request_type, request_date, reason } = req.body;
@@ -339,17 +334,22 @@ class EmployeeRequestController {
 
     const employee = employees[0];
 
-    // Handle file upload
+    // Handle file upload - Use multer's saved file path
     let documentPath = null;
     if (supporting_document) {
-      // Generate unique filename
-      const fileExtension = supporting_document.originalname.split('.').pop();
-      const fileName = `request_${employeeId}_${Date.now()}.${fileExtension}`;
-      documentPath = `uploads/requests/${fileName}`;
+      const path = require('path');
       
-      // In a real application, you would save the file to your storage system
-      // For now, we'll just store the filename
-      documentPath = fileName;
+      // Extract the relative path from the full path
+      const fullPath = supporting_document.path;
+      const projectRoot = path.join(__dirname, '..', '..');
+      
+     documentPath = `uploads/requests/${supporting_document.filename}`;
+      
+      console.log('File saved as:', {
+        original: fullPath,
+        stored: documentPath,
+        filename: supporting_document.filename
+      });
     }
 
     // Insert request
@@ -372,7 +372,8 @@ class EmployeeRequestController {
         requestId: requestId,
         requestType: request_type,
         requestDate: formattedDate,
-        status: 'pending'
+        status: 'pending',
+        supportingDocument: documentPath
       },
       environment: this.isProduction ? 'production' : 'development/staging'
     });
@@ -382,7 +383,8 @@ class EmployeeRequestController {
     res.status(500).json({
       success: false,
       message: 'Failed to submit request',
-      error: error.message
+      error: error.message,
+      stack: this.isProduction ? null : error.stack
     });
   }
 }
@@ -1227,7 +1229,7 @@ async handleLeaveApproval(connection, request, requestId) {
     // Update existing record
     await connection.query(`
       UPDATE attendance 
-      SET status = 'On Leave',
+      SET status = 'Leave',
           remarks = CONCAT(IFNULL(remarks, ''), ' Leave approved via request #${requestId}'),
           updated_at = NOW()
       WHERE id = ?
@@ -1239,7 +1241,7 @@ async handleLeaveApproval(connection, request, requestId) {
     await connection.query(`
       INSERT INTO attendance 
       (employee_id, date, status, remarks, created_at, updated_at)
-      VALUES (?, ?, 'On Leave', 'Leave approved via request #${requestId}', NOW(), NOW())
+      VALUES (?, ?, 'Leave', 'Leave approved via request #${requestId}', NOW(), NOW())
     `, [request.employee_id, request.request_date]);
     
     console.log(`Created new On Leave attendance record for request #${requestId}`);
@@ -1501,6 +1503,58 @@ async sendDecisionSMSToEmployee(employee, request, status, review_notes, request
       });
     }
   }
+
+  async serveRequestDocument(req, res) {
+  try {
+    const { filename } = req.params;
+    
+    // Construct the file path
+    const fs = require('fs');
+    const path = require('path');
+    
+    // Resolve the file path
+    const filePath = path.join(__dirname, '..', 'uploads', 'requests', filename);
+    
+    // Check if file exists
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({
+        success: false,
+        message: 'Document not found'
+      });
+    }
+    
+    // Set appropriate headers based on file type
+    const ext = path.extname(filename).toLowerCase();
+    let contentType = 'application/octet-stream';
+    
+    if (ext === '.pdf') {
+      contentType = 'application/pdf';
+    } else if (ext === '.jpg' || ext === '.jpeg') {
+      contentType = 'image/jpeg';
+    } else if (ext === '.png') {
+      contentType = 'image/png';
+    } else if (ext === '.doc') {
+      contentType = 'application/msword';
+    } else if (ext === '.docx') {
+      contentType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+    }
+    
+    // Set headers
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Content-Disposition', `inline; filename="${filename}"`);
+    
+    // Send the file
+    res.sendFile(filePath);
+    
+  } catch (error) {
+    console.error('Error serving document:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to serve document',
+      error: error.message
+    });
+  }
+}
 }
 
 // Create instance and export

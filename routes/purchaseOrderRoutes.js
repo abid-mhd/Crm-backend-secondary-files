@@ -38,4 +38,10 @@ router.get('/:id/pdf', purchaseOrderController.getPOPDF);
 router.get('/download/template', purchaseOrderController.downloadTemplate);
 router.post('/associate-pdf', purchaseOrderController.associatePDFWithOrder);
 
+router.get('/next-number/available', purchaseOrderController.getNextPurchaseOrderNumber);
+router.get('/check-number/available', purchaseOrderController.checkPurchaseOrderNumber);
+
+// History routes
+router.get('/:id/history', purchaseOrderController.getHistory);
+
 module.exports = router;

@@ -12,4 +12,10 @@ router.delete('/:id', ctrl.delete);
 
 router.get('/:id/balance', ctrl.balance);
 
+router.get('/next-number/available', ctrl.getNextInvoiceNumber);
+router.get('/check-number/available', ctrl.checkInvoiceNumber);
+
+// History routes
+router.get('/:id/history', ctrl.getHistory);
+
 module.exports = router;

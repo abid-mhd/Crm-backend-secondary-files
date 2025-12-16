@@ -1,7 +1,7 @@
 const db = require('../config/db');
 const NotificationService = require('../services/notificationService');
 
-// Get all leaves for current employee
+// Get all leaves for current employee (including leave_approval requests)
 const getMyLeaves = async (req, res) => {
   try {
     const userId = req.user.id; // From authenticated user
@@ -21,17 +21,95 @@ const getMyLeaves = async (req, res) => {
     
     const employeeId = users[0].employee_id;
     
+    // Query for regular leaves and leave_approval requests
     const [leaves] = await db.query(`
-      SELECT l.*, e.employeeName, e.position, e.department 
+      SELECT 
+        l.id,
+        l.employee_id,
+        e.employeeName,
+        e.position,
+        e.department,
+        l.leave_type,
+        e.employeeName as employee_name,
+        l.leave_reason,
+        l.start_date,
+        l.end_date,
+        l.days,
+        l.status,
+        l.approved_by,
+        l.approved_date,
+        l.created_at,
+        l.updated_at,
+        l.applied_date,
+        'leave' as source_type,
+        NULL as request_id,
+        NULL as admin_remarks
       FROM leaves l 
       LEFT JOIN employees e ON l.employee_id = e.id 
       WHERE l.employee_id = ? 
-      ORDER BY l.created_at DESC
-    `, [employeeId]);
+      
+      UNION ALL
+      
+      SELECT 
+        NULL as id,
+        er.employee_id,
+        e.employeeName,
+        e.position,
+        e.department,
+        'Leave Approval Request' as leave_type,
+        e.employeeName as employee_name,
+        er.reason as leave_reason,
+        er.request_date as start_date,
+        er.request_date as end_date,
+        1 as days,
+        er.status,
+        NULL as approved_by,
+        NULL as approved_date,
+        er.created_at,
+        er.updated_at,
+        er.created_at as applied_date,
+        'employee_request' as source_type,
+        er.id as request_id,
+        er.admin_remarks
+      FROM employee_requests er
+      LEFT JOIN employees e ON er.employee_id = e.id 
+      WHERE er.employee_id = ? 
+      AND er.request_type = 'leave_approval'
+      
+      ORDER BY created_at DESC
+    `, [employeeId, employeeId]);
+    
+    // Process the combined results
+    const processedLeaves = leaves.map(leave => {
+      const result = {
+        id: leave.source_type === 'leave' ? leave.id : `request_${leave.request_id}`,
+        employee_id: leave.employee_id,
+        employeeName: leave.employeeName,
+        position: leave.position,
+        department: leave.department,
+        leave_type: leave.leave_type,
+        employee_name: leave.employee_name,
+        leave_reason: leave.leave_reason,
+        start_date: leave.start_date,
+        end_date: leave.end_date,
+        days: leave.days,
+        status: leave.status,
+        approved_by: leave.approved_by,
+        approved_date: leave.approved_date,
+        created_at: leave.created_at,
+        updated_at: leave.updated_at,
+        applied_date: leave.applied_date,
+        is_leave_request: leave.source_type === 'employee_request',
+        request_id: leave.request_id,
+        admin_remarks: leave.admin_remarks
+      };
+      
+      return result;
+    });
     
     res.json({
       success: true,
-      data: leaves
+      data: processedLeaves
     });
   } catch (error) {
     console.error('Error fetching leaves:', error);
@@ -66,24 +144,6 @@ const getMyLeaveBalance = async (req, res) => {
       'SELECT * FROM leave_balance WHERE employee_id = ?',
       [employeeId]
     );
-    
-    // if (balance.length === 0) {
-    //   // Initialize leave balance if not exists
-    //   const [newBalance] = await db.query(
-    //     'INSERT INTO leave_balance (employee_id) VALUES (?)',
-    //     [employeeId]
-    //   );
-      
-    //   const [createdBalance] = await db.query(
-    //     'SELECT * FROM leave_balance WHERE employee_id = ?',
-    //     [employeeId]
-    //   );
-      
-    //   return res.json({
-    //     success: true,
-    //     data: createdBalance[0]
-    //   });
-    // }
     
     res.json({
       success: true,
@@ -194,40 +254,40 @@ const applyLeave = async (req, res) => {
     
     // Validate leave balance only if employee has configured leave balance
     if (hasLeaveBalance) {
-  const leaveTypeMap = {
-  'Casual Leave': 'casual_leave',
-  'Sick Leave': 'sick_leave',
-  'Permission': 'permission',
-  'Women Special': 'women_special',
-  'Woman Special': 'women_special', // Add this for consistency
-  'Women Special': 'women_special' // Add this for consistency
-};
-  
-  const leaveTypeKey = leaveTypeMap[leaveType];
-  const availableBalance = currentBalance[leaveTypeKey];
-  
-  // Check if the specific leave type has balance configured (not NULL)
-  const hasSpecificBalance = availableBalance !== null && availableBalance !== undefined && availableBalance !== '';
-  
-  if (hasSpecificBalance && availableBalance < daysRequested) {
-    await connection.rollback();
-    return res.status(400).json({
-      success: false,
-      message: `Insufficient ${leaveType} balance. Available: ${availableBalance} days`
-    });
-  }
-} else {
-  // For unlimited leaves (NULL values), apply reasonable limits
-  const maxAllowedDays = 30; // Maximum days allowed per application for unlimited leaves
-  
-  if (daysRequested > maxAllowedDays) {
-    await connection.rollback();
-    return res.status(400).json({
-      success: false,
-      message: `For flexible leave policy, maximum ${maxAllowedDays} days are allowed per application`
-    });
-  }
-}
+      const leaveTypeMap = {
+        'Casual Leave': 'casual_leave',
+        'Sick Leave': 'sick_leave',
+        'Permission': 'permission',
+        'Women Special': 'women_special',
+        'Woman Special': 'women_special', // Add this for consistency
+        'Women Special': 'women_special' // Add this for consistency
+      };
+      
+      const leaveTypeKey = leaveTypeMap[leaveType];
+      const availableBalance = currentBalance[leaveTypeKey];
+      
+      // Check if the specific leave type has balance configured (not NULL)
+      const hasSpecificBalance = availableBalance !== null && availableBalance !== undefined && availableBalance !== '';
+      
+      if (hasSpecificBalance && availableBalance < daysRequested) {
+        await connection.rollback();
+        return res.status(400).json({
+          success: false,
+          message: `Insufficient ${leaveType} balance. Available: ${availableBalance} days`
+        });
+      }
+    } else {
+      // For unlimited leaves (NULL values), apply reasonable limits
+      const maxAllowedDays = 30;
+      
+      if (daysRequested > maxAllowedDays) {
+        await connection.rollback();
+        return res.status(400).json({
+          success: false,
+          message: `For flexible leave policy, maximum ${maxAllowedDays} days are allowed per application`
+        });
+      }
+    }
     
     // Validate permission (only half day) - applies to both limited and unlimited leaves
     if (leaveType === 'Permission' && daysRequested !== 0.5) {
@@ -297,7 +357,6 @@ const applyLeave = async (req, res) => {
     await connection.rollback();
     console.error('Error applying leave:', error);
     
-    // Handle specific database errors
     if (error.code === 'WARN_DATA_TRUNCATED' && error.sqlMessage.includes('leave_type')) {
       return res.status(400).json({
         success: false,
@@ -331,62 +390,118 @@ const updateLeave = async (req, res) => {
       days
     } = req.body;
     
-    // Get employee_id from users table
-    const [users] = await connection.query(
-      'SELECT employee_id FROM users WHERE id = ?',
-      [userId]
-    );
-    
-    if (users.length === 0 || !users[0].employee_id) {
-      await connection.rollback();
-      return res.status(404).json({
-        success: false,
-        message: 'Employee profile not found'
-      });
+    // Check if it's a regular leave or leave_approval request
+    if (id.startsWith('request_')) {
+      const requestId = id.replace('request_', '');
+      
+      // Get employee_id from users table
+      const [users] = await connection.query(
+        'SELECT employee_id FROM users WHERE id = ?',
+        [userId]
+      );
+      
+      if (users.length === 0 || !users[0].employee_id) {
+        await connection.rollback();
+        return res.status(404).json({
+          success: false,
+          message: 'Employee profile not found'
+        });
+      }
+      
+      const employeeId = users[0].employee_id;
+      
+      // Check if leave_approval request exists and belongs to employee
+      const [requests] = await connection.query(
+        'SELECT * FROM employee_requests WHERE id = ? AND employee_id = ? AND request_type = ?',
+        [requestId, employeeId, 'leave_approval']
+      );
+      
+      if (requests.length === 0) {
+        await connection.rollback();
+        return res.status(404).json({
+          success: false,
+          message: 'Leave request not found'
+        });
+      }
+      
+      const existingRequest = requests[0];
+      
+      // Only allow editing if status is 'pending'
+      if (existingRequest.status !== 'pending') {
+        await connection.rollback();
+        return res.status(400).json({
+          success: false,
+          message: 'Cannot edit leave request that is already processed'
+        });
+      }
+      
+      // Update leave_approval request
+      await connection.query(
+        `UPDATE employee_requests 
+         SET request_date = ?, reason = ?, updated_at = NOW()
+         WHERE id = ? AND employee_id = ? AND request_type = ?`,
+        [startDate, leaveReason, requestId, employeeId, 'leave_approval']
+      );
+      
+    } else {
+      // Regular leave update logic (existing code)
+      // Get employee_id from users table
+      const [users] = await connection.query(
+        'SELECT employee_id FROM users WHERE id = ?',
+        [userId]
+      );
+      
+      if (users.length === 0 || !users[0].employee_id) {
+        await connection.rollback();
+        return res.status(404).json({
+          success: false,
+          message: 'Employee profile not found'
+        });
+      }
+      
+      const employeeId = users[0].employee_id;
+      
+      // Check if leave exists and belongs to employee
+      const [leaves] = await connection.query(
+        'SELECT * FROM leaves WHERE id = ? AND employee_id = ?',
+        [id, employeeId]
+      );
+      
+      if (leaves.length === 0) {
+        await connection.rollback();
+        return res.status(404).json({
+          success: false,
+          message: 'Leave application not found'
+        });
+      }
+      
+      const existingLeave = leaves[0];
+      
+      // Only allow editing if status is 'Applied'
+      if (existingLeave.status !== 'Applied') {
+        await connection.rollback();
+        return res.status(400).json({
+          success: false,
+          message: 'Cannot edit leave that is already processed'
+        });
+      }
+      
+      // Update leave application
+      await connection.query(
+        `UPDATE leaves 
+         SET leave_type = ?, leave_reason = ?, start_date = ?, end_date = ?, days = ?, updated_at = NOW()
+         WHERE id = ? AND employee_id = ?`,
+        [
+          leaveType,
+          leaveReason,
+          startDate,
+          endDate || startDate,
+          parseFloat(days),
+          id,
+          employeeId
+        ]
+      );
     }
-    
-    const employeeId = users[0].employee_id;
-    
-    // Check if leave exists and belongs to employee
-    const [leaves] = await connection.query(
-      'SELECT * FROM leaves WHERE id = ? AND employee_id = ?',
-      [id, employeeId]
-    );
-    
-    if (leaves.length === 0) {
-      await connection.rollback();
-      return res.status(404).json({
-        success: false,
-        message: 'Leave application not found'
-      });
-    }
-    
-    const existingLeave = leaves[0];
-    
-    // Only allow editing if status is 'Applied'
-    if (existingLeave.status !== 'Applied') {
-      await connection.rollback();
-      return res.status(400).json({
-        success: false,
-        message: 'Cannot edit leave that is already processed'
-      });
-    }
-    
-    // Update leave application
-    await connection.query(
-      `UPDATE leaves 
-       SET leave_type = ?, leave_reason = ?, start_date = ?, end_date = ?, days = ?, updated_at = NOW()
-       WHERE id = ? AND employee_id = ?`,
-      [
-        leaveType,
-        leaveReason,
-        startDate,
-        endDate || startDate,
-        parseFloat(days),
-        id,
-        employeeId
-      ]
-    );
     
     await connection.commit();
     
@@ -417,52 +532,106 @@ const cancelLeave = async (req, res) => {
     const { id } = req.params;
     const userId = req.user.id;
     
-    // Get employee_id from users table
-    const [users] = await connection.query(
-      'SELECT employee_id FROM users WHERE id = ?',
-      [userId]
-    );
-    
-    if (users.length === 0 || !users[0].employee_id) {
-      await connection.rollback();
-      return res.status(404).json({
-        success: false,
-        message: 'Employee profile not found. Please contact HR.'
-      });
+    // Check if it's a regular leave or leave_approval request
+    if (id.startsWith('request_')) {
+      const requestId = id.replace('request_', '');
+      
+      // Get employee_id from users table
+      const [users] = await connection.query(
+        'SELECT employee_id FROM users WHERE id = ?',
+        [userId]
+      );
+      
+      if (users.length === 0 || !users[0].employee_id) {
+        await connection.rollback();
+        return res.status(404).json({
+          success: false,
+          message: 'Employee profile not found. Please contact HR.'
+        });
+      }
+      
+      const employeeId = users[0].employee_id;
+      
+      // Check if leave_approval request exists and belongs to employee
+      const [requests] = await connection.query(
+        'SELECT * FROM employee_requests WHERE id = ? AND employee_id = ? AND request_type = ?',
+        [requestId, employeeId, 'leave_approval']
+      );
+      
+      if (requests.length === 0) {
+        await connection.rollback();
+        return res.status(404).json({
+          success: false,
+          message: 'Leave request not found'
+        });
+      }
+      
+      const request = requests[0];
+      
+      // Only allow cancellation if status is 'pending'
+      if (request.status !== 'pending') {
+        await connection.rollback();
+        return res.status(400).json({
+          success: false,
+          message: 'Cannot cancel leave request that is already processed'
+        });
+      }
+      
+      // Delete leave_approval request
+      await connection.query(
+        'DELETE FROM employee_requests WHERE id = ? AND employee_id = ? AND request_type = ?',
+        [requestId, employeeId, 'leave_approval']
+      );
+      
+    } else {
+      // Regular leave cancellation logic (existing code)
+      // Get employee_id from users table
+      const [users] = await connection.query(
+        'SELECT employee_id FROM users WHERE id = ?',
+        [userId]
+      );
+      
+      if (users.length === 0 || !users[0].employee_id) {
+        await connection.rollback();
+        return res.status(404).json({
+          success: false,
+          message: 'Employee profile not found. Please contact HR.'
+        });
+      }
+      
+      const employeeId = users[0].employee_id;
+      
+      // Check if leave exists and belongs to employee
+      const [leaves] = await connection.query(
+        'SELECT * FROM leaves WHERE id = ? AND employee_id = ?',
+        [id, employeeId]
+      );
+      
+      if (leaves.length === 0) {
+        await connection.rollback();
+        return res.status(404).json({
+          success: false,
+          message: 'Leave application not found'
+        });
+      }
+      
+      const leave = leaves[0];
+      
+      // Only allow cancellation if status is 'Applied'
+      if (leave.status !== 'Applied') {
+        await connection.rollback();
+        return res.status(400).json({
+          success: false,
+          message: 'Cannot cancel leave that is already processed'
+        });
+      }
+      
+      // Delete leave application
+      await connection.query(
+        'DELETE FROM leaves WHERE id = ? AND employee_id = ?',
+        [id, employeeId]
+      );
     }
-    
-    const employeeId = users[0].employee_id;
-    
-    // Check if leave exists and belongs to employee
-    const [leaves] = await connection.query(
-      'SELECT * FROM leaves WHERE id = ? AND employee_id = ?',
-      [id, employeeId]
-    );
-    
-    if (leaves.length === 0) {
-      await connection.rollback();
-      return res.status(404).json({
-        success: false,
-        message: 'Leave application not found'
-      });
-    }
-    
-    const leave = leaves[0];
-    
-    // Only allow cancellation if status is 'Applied'
-    if (leave.status !== 'Applied') {
-      await connection.rollback();
-      return res.status(400).json({
-        success: false,
-        message: 'Cannot cancel leave that is already processed'
-      });
-    }
-    
-    // Delete leave application
-    await connection.query(
-      'DELETE FROM leaves WHERE id = ? AND employee_id = ?',
-      [id, employeeId]
-    );
     
     await connection.commit();
     
@@ -483,41 +652,157 @@ const cancelLeave = async (req, res) => {
   }
 };
 
-// Admin: Get all leaves (for HR/Admin)
+// Admin: Get all leaves (for HR/Admin) - including leave_approval requests
 const getAllLeaves = async (req, res) => {
   try {
     const { status, page = 1, limit = 10 } = req.query;
     const offset = (page - 1) * limit;
     
-    let query = `
-      SELECT l.*, e.employeeName, e.position, e.department, e.employeeNo 
-      FROM leaves l 
-      LEFT JOIN employees e ON l.employee_id = e.id 
-      WHERE 1=1
-    `;
-    let countQuery = `
-      SELECT COUNT(*) as total 
-      FROM leaves l 
-      LEFT JOIN employees e ON l.employee_id = e.id 
-      WHERE 1=1
-    `;
+    // Build WHERE clause for both leaves and employee_requests
+    let whereClause = 'WHERE 1=1';
     const params = [];
     
     if (status && status !== 'all') {
-      query += ' AND l.status = ?';
-      countQuery += ' AND l.status = ?';
+      whereClause += ' AND status = ?';
       params.push(status);
     }
     
-    query += ' ORDER BY l.created_at DESC LIMIT ? OFFSET ?';
-    params.push(parseInt(limit), parseInt(offset));
+    // Query for regular leaves - selecting specific columns to match second query
+    let leavesQuery = `
+      SELECT 
+        l.id,
+        l.employee_id,
+        e.employeeName,
+        e.position,
+        e.department,
+        e.employeeNo,
+        l.leave_type,
+        l.employee_name,
+        l.leave_reason,
+        l.start_date,
+        l.end_date,
+        l.days,
+        l.status,
+        l.approved_by,
+        l.approved_date,
+        l.created_at,
+        l.updated_at,
+        l.comments,
+        l.applied_date,
+        'leave' as source_type,
+        NULL as request_id,
+        NULL as admin_remarks
+      FROM leaves l 
+      LEFT JOIN employees e ON l.employee_id = e.id 
+      ${whereClause}
+    `;
     
-    const [leaves] = await db.query(query, params);
-    const [totalResult] = await db.query(countQuery, params.slice(0, -2));
+    // Query for leave_approval requests - must match exact same columns
+    let requestsQuery = `
+      SELECT 
+        NULL as id,
+        er.employee_id,
+        e.employeeName,
+        e.position,
+        e.department,
+        e.employeeNo,
+        'Leave Approval Request' as leave_type,
+        e.employeeName as employee_name,
+        er.reason as leave_reason,
+        er.request_date as start_date,
+        er.request_date as end_date,
+        1 as days,
+        er.status,
+        NULL as approved_by,
+        NULL as approved_date,
+        er.created_at,
+        er.updated_at,
+        er.admin_remarks as comments,
+        er.created_at as applied_date,
+        'employee_request' as source_type,
+        er.id as request_id,
+        er.admin_remarks
+      FROM employee_requests er
+      LEFT JOIN employees e ON er.employee_id = e.id 
+      WHERE er.request_type = 'leave_approval'
+    `;
+    
+    // Add status filter for requests if applicable
+    if (status && status !== 'all') {
+      requestsQuery += ' AND er.status = ?';
+      // Note: We'll handle parameters separately
+    }
+    
+    // Combine both queries
+    const combinedQuery = `
+      (${leavesQuery}) 
+      UNION ALL 
+      (${requestsQuery})
+      ORDER BY created_at DESC 
+      LIMIT ? OFFSET ?
+    `;
+    
+    // For count query
+    const countQuery = `
+      SELECT (
+        (SELECT COUNT(*) FROM leaves l WHERE 1=1 ${status && status !== 'all' ? 'AND l.status = ?' : ''}) +
+        (SELECT COUNT(*) FROM employee_requests er 
+         WHERE er.request_type = 'leave_approval' 
+         ${status && status !== 'all' ? 'AND er.status = ?' : ''})
+      ) as total
+    `;
+    
+    // Prepare parameters for the combined query
+    const queryParams = [...params];
+    if (status && status !== 'all') {
+      // Add status parameter for requests query as well
+      queryParams.push(status);
+    }
+    queryParams.push(parseInt(limit), parseInt(offset));
+    
+    // Prepare parameters for count query
+    const countParams = [];
+    if (status && status !== 'all') {
+      countParams.push(status, status);
+    }
+    
+    // Execute queries
+    const [leaves] = await db.query(combinedQuery, queryParams);
+    const [totalResult] = await db.query(countQuery, countParams);
+    
+    // Process the results to add metadata
+    const processedLeaves = leaves.map(leave => {
+      const result = {
+        id: leave.source_type === 'leave' ? leave.id : `request_${leave.request_id}`,
+        employee_id: leave.employee_id,
+        employeeName: leave.employeeName,
+        position: leave.position,
+        department: leave.department,
+        employeeNo: leave.employeeNo,
+        leave_type: leave.leave_type,
+        employee_name: leave.employee_name,
+        leave_reason: leave.leave_reason,
+        start_date: leave.start_date,
+        end_date: leave.end_date,
+        days: leave.days,
+        status: leave.status,
+        approved_by: leave.approved_by,
+        approved_date: leave.approved_date,
+        created_at: leave.created_at,
+        updated_at: leave.updated_at,
+        comments: leave.comments,
+        applied_date: leave.applied_date,
+        is_leave_request: leave.source_type === 'employee_request',
+        request_id: leave.request_id,
+        admin_remarks: leave.admin_remarks
+      };
+      
+      return result;
+    });
     
     res.json({
       success: true,
-      data: leaves,
+      data: processedLeaves,
       pagination: {
         page: parseInt(page),
         limit: parseInt(limit),
@@ -534,7 +819,7 @@ const getAllLeaves = async (req, res) => {
   }
 };
 
-// Admin: Update leave status
+// Admin: Update leave status (handles both regular leaves and leave_approval requests)
 const updateLeaveStatus = async (req, res) => {
   const connection = await db.getConnection();
   
@@ -543,241 +828,296 @@ const updateLeaveStatus = async (req, res) => {
     
     const { id } = req.params;
     const { status, comments } = req.body;
-    const approvedBy = req.user.id; // Admin user ID
+    const approvedBy = req.user.id;
     
-    // Check if leave exists
-    const [leaves] = await connection.query(
-      'SELECT * FROM leaves WHERE id = ?',
-      [id]
-    );
-    
-    if (leaves.length === 0) {
-      await connection.rollback();
-      return res.status(404).json({
-        success: false,
-        message: 'Leave application not found'
-      });
-    }
-    
-    const leave = leaves[0];
-    
-    // ✅ FIXED: Use dates directly without timezone conversion
-    const startDate = new Date(leave.start_date);
-    const endDate = new Date(leave.end_date);
-    
-    // Extract date parts to avoid timezone issues
-    const localStartDate = new Date(startDate.getFullYear(), startDate.getMonth(), startDate.getDate());
-    const localEndDate = new Date(endDate.getFullYear(), endDate.getMonth(), endDate.getDate());
-    
-    console.log('Leave dates (raw from DB):', {
-      start_date: leave.start_date,
-      end_date: leave.end_date,
-      days: leave.days
-    });
-    
-    console.log('Leave dates (processed):', {
-      localStart: localStartDate.toISOString().split('T')[0],
-      localEnd: localEndDate.toISOString().split('T')[0],
-      startDate: startDate.toISOString(),
-      endDate: endDate.toISOString()
-    });
-    
-    // Update leave status
-    await connection.query(
-      `UPDATE leaves 
-       SET status = ?, approved_by = ?, approved_date = NOW(), comments = ?
-       WHERE id = ?`,
-      [status, approvedBy, comments, id]
-    );
-    
-    // If approved, deduct from leave balance AND update attendance records
-    if (status === 'Approved') {
-      // Map leave type to database column name
-      const leaveTypeMap = {
-        'Casual Leave': 'casual_leave',
-        'Sick Leave': 'sick_leave',
-        'Permission': 'permission',
-        'Women Special': 'women_special',
-        'Woman Special': 'women_special',
-        'Women Special': 'women_special'
-      };
+    // Check if it's a regular leave or leave_approval request
+    if (id.startsWith('request_')) {
+      const requestId = id.replace('request_', '');
       
-      const leaveTypeKey = leaveTypeMap[leave.leave_type];
+      // Check if leave_approval request exists
+      const [requests] = await connection.query(
+        `SELECT er.*, e.employeeName 
+         FROM employee_requests er 
+         LEFT JOIN employees e ON er.employee_id = e.id 
+         WHERE er.id = ? AND er.request_type = 'leave_approval'`,
+        [requestId]
+      );
       
-      if (!leaveTypeKey) {
+      if (requests.length === 0) {
         await connection.rollback();
-        return res.status(400).json({
+        return res.status(404).json({
           success: false,
-          message: `Invalid leave type: ${leave.leave_type}. Valid types are: ${Object.keys(leaveTypeMap).join(', ')}`
+          message: 'Leave approval request not found'
         });
       }
       
-      // Check if the employee has a leave balance record
-      const [balanceCheck] = await connection.query(
-        'SELECT * FROM leave_balance WHERE employee_id = ?',
-        [leave.employee_id]
+      const request = requests[0];
+      
+      // Update leave_approval request status
+      await connection.query(
+        `UPDATE employee_requests 
+         SET status = ?, admin_remarks = ?, handled_by = ?, handled_at = NOW(), updated_at = NOW()
+         WHERE id = ?`,
+        [status, comments, approvedBy, requestId]
       );
       
-      if (balanceCheck.length > 0) {
-        const currentBalance = balanceCheck[0];
+      // If approved, also create a corresponding leave record
+      if (status === 'approved') {
+        const leaveType = 'Leave Approval'; // You can customize this or make it configurable
         
-        // Only deduct if the specific leave type has a configured balance (not NULL)
-        if (currentBalance[leaveTypeKey] !== null && currentBalance[leaveTypeKey] !== undefined) {
-          await connection.query(
-            `UPDATE leave_balance 
-             SET ${leaveTypeKey} = ${leaveTypeKey} - ?, 
-                 total_leave = total_leave - ?,
-                 updated_at = NOW()
-             WHERE employee_id = ?`,
-            [leave.days, leave.days, leave.employee_id]
-          );
-        } else {
-          console.log(`No balance configured for ${leave.leave_type}, skipping deduction`);
-        }
-      }
-
-      // ✅ FIXED: Update attendance records without timezone conversion
-      let currentDate = new Date(localStartDate);
-      const finalEndDate = new Date(localEndDate);
-      let dateCount = 0;
-      
-      console.log('Processing attendance for dates:');
-      
-      while (currentDate <= finalEndDate) {
-        // Format date as YYYY-MM-DD without timezone conversion
-        const year = currentDate.getFullYear();
-        const month = String(currentDate.getMonth() + 1).padStart(2, '0');
-        const day = String(currentDate.getDate()).padStart(2, '0');
+        // Insert leave record
+        const [leaveResult] = await connection.query(
+          `INSERT INTO leaves 
+          (employee_id, employee_name, leave_type, leave_reason, start_date, end_date, days, status, approved_by, approved_date, comments) 
+          VALUES (?, ?, ?, ?, ?, ?, 1, 'Approved', ?, NOW(), ?)`,
+          [
+            request.employee_id,
+            request.employeeName,
+            leaveType,
+            request.reason,
+            request.request_date,
+            request.request_date,
+            approvedBy,
+            comments || 'Approved via leave approval request'
+          ]
+        );
+        
+        // Also update attendance records
+        const requestDate = new Date(request.request_date);
+        const year = requestDate.getFullYear();
+        const month = String(requestDate.getMonth() + 1).padStart(2, '0');
+        const day = String(requestDate.getDate()).padStart(2, '0');
         const formattedDate = `${year}-${month}-${day}`;
         
-        console.log(`- Processing date: ${formattedDate}`);
-        
-        // Check if attendance record already exists for this date
+        // Check if attendance record exists
         const [existingAttendance] = await connection.query(
-          'SELECT id, status, remarks FROM attendance WHERE employee_id = ? AND date = ?',
-          [leave.employee_id, formattedDate]
+          'SELECT id FROM attendance WHERE employee_id = ? AND date = ?',
+          [request.employee_id, formattedDate]
         );
         
         if (existingAttendance.length > 0) {
-          // Update existing attendance record
-          const existingRecord = existingAttendance[0];
-          const newRemarks = existingRecord.remarks 
-            ? `${existingRecord.remarks} | Leave Approved: ${leave.leave_type}`
-            : `Leave Approved: ${leave.leave_type}`;
-          
+          // Update existing attendance
           await connection.query(
             `UPDATE attendance 
-             SET status = 'Paid Leave', 
-                 remarks = ?,
+             SET status = 'Leave', 
+                 remarks = CONCAT(COALESCE(remarks, ''), ' | Leave Approved: ${leaveType}'),
                  updated_at = NOW()
              WHERE employee_id = ? AND date = ?`,
-            [newRemarks, leave.employee_id, formattedDate]
+            [request.employee_id, formattedDate]
           );
-          
-          console.log(`  Updated existing attendance record for ${formattedDate}`);
         } else {
-          // Insert new attendance record for the specific leave date
+          // Create new attendance record
           await connection.query(
             `INSERT INTO attendance 
              (employee_id, date, status, remarks, created_at, updated_at) 
-             VALUES (?, ?, 'Paid Leave', 'Leave Approved: ${leave.leave_type}', NOW(), NOW())`,
-            [leave.employee_id, formattedDate]
+             VALUES (?, ?, 'Leave', 'Leave Approved: ${leaveType}', NOW(), NOW())`,
+            [request.employee_id, formattedDate]
           );
-          
-          console.log(`  Created new attendance record for ${formattedDate}`);
         }
-        
-        dateCount++;
-        currentDate.setDate(currentDate.getDate() + 1);
       }
       
-      console.log(`Successfully updated ${dateCount} attendance records for ${leave.leave_type}`);
-    }
-    
-    // If rejected and was previously approved, restore balance
-    if (status === 'Rejected' && leave.status === 'Approved') {
-      // Map leave type to database column name
-      const leaveTypeMap = {
-        'Casual Leave': 'casual_leave',
-        'Sick Leave': 'sick_leave',
-        'Permission': 'permission',
-        'Women Special': 'women_special',
-        'Woman Special': 'women_special',
-        'Women Special': 'women_special'
-      };
+    } else {
+      // Regular leave status update (existing code)
+      // Check if leave exists
+      const [leaves] = await connection.query(
+        'SELECT * FROM leaves WHERE id = ?',
+        [id]
+      );
       
-      const leaveTypeKey = leaveTypeMap[leave.leave_type];
-      
-      if (!leaveTypeKey) {
+      if (leaves.length === 0) {
         await connection.rollback();
-        return res.status(400).json({
+        return res.status(404).json({
           success: false,
-          message: `Invalid leave type: ${leave.leave_type}. Valid types are: ${Object.keys(leaveTypeMap).join(', ')}`
+          message: 'Leave application not found'
         });
       }
       
-      // Check if the employee has a leave balance record
-      const [balanceCheck] = await connection.query(
-        'SELECT * FROM leave_balance WHERE employee_id = ?',
-        [leave.employee_id]
+      const leave = leaves[0];
+      
+      // Use dates directly without timezone conversion
+      const startDate = new Date(leave.start_date);
+      const endDate = new Date(leave.end_date);
+      
+      // Extract date parts to avoid timezone issues
+      const localStartDate = new Date(startDate.getFullYear(), startDate.getMonth(), startDate.getDate());
+      const localEndDate = new Date(endDate.getFullYear(), endDate.getMonth(), endDate.getDate());
+      
+      // Update leave status
+      await connection.query(
+        `UPDATE leaves 
+         SET status = ?, approved_by = ?, approved_date = NOW(), comments = ?
+         WHERE id = ?`,
+        [status, approvedBy, comments, id]
       );
       
-      if (balanceCheck.length > 0) {
-        const currentBalance = balanceCheck[0];
+      // If approved, deduct from leave balance AND update attendance records
+      if (status === 'Approved') {
+        // Map leave type to database column name
+        const leaveTypeMap = {
+          'Casual Leave': 'casual_leave',
+          'Sick Leave': 'sick_leave',
+          'Permission': 'permission',
+          'Women Special': 'women_special',
+          'Woman Special': 'women_special',
+          'Women Special': 'women_special'
+        };
         
-        // Only restore if the specific leave type has a configured balance (not NULL)
-        if (currentBalance[leaveTypeKey] !== null && currentBalance[leaveTypeKey] !== undefined) {
-          await connection.query(
-            `UPDATE leave_balance 
-             SET ${leaveTypeKey} = ${leaveTypeKey} + ?, 
-                 total_leave = total_leave + ?,
-                 updated_at = NOW()
-             WHERE employee_id = ?`,
-            [leave.days, leave.days, leave.employee_id]
-          );
-        } else {
-          console.log(`No balance configured for ${leave.leave_type}, skipping restoration`);
+        const leaveTypeKey = leaveTypeMap[leave.leave_type];
+        
+        if (!leaveTypeKey) {
+          await connection.rollback();
+          return res.status(400).json({
+            success: false,
+            message: `Invalid leave type: ${leave.leave_type}. Valid types are: ${Object.keys(leaveTypeMap).join(', ')}`
+          });
         }
-      }
-
-      // ✅ FIXED: Remove Paid Leave attendance records without timezone conversion
-      let currentDate = new Date(localStartDate);
-      const finalEndDate = new Date(localEndDate);
-      let removedCount = 0;
-      
-      while (currentDate <= finalEndDate) {
-        // Format date as YYYY-MM-DD without timezone conversion
-        const year = currentDate.getFullYear();
-        const month = String(currentDate.getMonth() + 1).padStart(2, '0');
-        const day = String(currentDate.getDate()).padStart(2, '0');
-        const formattedDate = `${year}-${month}-${day}`;
         
-        // Check if attendance record exists and was marked as Paid Leave for this leave
-        const [existingAttendance] = await connection.query(
-          `SELECT id FROM attendance 
-           WHERE employee_id = ? AND date = ? AND status = 'Paid Leave' 
-           AND remarks LIKE ?`,
-          [leave.employee_id, formattedDate, `%Leave Approved: ${leave.leave_type}%`]
+        // Check if the employee has a leave balance record
+        const [balanceCheck] = await connection.query(
+          'SELECT * FROM leave_balance WHERE employee_id = ?',
+          [leave.employee_id]
         );
         
-        if (existingAttendance.length > 0) {
-          // Delete the attendance record created for this leave
-          await connection.query(
-            'DELETE FROM attendance WHERE employee_id = ? AND date = ? AND status = "Paid Leave" AND remarks LIKE ?',
-            [leave.employee_id, formattedDate, `%Leave Approved: ${leave.leave_type}%`]
-          );
-          removedCount++;
-          console.log(`Removed attendance record for ${formattedDate}`);
+        if (balanceCheck.length > 0) {
+          const currentBalance = balanceCheck[0];
+          
+          // Only deduct if the specific leave type has a configured balance (not NULL)
+          if (currentBalance[leaveTypeKey] !== null && currentBalance[leaveTypeKey] !== undefined) {
+            await connection.query(
+              `UPDATE leave_balance 
+               SET ${leaveTypeKey} = ${leaveTypeKey} - ?, 
+                   total_leave = total_leave - ?,
+                   updated_at = NOW()
+               WHERE employee_id = ?`,
+              [leave.days, leave.days, leave.employee_id]
+            );
+          }
         }
+
+        // Update attendance records
+        let currentDate = new Date(localStartDate);
+        const finalEndDate = new Date(localEndDate);
         
-        currentDate.setDate(currentDate.getDate() + 1);
+        while (currentDate <= finalEndDate) {
+          // Format date as YYYY-MM-DD
+          const year = currentDate.getFullYear();
+          const month = String(currentDate.getMonth() + 1).padStart(2, '0');
+          const day = String(currentDate.getDate()).padStart(2, '0');
+          const formattedDate = `${year}-${month}-${day}`;
+          
+          // Check if attendance record already exists
+          const [existingAttendance] = await connection.query(
+            'SELECT id, status, remarks FROM attendance WHERE employee_id = ? AND date = ?',
+            [leave.employee_id, formattedDate]
+          );
+          
+          if (existingAttendance.length > 0) {
+            // Update existing attendance record
+            const existingRecord = existingAttendance[0];
+            const newRemarks = existingRecord.remarks 
+              ? `${existingRecord.remarks} | Leave Approved: ${leave.leave_type}`
+              : `Leave Approved: ${leave.leave_type}`;
+            
+            await connection.query(
+              `UPDATE attendance 
+               SET status = 'Leave', 
+                   remarks = ?,
+                   updated_at = NOW()
+               WHERE employee_id = ? AND date = ?`,
+              [newRemarks, leave.employee_id, formattedDate]
+            );
+          } else {
+            // Insert new attendance record
+            await connection.query(
+              `INSERT INTO attendance 
+               (employee_id, date, status, remarks, created_at, updated_at) 
+               VALUES (?, ?, 'Leave', 'Leave Approved: ${leave.leave_type}', NOW(), NOW())`,
+              [leave.employee_id, formattedDate]
+            );
+          }
+          
+          currentDate.setDate(currentDate.getDate() + 1);
+        }
       }
       
-      console.log(`Removed ${removedCount} Paid Leave attendance records for rejected leave`);
-    }
+      // If rejected and was previously approved, restore balance
+      if (status === 'Rejected' && leave.status === 'Approved') {
+        // Map leave type to database column name
+        const leaveTypeMap = {
+          'Casual Leave': 'casual_leave',
+          'Sick Leave': 'sick_leave',
+          'Permission': 'permission',
+          'Women Special': 'women_special',
+          'Woman Special': 'women_special',
+          'Women Special': 'women_special'
+        };
+        
+        const leaveTypeKey = leaveTypeMap[leave.leave_type];
+        
+        if (!leaveTypeKey) {
+          await connection.rollback();
+          return res.status(400).json({
+            success: false,
+            message: `Invalid leave type: ${leave.leave_type}. Valid types are: ${Object.keys(leaveTypeMap).join(', ')}`
+          });
+        }
+        
+        // Check if the employee has a leave balance record
+        const [balanceCheck] = await connection.query(
+          'SELECT * FROM leave_balance WHERE employee_id = ?',
+          [leave.employee_id]
+        );
+        
+        if (balanceCheck.length > 0) {
+          const currentBalance = balanceCheck[0];
+          
+          // Only restore if the specific leave type has a configured balance (not NULL)
+          if (currentBalance[leaveTypeKey] !== null && currentBalance[leaveTypeKey] !== undefined) {
+            await connection.query(
+              `UPDATE leave_balance 
+               SET ${leaveTypeKey} = ${leaveTypeKey} + ?, 
+                   total_leave = total_leave + ?,
+                   updated_at = NOW()
+               WHERE employee_id = ?`,
+              [leave.days, leave.days, leave.employee_id]
+            );
+          }
+        }
 
-    // Send notification to the employee about leave status update
-    await sendLeaveStatusNotification(leave, status, comments, approvedBy);
+        // Remove Leave attendance records
+        let currentDate = new Date(localStartDate);
+        const finalEndDate = new Date(localEndDate);
+        
+        while (currentDate <= finalEndDate) {
+          // Format date as YYYY-MM-DD
+          const year = currentDate.getFullYear();
+          const month = String(currentDate.getMonth() + 1).padStart(2, '0');
+          const day = String(currentDate.getDate()).padStart(2, '0');
+          const formattedDate = `${year}-${month}-${day}`;
+          
+          // Check if attendance record exists and was marked as Leave for this leave
+          const [existingAttendance] = await connection.query(
+            `SELECT id FROM attendance 
+             WHERE employee_id = ? AND date = ? AND status = 'Leave' 
+             AND remarks LIKE ?`,
+            [leave.employee_id, formattedDate, `%Leave Approved: ${leave.leave_type}%`]
+          );
+          
+          if (existingAttendance.length > 0) {
+            // Delete the attendance record
+            await connection.query(
+              'DELETE FROM attendance WHERE employee_id = ? AND date = ? AND status = "Leave" AND remarks LIKE ?',
+              [leave.employee_id, formattedDate, `%Leave Approved: ${leave.leave_type}%`]
+            );
+          }
+          
+          currentDate.setDate(currentDate.getDate() + 1);
+        }
+      }
+
+      // Send notification to the employee about leave status update
+      await sendLeaveStatusNotification(leave, status, comments, approvedBy);
+    }
     
     await connection.commit();
     
@@ -789,14 +1129,6 @@ const updateLeaveStatus = async (req, res) => {
   } catch (error) {
     await connection.rollback();
     console.error('Error updating leave status:', error);
-    
-    // More detailed error logging
-    console.error('Error details:', {
-      message: error.message,
-      code: error.code,
-      sql: error.sql,
-      sqlMessage: error.sqlMessage
-    });
     
     res.status(500).json({
       success: false,
@@ -838,22 +1170,25 @@ const sendLeaveStatusNotification = async (leave, status, comments, approvedBy) 
     
     switch (status) {
       case 'Approved':
+      case 'approved':
         title = 'Leave Application Approved';
-        message = `Your ${leave.leave_type} leave application for ${leave.days} day(s) has been approved`;
+        message = `Your ${leave.leave_type} leave application for ${leave.days || 1} day(s) has been approved`;
         if (comments) {
           message += `. Comments: ${comments}`;
         }
         break;
         
       case 'Rejected':
+      case 'rejected':
         title = 'Leave Application Rejected';
-        message = `Your ${leave.leave_type} leave application for ${leave.days} day(s) has been rejected`;
+        message = `Your ${leave.leave_type} leave application for ${leave.days || 1} day(s) has been rejected`;
         if (comments) {
           message += `. Reason: ${comments}`;
         }
         break;
         
       case 'Pending':
+      case 'pending':
         title = 'Leave Application Updated';
         message = `Your ${leave.leave_type} leave application status has been updated to pending`;
         if (comments) {
@@ -886,7 +1221,6 @@ const sendLeaveStatusNotification = async (leave, status, comments, approvedBy) 
     
   } catch (error) {
     console.error('Error sending leave status notification:', error);
-    // Don't throw error here to avoid affecting the main transaction
   }
 };
 
@@ -915,32 +1249,61 @@ const getLeaveStatistics = async (req, res) => {
     const currentMonth = currentDate.getMonth() + 1;
     const currentYear = currentDate.getFullYear();
     
-    // Monthly leaves count
+    // Monthly leaves count (including leave_approval requests)
     const [monthlyLeaves] = await db.query(
       `SELECT COUNT(*) as count 
-       FROM leaves 
-       WHERE employee_id = ? 
-       AND MONTH(start_date) = ? 
-       AND YEAR(start_date) = ?`,
-      [employeeId, currentMonth, currentYear]
+       FROM (
+         SELECT start_date FROM leaves WHERE employee_id = ? 
+         UNION ALL
+         SELECT request_date FROM employee_requests 
+         WHERE employee_id = ? AND request_type = 'leave_approval'
+       ) as all_leaves
+       WHERE MONTH(start_date) = ? AND YEAR(start_date) = ?`,
+      [employeeId, employeeId, currentMonth, currentYear]
     );
     
-    // Leaves by status
+    // Leaves by status (including leave_approval requests)
     const [leavesByStatus] = await db.query(
       `SELECT status, COUNT(*) as count 
-       FROM leaves 
-       WHERE employee_id = ? 
+       FROM (
+         SELECT status FROM leaves WHERE employee_id = ? 
+         UNION ALL
+         SELECT status FROM employee_requests 
+         WHERE employee_id = ? AND request_type = 'leave_approval'
+       ) as all_leaves
        GROUP BY status`,
-      [employeeId]
+      [employeeId, employeeId]
     );
     
-    // Recent leaves
+    // Recent leaves (including leave_approval requests)
     const [recentLeaves] = await db.query(
-      `SELECT * FROM leaves 
+      `SELECT 
+         'leave' as type,
+         id,
+         leave_type,
+         start_date,
+         days,
+         status,
+         created_at
+       FROM leaves 
        WHERE employee_id = ? 
+       
+       UNION ALL
+       
+       SELECT 
+         'leave_approval_request' as type,
+         id,
+         'Leave Approval Request' as leave_type,
+         request_date as start_date,
+         1 as days,
+         status,
+         created_at
+       FROM employee_requests 
+       WHERE employee_id = ? AND request_type = 'leave_approval'
+       
        ORDER BY created_at DESC 
        LIMIT 5`,
-      [employeeId]
+      [employeeId, employeeId]
     );
     
     res.json({
@@ -1075,7 +1438,6 @@ const getExistingLeaveBalance = async (req, res) => {
   }
 };
 
-// Add this function to your leaveController.js
 const clearLeaveBalanceForAll = async (req, res) => {
   const connection = await db.getConnection();
   
