@@ -132,21 +132,37 @@ const handleSignature = (signatureData) => {
 // Helper to get next sequence number for project
 const getNextSequence = async (conn, projectId = null, prefix = 'ICE/25-26/INV/', invoiceType = 'sales') => {
   try {
-    // Lock the row to prevent race conditions
+    // First, try to lock the existing row
     const [existing] = await conn.execute(
-      'SELECT * FROM invoice_sequences WHERE project_id = ? AND prefix = ? AND invoice_type = ? FOR UPDATE',
+      'SELECT * FROM invoice_sequences WHERE project_id <=> ? AND prefix = ? AND invoice_type = ? FOR UPDATE',
       [projectId, prefix, invoiceType]
     );
     
     if (existing.length === 0) {
-      // Create new sequence for this project
-      await conn.execute(
-        'INSERT INTO invoice_sequences (project_id, prefix, invoice_type, last_sequence) VALUES (?, ?, ?, 0)',
-        [projectId, prefix, invoiceType, 0]
-      );
-      return 1;
+      // No existing sequence - create a new one
+      try {
+        await conn.execute(
+          'INSERT INTO invoice_sequences (project_id, prefix, invoice_type, last_sequence) VALUES (?, ?, ?, 0)',
+          [projectId, prefix, invoiceType]
+        );
+        console.log(`Created new sequence for project ${projectId}, prefix ${prefix}`);
+        return 1;
+      } catch (insertErr) {
+        // If insert fails due to duplicate, try to fetch again
+        if (insertErr.code === 'ER_DUP_ENTRY' || insertErr.errno === 1062) {
+          const [retry] = await conn.execute(
+            'SELECT * FROM invoice_sequences WHERE project_id <=> ? AND prefix = ? AND invoice_type = ? FOR UPDATE',
+            [projectId, prefix, invoiceType]
+          );
+          if (retry.length > 0) {
+            return retry[0].last_sequence + 1;
+          }
+        }
+        throw insertErr;
+      }
     }
     
+    // Existing sequence found
     const nextSequence = existing[0].last_sequence + 1;
     return nextSequence;
   } catch (error) {
@@ -700,6 +716,7 @@ exports.checkInvoiceNumber = async (req, res) => {
 };
 
 // Create SALES invoice - FIXED
+// Create SALES invoice - FIXED
 exports.create = async (req, res) => {
   const payload = req.body;
   const conn = await db.getConnection();
@@ -931,49 +948,102 @@ exports.create = async (req, res) => {
       
       // Update sequence tracker if needed (only for numeric sequences)
       if (parsed.sequence && !isNaN(parsed.sequence)) {
-        // Get or create sequence record for this project+prefix
-        const [existing] = await conn.execute(
-          'SELECT * FROM invoice_sequences WHERE project_id <=> ? AND prefix = ? AND invoice_type = ? FOR UPDATE',
-          [validatedProjectId, invoicePrefix, 'sales']
-        );
-        
-        if (existing.length === 0) {
-          // Create new sequence
+        // Use INSERT ... ON DUPLICATE KEY UPDATE to avoid race conditions
+        try {
           await conn.execute(
-            'INSERT INTO invoice_sequences (project_id, prefix, invoice_type, last_sequence) VALUES (?, ?, ?, ?)',
+            `INSERT INTO invoice_sequences (project_id, prefix, invoice_type, last_sequence) 
+             VALUES (?, ?, ?, ?) 
+             ON DUPLICATE KEY UPDATE last_sequence = GREATEST(last_sequence, VALUES(last_sequence))`,
             [validatedProjectId, invoicePrefix, 'sales', parsed.sequence]
           );
-        } else if (parsed.sequence > existing[0].last_sequence) {
-          // Update sequence if manual number is higher
-          await conn.execute(
-            'UPDATE invoice_sequences SET last_sequence = ? WHERE project_id <=> ? AND prefix = ? AND invoice_type = ?',
-            [parsed.sequence, validatedProjectId, invoicePrefix, 'sales']
-          );
+        } catch (seqErr) {
+          console.warn('Error updating sequence for manual number:', seqErr);
+          // Continue even if sequence update fails for manual numbers
         }
       }
     } else {
       // Auto-generate invoice number
       console.log("Auto-generating invoice number for project:", validatedProjectId);
       
-      // Get next sequence number
-      const [existing] = await conn.execute(
-        'SELECT * FROM invoice_sequences WHERE project_id <=> ? AND prefix = ? AND invoice_type = ? FOR UPDATE',
-        [validatedProjectId, invoicePrefix, 'sales']
-      );
-      
-      if (existing.length === 0) {
-        // Create new sequence for this project/prefix
-        invoiceSequence = 1;
+      // FIXED: Use INSERT ... ON DUPLICATE KEY UPDATE to handle race conditions
+      try {
+        // First ensure the sequence record exists with last_sequence = 0
         await conn.execute(
-          'INSERT INTO invoice_sequences (project_id, prefix, invoice_type, last_sequence) VALUES (?, ?, ?, ?)',
-          [validatedProjectId, invoicePrefix, 'sales', 1]
+          `INSERT INTO invoice_sequences (project_id, prefix, invoice_type, last_sequence) 
+           VALUES (?, ?, ?, 0) 
+           ON DUPLICATE KEY UPDATE project_id = project_id`,
+          [validatedProjectId, invoicePrefix, 'sales']
         );
-      } else {
-        invoiceSequence = existing[0].last_sequence + 1;
-        await conn.execute(
-          'UPDATE invoice_sequences SET last_sequence = ? WHERE project_id <=> ? AND prefix = ? AND invoice_type = ?',
-          [invoiceSequence, validatedProjectId, invoicePrefix, 'sales']
+        
+        // Now lock and increment
+        const [existing] = await conn.execute(
+          'SELECT last_sequence FROM invoice_sequences WHERE project_id <=> ? AND prefix = ? AND invoice_type = ? FOR UPDATE',
+          [validatedProjectId, invoicePrefix, 'sales']
         );
+        
+        if (existing.length === 0) {
+          // Should not happen after the INSERT
+          invoiceSequence = 1;
+          await conn.execute(
+            'INSERT INTO invoice_sequences (project_id, prefix, invoice_type, last_sequence) VALUES (?, ?, ?, ?)',
+            [validatedProjectId, invoicePrefix, 'sales', 1]
+          );
+        } else {
+          invoiceSequence = existing[0].last_sequence + 1;
+          await conn.execute(
+            'UPDATE invoice_sequences SET last_sequence = ? WHERE project_id <=> ? AND prefix = ? AND invoice_type = ?',
+            [invoiceSequence, validatedProjectId, invoicePrefix, 'sales']
+          );
+        }
+      } catch (seqErr) {
+        // Fallback: try to get the next sequence with a simpler approach
+        console.warn('Sequence handling error, using fallback:', seqErr);
+        
+        if (seqErr.code === 'ER_DUP_ENTRY' || seqErr.errno === 1062) {
+          // Duplicate entry error - sequence already exists
+          const [existing] = await conn.execute(
+            'SELECT last_sequence FROM invoice_sequences WHERE project_id <=> ? AND prefix = ? AND invoice_type = ? FOR UPDATE',
+            [validatedProjectId, invoicePrefix, 'sales']
+          );
+          
+          if (existing.length > 0) {
+            invoiceSequence = existing[0].last_sequence + 1;
+            await conn.execute(
+              'UPDATE invoice_sequences SET last_sequence = ? WHERE project_id <=> ? AND prefix = ? AND invoice_type = ?',
+              [invoiceSequence, validatedProjectId, invoicePrefix, 'sales']
+            );
+          } else {
+            // Try to get max sequence from existing invoices
+            let query = `
+              SELECT MAX(invoice_sequence) as max_sequence 
+              FROM invoices 
+              WHERE invoice_prefix = ? 
+                AND type = 'sales'
+                AND project_id <=> ?
+            `;
+            
+            const [invoices] = await conn.execute(query, [invoicePrefix, validatedProjectId]);
+            
+            if (invoices[0].max_sequence) {
+              invoiceSequence = invoices[0].max_sequence + 1;
+            } else {
+              invoiceSequence = 1;
+            }
+            
+            // Try to insert the sequence record one more time
+            try {
+              await conn.execute(
+                'INSERT INTO invoice_sequences (project_id, prefix, invoice_type, last_sequence) VALUES (?, ?, ?, ?)',
+                [validatedProjectId, invoicePrefix, 'sales', invoiceSequence]
+              );
+            } catch (insertErr) {
+              // If still duplicate, just use the sequence we calculated
+              console.warn('Could not insert sequence record, using calculated sequence:', insertErr);
+            }
+          }
+        } else {
+          throw seqErr;
+        }
       }
       
       // Generate the full invoice number with padding
@@ -1209,9 +1279,15 @@ exports.create = async (req, res) => {
     
     // Handle duplicate invoice number error
     if (err.code === 'ER_DUP_ENTRY' || err.message.includes('Duplicate entry')) {
-      res.status(400).json({ 
-        message: "Invoice number already exists. Please use a different number."
-      });
+      if (err.message.includes('invoice_sequences.unique_project_prefix')) {
+        res.status(400).json({ 
+          message: "Invoice sequence already exists for this project and prefix. Please try again."
+        });
+      } else {
+        res.status(400).json({ 
+          message: "Invoice number already exists. Please use a different number."
+        });
+      }
     } else if (err.message && err.message.includes('exceeds project budget')) {
       res.status(400).json({ 
         message: err.message,
@@ -1222,7 +1298,8 @@ exports.create = async (req, res) => {
     } else {
       res.status(500).json({ 
         message: "Error creating sales invoice", 
-        error: err.message 
+        error: err.message,
+        stack: process.env.NODE_ENV === 'development' ? err.stack : undefined
       });
     }
   } finally {
