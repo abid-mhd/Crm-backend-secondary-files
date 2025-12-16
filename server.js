@@ -202,6 +202,7 @@ const boqRoutes = require('./routes/boqRoutes');
 const vendorPoRoutes = require("./routes/vendorPoRoutes");
 const cronRoutes = require('./routes/cronRoutes');
 const cronScheduler = require('./cron/scheduler'); 
+const templateRoutes = require('./routes/templateRoutes'); 
 
 app.use("/api/employees", employeeRoutes);
 app.use("/api/billing", billingRoutes);
@@ -232,6 +233,7 @@ app.use('/api/ewaybills', ewayBillRoutes);
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.use('/api/boq', boqRoutes);
 app.use("/api/vendor-pos", vendorPoRoutes);
+app.use("/api/templates", templateRoutes);
 app.use('/api', cronRoutes);
 cronScheduler.startScheduler();
 
