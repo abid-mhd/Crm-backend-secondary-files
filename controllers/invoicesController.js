@@ -163,6 +163,7 @@ const updateSequence = async (conn, projectId = null, prefix = 'ICE/25-26/INV/',
   );
 };
 
+// FIXED: Better project ID handling and NULL comparison
 const validateInvoiceNumber = async (conn, invoiceNumber, projectId = null, excludeId = null) => {
   try {
     console.log('Validating invoice number:', {
@@ -170,9 +171,12 @@ const validateInvoiceNumber = async (conn, invoiceNumber, projectId = null, excl
       projectId,
       excludeId,
       projectIdType: typeof projectId,
-      projectIdValue: projectId
+      projectIdValue: projectId,
+      isNull: projectId === null,
+      isUndefined: projectId === undefined
     });
     
+    // Build query with proper NULL handling
     let query = `
       SELECT COUNT(*) as count 
       FROM invoices 
@@ -182,10 +186,11 @@ const validateInvoiceNumber = async (conn, invoiceNumber, projectId = null, excl
     
     const params = [invoiceNumber];
     
-    // CRITICAL FIX: Handle null projectId properly
-    if (projectId === null) {
+    // CRITICAL FIX: Handle project_id properly for both NULL and actual values
+    if (projectId === null || projectId === undefined || projectId === 'null' || projectId === 'undefined') {
       // Check for invoices without project (project_id IS NULL)
-      query += ' AND project_id IS NULL';
+      query += ' AND (project_id IS NULL OR project_id = ?)';
+      params.push(null);
     } else {
       // Check for invoices with specific project
       query += ' AND project_id = ?';
@@ -212,65 +217,6 @@ const validateInvoiceNumber = async (conn, invoiceNumber, projectId = null, excl
   } catch (error) {
     console.error('Error validating invoice number:', error);
     throw error;
-  }
-};
-
-// Update the checkInvoiceNumber API endpoint
-exports.checkInvoiceNumber = async (req, res) => {
-  const conn = await db.getConnection();
-  
-  try {
-    const { invoiceNumber, projectId } = req.query;
-    
-    if (!invoiceNumber) {
-      return res.status(400).json({ 
-        success: false,
-        message: 'Invoice number is required' 
-      });
-    }
-    
-    // Convert projectId to proper type
-    let parsedProjectId = null;
-    if (projectId !== undefined && projectId !== null && projectId !== '') {
-      if (projectId === 'null' || projectId === 'undefined') {
-        parsedProjectId = null;
-      } else {
-        parsedProjectId = parseInt(projectId);
-        if (isNaN(parsedProjectId)) {
-          parsedProjectId = null;
-        }
-      }
-    }
-    
-    console.log('Checking invoice number:', {
-      invoiceNumber,
-      projectId,
-      parsedProjectId
-    });
-    
-    // Check if the number already exists
-    const isValid = await validateInvoiceNumber(
-      conn,
-      invoiceNumber,
-      parsedProjectId, // Send null for no project
-      null
-    );
-    
-    conn.release();
-    
-    res.json({
-      success: true,
-      available: isValid,
-      invoiceNumber,
-      projectId: parsedProjectId
-    });
-  } catch (error) {
-    if (conn) conn.release();
-    console.error('Error checking invoice number:', error);
-    res.status(500).json({ 
-      success: false,
-      message: 'Database error' 
-    });
   }
 };
 
@@ -304,6 +250,20 @@ const parseInvoiceNumber = (fullNumber, defaultPrefix = 'ICE/25-26/INV/') => {
   };
 };
 
+// Helper function to get proper project ID for validation
+const getProjectIdForValidation = (projectId) => {
+  // Handle all possible cases
+  if (projectId === null || projectId === undefined || projectId === 'null' || projectId === 'undefined') {
+    return null;
+  }
+  
+  if (typeof projectId === 'string') {
+    const parsed = parseInt(projectId);
+    return isNaN(parsed) ? null : parsed;
+  }
+  
+  return projectId;
+};
 
 // ==================== API ROUTES ====================
 
@@ -627,16 +587,20 @@ exports.getInvoicesByProject = async (req, res) => {
   }
 };
 
+// Get next invoice number
 exports.getNextInvoiceNumber = async (req, res) => {
   const conn = await db.getConnection();
   
   try {
     const { projectId, prefix = 'ICE/25-26/INV/' } = req.query;
     
+    // Get proper project ID
+    const validatedProjectId = getProjectIdForValidation(projectId);
+    
     // Get current max sequence
     const [sequences] = await conn.execute(
-      'SELECT last_sequence FROM invoice_sequences WHERE project_id = ? AND prefix = ? AND invoice_type = ?',
-      [projectId || null, prefix, 'sales']
+      'SELECT last_sequence FROM invoice_sequences WHERE project_id <=> ? AND prefix = ? AND invoice_type = ?',
+      [validatedProjectId, prefix, 'sales']
     );
     
     let nextSequence = 1;
@@ -653,9 +617,9 @@ exports.getNextInvoiceNumber = async (req, res) => {
       
       const params = [prefix];
       
-      if (projectId) {
+      if (validatedProjectId !== null) {
         query += ' AND project_id = ?';
-        params.push(projectId);
+        params.push(validatedProjectId);
       } else {
         query += ' AND project_id IS NULL';
       }
@@ -673,7 +637,7 @@ exports.getNextInvoiceNumber = async (req, res) => {
       success: true,
       nextSequence,
       nextInvoiceNumber: `${prefix}${nextSequence.toString().padStart(4, '0')}`,
-      projectId: projectId || null,
+      projectId: validatedProjectId,
       prefix
     });
   } catch (error) {
@@ -686,7 +650,7 @@ exports.getNextInvoiceNumber = async (req, res) => {
   }
 };
 
-// Check invoice number availability - GLOBAL CHECK IF NO PROJECT
+// Check invoice number availability - UPDATED
 exports.checkInvoiceNumber = async (req, res) => {
   const conn = await db.getConnection();
   
@@ -700,12 +664,20 @@ exports.checkInvoiceNumber = async (req, res) => {
       });
     }
     
+    // Get proper project ID
+    const validatedProjectId = getProjectIdForValidation(projectId);
+    
+    console.log('Checking invoice number:', {
+      invoiceNumber,
+      originalProjectId: projectId,
+      validatedProjectId
+    });
+    
     // Check if the number already exists
-    // For invoices without project, check globally
     const isValid = await validateInvoiceNumber(
       conn,
       invoiceNumber,
-      projectId !== undefined ? projectId : null, // Send null for no project
+      validatedProjectId, // Use validated project ID
       null
     );
     
@@ -715,7 +687,7 @@ exports.checkInvoiceNumber = async (req, res) => {
       success: true,
       available: isValid,
       invoiceNumber,
-      projectId: projectId || null
+      projectId: validatedProjectId
     });
   } catch (error) {
     if (conn) conn.release();
@@ -727,7 +699,7 @@ exports.checkInvoiceNumber = async (req, res) => {
   }
 };
 
-// Create SALES invoice with project-specific invoice numbers
+// Create SALES invoice - FIXED
 exports.create = async (req, res) => {
   const payload = req.body;
   const conn = await db.getConnection();
@@ -749,14 +721,17 @@ exports.create = async (req, res) => {
     const taxType = gstApplicable ? (payload.taxType || 'sgst_cgst') : 'none';
     console.log("Tax Type:", taxType);
 
+    // Get proper project ID
+    const validatedProjectId = getProjectIdForValidation(payload.projectId);
+
     // Project Budget Validation
-    if (payload.projectId) {
-      console.log("Checking project budget for project ID:", payload.projectId);
+    if (validatedProjectId !== null) {
+      console.log("Checking project budget for project ID:", validatedProjectId);
       
       // Get project details with meta_data
       const [projects] = await conn.execute(
         "SELECT * FROM projects WHERE id = ?",
-        [payload.projectId]
+        [validatedProjectId]
       );
       
       if (projects.length === 0) {
@@ -923,18 +898,18 @@ exports.create = async (req, res) => {
       invoicePrefix = parsed.prefix;
       generatedNumber = parsed.number;
       
-      // CRITICAL FIX: Validate uniqueness for the right project scope
+      // CRITICAL FIX: Validate uniqueness with proper project ID
       const isValid = await validateInvoiceNumber(
         conn,
         generatedNumber,
-        payload.projectId !== undefined ? payload.projectId : null, // null for no project
+        validatedProjectId, // Use validated project ID
         null
       );
       
       if (!isValid) {
         await conn.rollback();
         return res.status(400).json({
-          message: `Invoice number "${generatedNumber}" already exists ${payload.projectId ? 'for this project' : 'globally'}`,
+          message: `Invoice number "${generatedNumber}" already exists ${validatedProjectId !== null ? 'for this project' : 'globally'}`,
           available: false,
           existingInvoice: true
         });
@@ -950,7 +925,8 @@ exports.create = async (req, res) => {
         invoicePrefix,
         invoiceSequence,
         sequenceStr,
-        isManualInvoice
+        isManualInvoice,
+        projectId: validatedProjectId
       });
       
       // Update sequence tracker if needed (only for numeric sequences)
@@ -958,31 +934,31 @@ exports.create = async (req, res) => {
         // Get or create sequence record for this project+prefix
         const [existing] = await conn.execute(
           'SELECT * FROM invoice_sequences WHERE project_id <=> ? AND prefix = ? AND invoice_type = ? FOR UPDATE',
-          [payload.projectId !== undefined ? payload.projectId : null, invoicePrefix, 'sales']
+          [validatedProjectId, invoicePrefix, 'sales']
         );
         
         if (existing.length === 0) {
           // Create new sequence
           await conn.execute(
             'INSERT INTO invoice_sequences (project_id, prefix, invoice_type, last_sequence) VALUES (?, ?, ?, ?)',
-            [payload.projectId !== undefined ? payload.projectId : null, invoicePrefix, 'sales', parsed.sequence]
+            [validatedProjectId, invoicePrefix, 'sales', parsed.sequence]
           );
         } else if (parsed.sequence > existing[0].last_sequence) {
           // Update sequence if manual number is higher
           await conn.execute(
             'UPDATE invoice_sequences SET last_sequence = ? WHERE project_id <=> ? AND prefix = ? AND invoice_type = ?',
-            [parsed.sequence, payload.projectId !== undefined ? payload.projectId : null, invoicePrefix, 'sales']
+            [parsed.sequence, validatedProjectId, invoicePrefix, 'sales']
           );
         }
       }
     } else {
       // Auto-generate invoice number
-      console.log("Auto-generating invoice number for project:", payload.projectId);
+      console.log("Auto-generating invoice number for project:", validatedProjectId);
       
       // Get next sequence number
       const [existing] = await conn.execute(
         'SELECT * FROM invoice_sequences WHERE project_id <=> ? AND prefix = ? AND invoice_type = ? FOR UPDATE',
-        [payload.projectId !== undefined ? payload.projectId : null, invoicePrefix, 'sales']
+        [validatedProjectId, invoicePrefix, 'sales']
       );
       
       if (existing.length === 0) {
@@ -990,24 +966,24 @@ exports.create = async (req, res) => {
         invoiceSequence = 1;
         await conn.execute(
           'INSERT INTO invoice_sequences (project_id, prefix, invoice_type, last_sequence) VALUES (?, ?, ?, ?)',
-          [payload.projectId !== undefined ? payload.projectId : null, invoicePrefix, 'sales', 1]
+          [validatedProjectId, invoicePrefix, 'sales', 1]
         );
       } else {
         invoiceSequence = existing[0].last_sequence + 1;
         await conn.execute(
           'UPDATE invoice_sequences SET last_sequence = ? WHERE project_id <=> ? AND prefix = ? AND invoice_type = ?',
-          [invoiceSequence, payload.projectId !== undefined ? payload.projectId : null, invoicePrefix, 'sales']
+          [invoiceSequence, validatedProjectId, invoicePrefix, 'sales']
         );
       }
       
       // Generate the full invoice number with padding
-      generatedNumber = payload.projectId == undefined || payload.projectId == null ? payload.invoiceNumber : `${invoicePrefix}${invoiceSequence.toString().padStart(4, '0')}`;
+      generatedNumber = `${invoicePrefix}${invoiceSequence.toString().padStart(4, '0')}`;
       
       // Double-check uniqueness (in case of race condition)
       const isValid = await validateInvoiceNumber(
         conn,
         generatedNumber,
-        payload.projectId !== undefined ? payload.projectId : null,
+        validatedProjectId,
         null
       );
       
@@ -1046,7 +1022,7 @@ exports.create = async (req, res) => {
       roundingDifference: payload.roundingDifference || (payload.roundingApplied ? (finalTotal - calculatedTotal) : 0),
       
       // Project information (also stored in meta for easy access)
-      projectId: payload.projectId || null,
+      projectId: validatedProjectId,
       projectName: payload.projectName || null,
       
       // Store original project budget for future validation during updates
@@ -1080,7 +1056,7 @@ exports.create = async (req, res) => {
       [
         invoicePrefix,
         invoiceSequence,
-        payload.projectId == undefined || payload.projectId == null ? payload.invoiceNumber : generatedNumber,
+        generatedNumber,
         isManualInvoice,
         originalSequence,
         sequenceStr, // Store the sequence string (actual value entered)
@@ -1096,20 +1072,20 @@ exports.create = async (req, res) => {
         signatureBase64,
         'sales',
         JSON.stringify(meta),
-        payload.projectId || null
+        validatedProjectId
       ]
     );
 
     const invoiceId = result.insertId;
 
     // Update project budget after successful invoice creation
-    if (payload.projectId && currentProjectBudget !== null) {
-      console.log("Updating project budget for project ID:", payload.projectId);
+    if (validatedProjectId !== null && currentProjectBudget !== null) {
+      console.log("Updating project budget for project ID:", validatedProjectId);
       
       // Get project details again to ensure we have latest data
       const [projects] = await conn.execute(
         "SELECT * FROM projects WHERE id = ?",
-        [payload.projectId]
+        [validatedProjectId]
       );
       
       if (projects.length > 0) {
@@ -1134,7 +1110,7 @@ exports.create = async (req, res) => {
         // Update the project in database
         await conn.execute(
           "UPDATE projects SET meta_data = ? WHERE id = ?",
-          [JSON.stringify(projectMeta), payload.projectId]
+          [JSON.stringify(projectMeta), validatedProjectId]
         );
         
         console.log(`Project budget updated: ₹${currentProjectBudget.toFixed(2)} -> ₹${newBudgetAmount.toFixed(2)}`);
@@ -1204,7 +1180,7 @@ exports.create = async (req, res) => {
         taxType: taxType,
         gstApplicable: gstApplicable,
         status: payload.status || "draft",
-        projectId: payload.projectId || null,
+        projectId: validatedProjectId,
         projectBudgetUsed: finalTotal,
         originalProjectBudget: originalProjectBudget
       },
@@ -1223,9 +1199,9 @@ exports.create = async (req, res) => {
       total: payload.total || finalTotal,
       roundingApplied: payload.roundingApplied || false,
       signatureSaved: !!signatureBase64,
-      projectId: payload.projectId || null,
+      projectId: validatedProjectId,
       projectName: payload.projectName || null,
-      budgetUpdated: !!payload.projectId
+      budgetUpdated: !!validatedProjectId
     });
   } catch (err) {
     await conn.rollback();
@@ -1254,7 +1230,7 @@ exports.create = async (req, res) => {
   }
 };
 
-// Update SALES invoice with invoice number validation
+// Update SALES invoice - FIXED
 exports.update = async (req, res) => {
   const conn = await db.getConnection();
   
@@ -1286,6 +1262,9 @@ exports.update = async (req, res) => {
       (typeof oldInvoice.meta === 'string' ? 
         (JSON.parse(oldInvoice.meta).taxType || 'sgst_cgst') : 
         (oldInvoice.meta.taxType || 'sgst_cgst')) : 'sgst_cgst';
+
+    // Get proper project ID
+    const validatedProjectId = getProjectIdForValidation(payload.projectId);
 
     // Track changes for history log
     const changes = {};
@@ -1353,20 +1332,19 @@ exports.update = async (req, res) => {
       invoicePrefix = parsed.prefix;
       newGeneratedNumber = parsed.number;
       
-      // CRITICAL FIX: Validate uniqueness for the right project scope
-      // But skip validation if it's the same number (even if manual)
+      // CRITICAL FIX: Validate uniqueness with proper project ID handling
       if (newGeneratedNumber !== currentFullNumber) {
         const isValid = await validateInvoiceNumber(
           conn,
           newGeneratedNumber,
-          payload.projectId !== undefined ? payload.projectId : null, // null for no project
+          validatedProjectId,
           req.params.id // Exclude current invoice
         );
         
         if (!isValid) {
           await conn.rollback();
           return res.status(400).json({
-            message: `Invoice number "${newGeneratedNumber}" already exists ${payload.projectId ? 'for this project' : 'globally'}`,
+            message: `Invoice number "${newGeneratedNumber}" already exists ${validatedProjectId !== null ? 'for this project' : 'globally'}`,
             available: false,
             existingInvoice: true
           });
@@ -1383,25 +1361,26 @@ exports.update = async (req, res) => {
         invoicePrefix,
         newInvoiceSequence,
         sequenceStr,
-        isManualInvoice
+        isManualInvoice,
+        projectId: validatedProjectId
       });
       
       // Update sequence tracker if needed
       if (parsed.sequence && !isNaN(parsed.sequence)) {
         const [existing] = await conn.execute(
           'SELECT * FROM invoice_sequences WHERE project_id <=> ? AND prefix = ? AND invoice_type = ? FOR UPDATE',
-          [payload.projectId !== undefined ? payload.projectId : null, invoicePrefix, 'sales']
+          [validatedProjectId, invoicePrefix, 'sales']
         );
         
         if (existing.length === 0) {
           await conn.execute(
             'INSERT INTO invoice_sequences (project_id, prefix, invoice_type, last_sequence) VALUES (?, ?, ?, ?)',
-            [payload.projectId !== undefined ? payload.projectId : null, invoicePrefix, 'sales', parsed.sequence]
+            [validatedProjectId, invoicePrefix, 'sales', parsed.sequence]
           );
         } else if (parsed.sequence > existing[0].last_sequence) {
           await conn.execute(
             'UPDATE invoice_sequences SET last_sequence = ? WHERE project_id <=> ? AND prefix = ? AND invoice_type = ?',
-            [parsed.sequence, payload.projectId !== undefined ? payload.projectId : null, invoicePrefix, 'sales']
+            [parsed.sequence, validatedProjectId, invoicePrefix, 'sales']
           );
         }
       }
@@ -1428,14 +1407,14 @@ exports.update = async (req, res) => {
         const isValid = await validateInvoiceNumber(
           conn,
           newGeneratedNumber,
-          payload.projectId !== undefined ? payload.projectId : null,
+          validatedProjectId,
           req.params.id
         );
         
         if (!isValid) {
           await conn.rollback();
           return res.status(400).json({
-            message: `Invoice number "${newGeneratedNumber}" already exists ${payload.projectId ? 'for this project' : 'globally'}`,
+            message: `Invoice number "${newGeneratedNumber}" already exists ${validatedProjectId !== null ? 'for this project' : 'globally'}`,
             available: false,
             existingInvoice: true
           });
@@ -1450,18 +1429,18 @@ exports.update = async (req, res) => {
           // Update sequence tracker
           const [existing] = await conn.execute(
             'SELECT * FROM invoice_sequences WHERE project_id <=> ? AND prefix = ? AND invoice_type = ? FOR UPDATE',
-            [payload.projectId !== undefined ? payload.projectId : null, invoicePrefix, 'sales']
+            [validatedProjectId, invoicePrefix, 'sales']
           );
           
           if (existing.length === 0) {
             await conn.execute(
               'INSERT INTO invoice_sequences (project_id, prefix, invoice_type, last_sequence) VALUES (?, ?, ?, ?)',
-              [payload.projectId !== undefined ? payload.projectId : null, invoicePrefix, 'sales', sequenceNum]
+              [validatedProjectId, invoicePrefix, 'sales', sequenceNum]
             );
           } else if (sequenceNum > existing[0].last_sequence) {
             await conn.execute(
               'UPDATE invoice_sequences SET last_sequence = ? WHERE project_id <=> ? AND prefix = ? AND invoice_type = ?',
-              [sequenceNum, payload.projectId !== undefined ? payload.projectId : null, invoicePrefix, 'sales']
+              [sequenceNum, validatedProjectId, invoicePrefix, 'sales']
             );
           }
         }
@@ -1475,8 +1454,8 @@ exports.update = async (req, res) => {
     }
 
     // Project Budget Validation for Update - Use original project budget from invoice meta
-    if (payload.projectId) {
-      console.log("Checking project budget for project ID:", payload.projectId);
+    if (validatedProjectId !== null) {
+      console.log("Checking project budget for project ID:", validatedProjectId);
       
       // Get the original project budget from invoice meta (stored during creation)
       const originalProjectBudget = oldInvoiceMeta.originalProjectBudget;
@@ -1650,7 +1629,7 @@ exports.update = async (req, res) => {
       roundingDifference: payload.roundingDifference || (payload.roundingApplied ? (finalTotal - calculatedTotal) : 0),
       
       // Project information (also stored in meta for easy access)
-      projectId: payload.projectId || null,
+      projectId: validatedProjectId,
       projectName: payload.projectName || null,
       
       // Preserve the original project budget from the old invoice
@@ -1715,19 +1694,19 @@ exports.update = async (req, res) => {
         JSON.stringify(payload.notes || []),
         signatureBase64,
         JSON.stringify(meta),
-        payload.projectId || null,
+        validatedProjectId,
         req.params.id,
       ]
     );
 
     // Update project budget after successful invoice update
-    if (payload.projectId && oldInvoiceMeta.originalProjectBudget) {
-      console.log("Updating project budget for project ID:", payload.projectId);
+    if (validatedProjectId !== null && oldInvoiceMeta.originalProjectBudget) {
+      console.log("Updating project budget for project ID:", validatedProjectId);
       
       // Get current project details
       const [projects] = await conn.execute(
         "SELECT * FROM projects WHERE id = ?",
-        [payload.projectId]
+        [validatedProjectId]
       );
       
       if (projects.length > 0) {
@@ -1760,7 +1739,7 @@ exports.update = async (req, res) => {
         // Update the project in database
         await conn.execute(
           "UPDATE projects SET meta_data = ? WHERE id = ?",
-          [JSON.stringify(projectMeta), payload.projectId]
+          [JSON.stringify(projectMeta), validatedProjectId]
         );
         
         console.log(`Project budget updated: ₹${currentBudget.toFixed(2)} - (${finalTotal.toFixed(2)} - ${oldInvoiceTotal.toFixed(2)}) = ₹${newBudgetAmount.toFixed(2)}`);
@@ -1864,9 +1843,9 @@ exports.update = async (req, res) => {
       total: payload.total || finalTotal,
       roundingApplied: payload.roundingApplied || false,
       signatureUpdated: !!signatureBase64,
-      projectId: payload.projectId || null,
+      projectId: validatedProjectId,
       projectName: payload.projectName || null,
-      budgetUpdated: !!payload.projectId
+      budgetUpdated: validatedProjectId !== null
     });
   } catch (err) {
     await conn.rollback();
@@ -1879,7 +1858,7 @@ exports.update = async (req, res) => {
         error: err.message
       });
     } else if (err.message && err.message.includes('exceeds project budget')) {
-      res.status(400).json({ 
+      res.status(500).json({ 
         message: err.message,
         invoiceAmount: err.invoiceAmount,
         projectBudget: err.projectBudget,
@@ -1896,6 +1875,7 @@ exports.update = async (req, res) => {
     conn.release();
   }
 };
+
 
 // Delete SALES invoice - WITH LOGGING
 exports.delete = async (req, res) => {
