@@ -66,24 +66,29 @@ function calculateItemBaseAmount(item) {
   }
 }
 
-// Helper function to calculate all item amounts with IGST support
-function calculateItemAmounts(item, taxType = 'sgst_cgst') {
+// Helper function to calculate all item amounts with GST applicability check
+function calculateItemAmounts(item, taxType = 'sgst_cgst', gstApplicable = true) {
   const baseAmount = calculateItemBaseAmount(item);
   const discountAmount = item.discount ? (baseAmount * item.discount) / 100 : 0;
   const taxableAmount = baseAmount - discountAmount;
-  const taxAmount = item.tax ? (taxableAmount * item.tax) / 100 : 0;
   
-  // Calculate taxes based on tax type
+  // Calculate taxes based on tax type and GST applicability
+  let taxAmount = 0;
   let sgstAmount = 0;
   let cgstAmount = 0;
   let igstAmount = 0;
 
-  if (taxType === 'sgst_cgst') {
-    sgstAmount = (taxableAmount * (item.sgst || 9)) / 100;
-    cgstAmount = (taxableAmount * (item.cgst || 9)) / 100;
-  } else {
-    igstAmount = (taxableAmount * (item.igst || 18)) / 100;
+  if (gstApplicable) {
+    if (taxType === 'sgst_cgst') {
+      sgstAmount = (taxableAmount * (item.sgst || 9)) / 100;
+      cgstAmount = (taxableAmount * (item.cgst || 9)) / 100;
+      taxAmount = sgstAmount + cgstAmount;
+    } else if (taxType === 'igst') {
+      igstAmount = (taxableAmount * (item.igst || 18)) / 100;
+      taxAmount = igstAmount;
+    }
   }
+  // If GST is not applicable, all tax amounts remain 0
 
   const totalAmount = taxableAmount;
 
@@ -121,6 +126,186 @@ const handleSignature = (signatureData) => {
   
   return signatureData;
 };
+
+// ==================== INVOICE NUMBER HELPER FUNCTIONS ====================
+
+// Helper to get next sequence number for project
+const getNextSequence = async (conn, projectId = null, prefix = 'ICE/25-26/INV/', invoiceType = 'sales') => {
+  try {
+    // Lock the row to prevent race conditions
+    const [existing] = await conn.execute(
+      'SELECT * FROM invoice_sequences WHERE project_id = ? AND prefix = ? AND invoice_type = ? FOR UPDATE',
+      [projectId, prefix, invoiceType]
+    );
+    
+    if (existing.length === 0) {
+      // Create new sequence for this project
+      await conn.execute(
+        'INSERT INTO invoice_sequences (project_id, prefix, invoice_type, last_sequence) VALUES (?, ?, ?, 0)',
+        [projectId, prefix, invoiceType, 0]
+      );
+      return 1;
+    }
+    
+    const nextSequence = existing[0].last_sequence + 1;
+    return nextSequence;
+  } catch (error) {
+    console.error('Error getting next sequence:', error);
+    throw error;
+  }
+};
+
+// Helper to update sequence after invoice creation
+const updateSequence = async (conn, projectId = null, prefix = 'ICE/25-26/INV/', sequence, invoiceType = 'sales') => {
+  await conn.execute(
+    'UPDATE invoice_sequences SET last_sequence = ? WHERE project_id = ? AND prefix = ? AND invoice_type = ?',
+    [sequence, projectId, prefix, invoiceType]
+  );
+};
+
+const validateInvoiceNumber = async (conn, invoiceNumber, projectId = null, excludeId = null) => {
+  try {
+    console.log('Validating invoice number:', {
+      invoiceNumber,
+      projectId,
+      excludeId,
+      projectIdType: typeof projectId,
+      projectIdValue: projectId
+    });
+    
+    let query = `
+      SELECT COUNT(*) as count 
+      FROM invoices 
+      WHERE invoice_number_generated = ? 
+        AND type = 'sales'
+    `;
+    
+    const params = [invoiceNumber];
+    
+    // CRITICAL FIX: Handle null projectId properly
+    if (projectId === null) {
+      // Check for invoices without project (project_id IS NULL)
+      query += ' AND project_id IS NULL';
+    } else {
+      // Check for invoices with specific project
+      query += ' AND project_id = ?';
+      params.push(projectId);
+    }
+    
+    if (excludeId) {
+      query += ' AND id != ?';
+      params.push(excludeId);
+    }
+    
+    console.log('Validation query:', query);
+    console.log('Validation params:', params);
+    
+    const [result] = await conn.execute(query, params);
+    const isValid = result[0].count === 0;
+    
+    console.log('Validation result:', {
+      count: result[0].count,
+      isValid: isValid
+    });
+    
+    return isValid;
+  } catch (error) {
+    console.error('Error validating invoice number:', error);
+    throw error;
+  }
+};
+
+// Update the checkInvoiceNumber API endpoint
+exports.checkInvoiceNumber = async (req, res) => {
+  const conn = await db.getConnection();
+  
+  try {
+    const { invoiceNumber, projectId } = req.query;
+    
+    if (!invoiceNumber) {
+      return res.status(400).json({ 
+        success: false,
+        message: 'Invoice number is required' 
+      });
+    }
+    
+    // Convert projectId to proper type
+    let parsedProjectId = null;
+    if (projectId !== undefined && projectId !== null && projectId !== '') {
+      if (projectId === 'null' || projectId === 'undefined') {
+        parsedProjectId = null;
+      } else {
+        parsedProjectId = parseInt(projectId);
+        if (isNaN(parsedProjectId)) {
+          parsedProjectId = null;
+        }
+      }
+    }
+    
+    console.log('Checking invoice number:', {
+      invoiceNumber,
+      projectId,
+      parsedProjectId
+    });
+    
+    // Check if the number already exists
+    const isValid = await validateInvoiceNumber(
+      conn,
+      invoiceNumber,
+      parsedProjectId, // Send null for no project
+      null
+    );
+    
+    conn.release();
+    
+    res.json({
+      success: true,
+      available: isValid,
+      invoiceNumber,
+      projectId: parsedProjectId
+    });
+  } catch (error) {
+    if (conn) conn.release();
+    console.error('Error checking invoice number:', error);
+    res.status(500).json({ 
+      success: false,
+      message: 'Database error' 
+    });
+  }
+};
+
+// Update the parseInvoiceNumber function to better handle prefixes
+const parseInvoiceNumber = (fullNumber, defaultPrefix = 'ICE/25-26/INV/') => {
+  if (!fullNumber) return { sequence: null, number: null, prefix: defaultPrefix };
+  
+  // Try to extract prefix (everything up to the last '/')
+  const lastSlashIndex = fullNumber.lastIndexOf('/');
+  let prefix = defaultPrefix;
+  let sequenceStr = fullNumber;
+  
+  if (lastSlashIndex !== -1) {
+    prefix = fullNumber.substring(0, lastSlashIndex + 1);
+    sequenceStr = fullNumber.substring(lastSlashIndex + 1);
+  }
+  
+  // For manual numbers, don't force to integer
+  let sequence;
+  if (/^\d+$/.test(sequenceStr)) {
+    sequence = parseInt(sequenceStr);
+  } else {
+    sequence = null;
+  }
+  
+  return {
+    sequence: sequence,
+    number: fullNumber,
+    sequenceStr: sequenceStr,
+    prefix: prefix
+  };
+};
+
+
+// ==================== API ROUTES ====================
 
 // Get history logs for a sales invoice
 exports.getHistory = async (req, res) => {
@@ -177,7 +362,7 @@ exports.list = async (req, res) => {
       
       inv.items = items;
 
-      // Parse meta data for project information
+      // Parse meta data for project information and GST applicability
       if (inv.meta) {
         if (typeof inv.meta === 'string') {
           try {
@@ -190,6 +375,9 @@ exports.list = async (req, res) => {
       } else {
         inv.meta = {};
       }
+
+      // Add GST applicability info
+      inv.gstApplicable = inv.meta.gstApplicable !== false; // Default to true if not specified
 
       // Add project information from meta if available
       if (inv.meta.projectId) {
@@ -233,8 +421,9 @@ exports.get = async (req, res) => {
       invoice.meta = {};
     }
 
-    // Extract tax type from meta
-    const taxType = invoice.meta.taxType || 'sgst_cgst';
+    // Extract GST applicability and tax type from meta
+    const gstApplicable = invoice.meta.gstApplicable !== false; // Default to true if not specified
+    const taxType = gstApplicable ? (invoice.meta.taxType || 'sgst_cgst') : 'none';
 
     const [client] = await db.execute(
       "SELECT * FROM clients WHERE id = ?",
@@ -270,7 +459,7 @@ exports.get = async (req, res) => {
             item.meta = {};
           }
         }
-        if (typeof item.meta === 'object' && item.meta !== null) {
+        if (typeof item.meta === 'object' && item.meta !== null && gstApplicable) {
           item.sgst = item.meta.sgst || 9;
           item.cgst = item.meta.cgst || 9;
           item.igst = item.meta.igst || 18;
@@ -279,6 +468,14 @@ exports.get = async (req, res) => {
           item.igstAmount = item.meta.igstAmount || 0;
           item.percentageValue = item.meta.percentageValue || null;
           item.isPercentageQty = item.meta.isPercentageQty || false;
+        } else if (!gstApplicable) {
+          // Reset all tax values to 0 if GST is not applicable
+          item.sgst = 0;
+          item.cgst = 0;
+          item.igst = 0;
+          item.sgstAmount = 0;
+          item.cgstAmount = 0;
+          item.igstAmount = 0;
         }
       } else {
         item.meta = {};
@@ -306,7 +503,8 @@ exports.get = async (req, res) => {
       invoice.projectName = invoice.meta.projectName || invoice.projectName;
     }
 
-    // Add tax type to invoice response
+    // Add GST applicability and tax type to invoice response
+    invoice.gstApplicable = gstApplicable;
     invoice.taxType = taxType;
 
     res.json(invoice);
@@ -361,6 +559,9 @@ exports.getInvoicesByProject = async (req, res) => {
         inv.meta = {};
       }
 
+      // Get GST applicability from meta
+      const gstApplicable = inv.meta.gstApplicable !== false; // Default to true
+
       inv.items = items.map(item => {
         if (item.meta) {
           if (typeof item.meta === 'string') {
@@ -371,7 +572,7 @@ exports.getInvoicesByProject = async (req, res) => {
               item.meta = {};
             }
           }
-          if (typeof item.meta === 'object' && item.meta !== null) {
+          if (typeof item.meta === 'object' && item.meta !== null && gstApplicable) {
             item.sgst = item.meta.sgst || 9;
             item.cgst = item.meta.cgst || 9;
             item.igst = item.meta.igst || 18;
@@ -380,6 +581,14 @@ exports.getInvoicesByProject = async (req, res) => {
             item.igstAmount = item.meta.igstAmount || 0;
             item.percentageValue = item.meta.percentageValue || null;
             item.isPercentageQty = item.meta.isPercentageQty || false;
+          } else if (!gstApplicable) {
+            // Reset all tax values to 0 if GST is not applicable
+            item.sgst = 0;
+            item.cgst = 0;
+            item.igst = 0;
+            item.sgstAmount = 0;
+            item.cgstAmount = 0;
+            item.igstAmount = 0;
           }
         } else {
           item.meta = {};
@@ -401,6 +610,9 @@ exports.getInvoicesByProject = async (req, res) => {
         return item;
       });
 
+      // Add GST applicability info
+      inv.gstApplicable = gstApplicable;
+
       // Add project information from meta if available
       if (inv.meta.projectId) {
         inv.projectId = inv.meta.projectId;
@@ -415,7 +627,107 @@ exports.getInvoicesByProject = async (req, res) => {
   }
 };
 
-// Create SALES invoice with items and project details - WITH LOGGING
+exports.getNextInvoiceNumber = async (req, res) => {
+  const conn = await db.getConnection();
+  
+  try {
+    const { projectId, prefix = 'ICE/25-26/INV/' } = req.query;
+    
+    // Get current max sequence
+    const [sequences] = await conn.execute(
+      'SELECT last_sequence FROM invoice_sequences WHERE project_id = ? AND prefix = ? AND invoice_type = ?',
+      [projectId || null, prefix, 'sales']
+    );
+    
+    let nextSequence = 1;
+    if (sequences.length > 0) {
+      nextSequence = sequences[0].last_sequence + 1;
+    } else {
+      // Check if there's any existing invoice for this project/global
+      let query = `
+        SELECT MAX(invoice_sequence) as max_sequence 
+        FROM invoices 
+        WHERE invoice_prefix = ? 
+          AND type = 'sales'
+      `;
+      
+      const params = [prefix];
+      
+      if (projectId) {
+        query += ' AND project_id = ?';
+        params.push(projectId);
+      } else {
+        query += ' AND project_id IS NULL';
+      }
+      
+      const [invoices] = await conn.execute(query, params);
+      
+      if (invoices[0].max_sequence) {
+        nextSequence = invoices[0].max_sequence + 1;
+      }
+    }
+    
+    conn.release();
+    
+    res.json({
+      success: true,
+      nextSequence,
+      nextInvoiceNumber: `${prefix}${nextSequence.toString().padStart(4, '0')}`,
+      projectId: projectId || null,
+      prefix
+    });
+  } catch (error) {
+    if (conn) conn.release();
+    console.error('Error getting next invoice number:', error);
+    res.status(500).json({ 
+      success: false,
+      message: 'Database error' 
+    });
+  }
+};
+
+// Check invoice number availability - GLOBAL CHECK IF NO PROJECT
+exports.checkInvoiceNumber = async (req, res) => {
+  const conn = await db.getConnection();
+  
+  try {
+    const { invoiceNumber, projectId } = req.query;
+    
+    if (!invoiceNumber) {
+      return res.status(400).json({ 
+        success: false,
+        message: 'Invoice number is required' 
+      });
+    }
+    
+    // Check if the number already exists
+    // For invoices without project, check globally
+    const isValid = await validateInvoiceNumber(
+      conn,
+      invoiceNumber,
+      projectId !== undefined ? projectId : null, // Send null for no project
+      null
+    );
+    
+    conn.release();
+    
+    res.json({
+      success: true,
+      available: isValid,
+      invoiceNumber,
+      projectId: projectId || null
+    });
+  } catch (error) {
+    if (conn) conn.release();
+    console.error('Error checking invoice number:', error);
+    res.status(500).json({ 
+      success: false,
+      message: 'Database error' 
+    });
+  }
+};
+
+// Create SALES invoice with project-specific invoice numbers
 exports.create = async (req, res) => {
   const payload = req.body;
   const conn = await db.getConnection();
@@ -423,10 +735,19 @@ exports.create = async (req, res) => {
   try {
     await conn.beginTransaction();
 
-    console.log("Creating sales invoice with project ID:", payload.projectId);
+    console.log("Creating sales invoice for project:", payload.projectId);
+    console.log("Payload invoice number:", payload.manualInvoiceNumber);
 
     let originalProjectBudget = null;
     let currentProjectBudget = null;
+
+    // Get GST applicability from payload (default to true if not specified)
+    const gstApplicable = payload.gstApplicable !== false;
+    console.log("GST Applicable:", gstApplicable);
+
+    // Get tax type based on GST applicability
+    const taxType = gstApplicable ? (payload.taxType || 'sgst_cgst') : 'none';
+    console.log("Tax Type:", taxType);
 
     // Project Budget Validation
     if (payload.projectId) {
@@ -467,8 +788,8 @@ exports.create = async (req, res) => {
         
         if (!isNaN(currentProjectBudget) && currentProjectBudget > 0) {
           // Calculate invoice total for validation
-          const taxType = payload.taxType || 'sgst_cgst';
-          
+          const taxType = gstApplicable ? (payload.taxType || 'sgst_cgst') : 'none';
+
           // Calculate subtotal using the helper function
           const subtotal = payload.items.reduce((sum, item) => {
             return sum + calculateItemBaseAmount(item);
@@ -483,22 +804,30 @@ exports.create = async (req, res) => {
           const taxable = subtotal - discountValue + additionalChargesTotal;
           const tcs = payload.applyTCS ? taxable * 0.01 : 0;
           
-          // Calculate total tax, SGST, CGST, and IGST from items based on tax type
+          // Calculate total tax based on GST applicability
           let totalTax = 0;
           let sgstTotal = 0;
           let cgstTotal = 0;
           let igstTotal = 0;
 
-          payload.items.forEach(item => {
-            const amounts = calculateItemAmounts(item, taxType);
-            totalTax += amounts.taxAmount;
-            sgstTotal += amounts.sgstAmount;
-            cgstTotal += amounts.cgstAmount;
-            igstTotal += amounts.igstAmount;
-          });
+          if (gstApplicable) {
+            payload.items.forEach(item => {
+              const amounts = calculateItemAmounts(item, taxType, true);
+              totalTax += amounts.taxAmount;
+              sgstTotal += amounts.sgstAmount;
+              cgstTotal += amounts.cgstAmount;
+              igstTotal += amounts.igstAmount;
+            });
+          }
 
           // Apply rounding if enabled
-          const calculatedTotal = taxable + tcs + totalTax + sgstTotal + cgstTotal + igstTotal;
+          let calculatedTotal;
+          if (gstApplicable) {
+            calculatedTotal = taxable + tcs + totalTax + sgstTotal + cgstTotal + igstTotal;
+          } else {
+            calculatedTotal = taxable + tcs; // No tax when GST is not applicable
+          }
+          
           const finalTotal = payload.roundingApplied ? Math.round(calculatedTotal) : calculatedTotal;
           
           console.log("Invoice total amount:", finalTotal, "Project budget:", currentProjectBudget);
@@ -518,9 +847,6 @@ exports.create = async (req, res) => {
         }
       }
     }
-
-    // Continue with existing invoice creation logic...
-    const taxType = payload.taxType || 'sgst_cgst';
 
     // Handle signature - convert to base64 if provided
     const signatureBase64 = handleSignature(payload.signature);
@@ -545,27 +871,162 @@ exports.create = async (req, res) => {
     const taxable = subtotal - discountValue + additionalChargesTotal;
     const tcs = payload.applyTCS ? taxable * 0.01 : 0;
     
-    // Calculate total tax, SGST, CGST, and IGST from items based on tax type
+    // Calculate total tax based on GST applicability
     let totalTax = 0;
     let sgstTotal = 0;
     let cgstTotal = 0;
     let igstTotal = 0;
 
-    payload.items.forEach(item => {
-      const amounts = calculateItemAmounts(item, taxType);
-      totalTax += amounts.taxAmount;
-      sgstTotal += amounts.sgstAmount;
-      cgstTotal += amounts.cgstAmount;
-      igstTotal += amounts.igstAmount;
-    });
-
+    if (gstApplicable) {
+      payload.items.forEach(item => {
+        const amounts = calculateItemAmounts(item, taxType, true);
+        totalTax += amounts.taxAmount;
+        sgstTotal += amounts.sgstAmount;
+        cgstTotal += amounts.cgstAmount;
+        igstTotal += amounts.igstAmount;
+      });
+    }
+    
     // Apply rounding if enabled
-    const calculatedTotal = taxable + tcs + totalTax + sgstTotal + cgstTotal + igstTotal;
+    let calculatedTotal;
+    if (gstApplicable) {
+      calculatedTotal = taxable + tcs + totalTax + sgstTotal + cgstTotal + igstTotal;
+    } else {
+      calculatedTotal = taxable + tcs; // No tax when GST is not applicable
+    }
+    
     const finalTotal = payload.roundingApplied ? Math.round(calculatedTotal) : calculatedTotal;
 
-    // Create meta object for additional fields with tax type and project details
+    // ==================== INVOICE NUMBER HANDLING ====================
+    let invoiceSequence;
+    let generatedNumber;
+    let isManualInvoice = false;
+    let originalSequence = null;
+    let sequenceStr = null;
+    let invoicePrefix = payload.invoicePrefix || 'ICE/25-26/INV/';
+
+    if (payload.manualInvoiceNumber) {
+      // User provided manual invoice number
+      console.log("Using manual invoice number:", payload.manualInvoiceNumber);
+      
+      // Parse the manual number with its actual prefix
+      const parsed = parseInvoiceNumber(payload.manualInvoiceNumber, invoicePrefix);
+      
+      if (!parsed.number) {
+        await conn.rollback();
+        return res.status(400).json({ 
+          message: "Invalid invoice number format" 
+        });
+      }
+      
+      // Use the actual prefix from the parsed number
+      invoicePrefix = parsed.prefix;
+      generatedNumber = parsed.number;
+      
+      // CRITICAL FIX: Validate uniqueness for the right project scope
+      const isValid = await validateInvoiceNumber(
+        conn,
+        generatedNumber,
+        payload.projectId !== undefined ? payload.projectId : null, // null for no project
+        null
+      );
+      
+      if (!isValid) {
+        await conn.rollback();
+        return res.status(400).json({
+          message: `Invoice number "${generatedNumber}" already exists ${payload.projectId ? 'for this project' : 'globally'}`,
+          available: false,
+          existingInvoice: true
+        });
+      }
+      
+      invoiceSequence = parsed.sequence || 0;
+      isManualInvoice = true;
+      originalSequence = parsed.sequence || null;
+      sequenceStr = parsed.sequenceStr;
+      
+      console.log('Parsed manual number:', {
+        generatedNumber,
+        invoicePrefix,
+        invoiceSequence,
+        sequenceStr,
+        isManualInvoice
+      });
+      
+      // Update sequence tracker if needed (only for numeric sequences)
+      if (parsed.sequence && !isNaN(parsed.sequence)) {
+        // Get or create sequence record for this project+prefix
+        const [existing] = await conn.execute(
+          'SELECT * FROM invoice_sequences WHERE project_id <=> ? AND prefix = ? AND invoice_type = ? FOR UPDATE',
+          [payload.projectId !== undefined ? payload.projectId : null, invoicePrefix, 'sales']
+        );
+        
+        if (existing.length === 0) {
+          // Create new sequence
+          await conn.execute(
+            'INSERT INTO invoice_sequences (project_id, prefix, invoice_type, last_sequence) VALUES (?, ?, ?, ?)',
+            [payload.projectId !== undefined ? payload.projectId : null, invoicePrefix, 'sales', parsed.sequence]
+          );
+        } else if (parsed.sequence > existing[0].last_sequence) {
+          // Update sequence if manual number is higher
+          await conn.execute(
+            'UPDATE invoice_sequences SET last_sequence = ? WHERE project_id <=> ? AND prefix = ? AND invoice_type = ?',
+            [parsed.sequence, payload.projectId !== undefined ? payload.projectId : null, invoicePrefix, 'sales']
+          );
+        }
+      }
+    } else {
+      // Auto-generate invoice number
+      console.log("Auto-generating invoice number for project:", payload.projectId);
+      
+      // Get next sequence number
+      const [existing] = await conn.execute(
+        'SELECT * FROM invoice_sequences WHERE project_id <=> ? AND prefix = ? AND invoice_type = ? FOR UPDATE',
+        [payload.projectId !== undefined ? payload.projectId : null, invoicePrefix, 'sales']
+      );
+      
+      if (existing.length === 0) {
+        // Create new sequence for this project/prefix
+        invoiceSequence = 1;
+        await conn.execute(
+          'INSERT INTO invoice_sequences (project_id, prefix, invoice_type, last_sequence) VALUES (?, ?, ?, ?)',
+          [payload.projectId !== undefined ? payload.projectId : null, invoicePrefix, 'sales', 1]
+        );
+      } else {
+        invoiceSequence = existing[0].last_sequence + 1;
+        await conn.execute(
+          'UPDATE invoice_sequences SET last_sequence = ? WHERE project_id <=> ? AND prefix = ? AND invoice_type = ?',
+          [invoiceSequence, payload.projectId !== undefined ? payload.projectId : null, invoicePrefix, 'sales']
+        );
+      }
+      
+      // Generate the full invoice number with padding
+      generatedNumber = payload.projectId == undefined || payload.projectId == null ? payload.invoiceNumber : `${invoicePrefix}${invoiceSequence.toString().padStart(4, '0')}`;
+      
+      // Double-check uniqueness (in case of race condition)
+      const isValid = await validateInvoiceNumber(
+        conn,
+        generatedNumber,
+        payload.projectId !== undefined ? payload.projectId : null,
+        null
+      );
+      
+      if (!isValid) {
+        await conn.rollback();
+        return res.status(400).json({
+          message: `Generated invoice number "${generatedNumber}" already exists. Please try again.`,
+          available: false
+        });
+      }
+      
+      sequenceStr = invoiceSequence.toString().padStart(4, '0');
+      console.log("Generated invoice number:", generatedNumber);
+    }
+
+    // Create meta object with tax type, GST applicability and project details
     const meta = {
       taxType: taxType,
+      gstApplicable: gstApplicable,
       discount: payload.discount || { type: "flat", value: 0 },
       discountValue: discountValue,
       additionalCharges: payload.additionalCharges || [],
@@ -573,9 +1034,9 @@ exports.create = async (req, res) => {
       applyTCS: payload.applyTCS || false,
       tcs: tcs,
       taxableAmount: taxable,
-      sgstTotal: taxType === 'sgst_cgst' ? sgstTotal : 0,
-      cgstTotal: taxType === 'sgst_cgst' ? cgstTotal : 0,
-      igstTotal: taxType === 'igst' ? igstTotal : 0,
+      sgstTotal: gstApplicable && taxType === 'sgst_cgst' ? sgstTotal : 0,
+      cgstTotal: gstApplicable && taxType === 'sgst_cgst' ? cgstTotal : 0,
+      igstTotal: gstApplicable && taxType === 'igst' ? igstTotal : 0,
       totalTax: totalTax,
       
       // Rounding information
@@ -601,15 +1062,28 @@ exports.create = async (req, res) => {
       poNumber: payload.poNumber || "",
       ewayBillNumber: payload.ewayBillNumber || "",
       vendorCode: payload.vendorCode || "",
-      poDate: payload.poDate || null
+      poDate: payload.poDate || null,
+      
+      // Invoice number information
+      isManualInvoice: isManualInvoice,
+      invoicePrefix: invoicePrefix,
+      generatedInvoiceNumber: generatedNumber
     };
 
+    // Insert invoice with new columns - use sequenceStr for invoiceNumber field
     const [result] = await conn.execute(
       `INSERT INTO invoices 
-      (invoiceNumber, date, dueDate, clientId, status, subTotal, tax, discount, total, notes, signature, type, meta, project_id, createdAt, updatedAt) 
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+      (invoice_prefix, invoice_sequence, invoice_number_generated, is_manual_invoice, original_sequence, 
+       invoiceNumber, date, dueDate, clientId, status, subTotal, tax, discount, total, notes, signature, 
+       type, meta, project_id, createdAt, updatedAt) 
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
       [
-        payload.invoiceNumber,
+        invoicePrefix,
+        invoiceSequence,
+        payload.projectId == undefined || payload.projectId == null ? payload.invoiceNumber : generatedNumber,
+        isManualInvoice,
+        originalSequence,
+        sequenceStr, // Store the sequence string (actual value entered)
         payload.date,
         payload.dueDate,
         payload.clientId,
@@ -669,13 +1143,13 @@ exports.create = async (req, res) => {
 
     // Insert items with correct amount calculations
     for (const item of payload.items) {
-      const amounts = calculateItemAmounts(item, taxType);
+      const amounts = calculateItemAmounts(item, taxType, gstApplicable);
 
-      // Create item meta with tax information based on tax type
+      // Create item meta with tax information based on GST applicability
       const itemMeta = {
-        sgst: taxType === 'sgst_cgst' ? (item.sgst || 9) : 0,
-        cgst: taxType === 'sgst_cgst' ? (item.cgst || 9) : 0,
-        igst: taxType === 'igst' ? (item.igst || 18) : 0,
+        sgst: gstApplicable && taxType === 'sgst_cgst' ? (item.sgst || 9) : 0,
+        cgst: gstApplicable && taxType === 'sgst_cgst' ? (item.cgst || 9) : 0,
+        igst: gstApplicable && taxType === 'igst' ? (item.igst || 18) : 0,
         sgstAmount: parseFloat(amounts.sgstAmount.toFixed(2)),
         cgstAmount: parseFloat(amounts.cgstAmount.toFixed(2)),
         igstAmount: parseFloat(amounts.igstAmount.toFixed(2)),
@@ -692,7 +1166,7 @@ exports.create = async (req, res) => {
       // Insert item with productId
       await conn.execute(
         `INSERT INTO invoice_items 
-        (invoiceId,itemId, description, hsn, uom, quantity, rate, discount, tax, taxAmount, amount, meta) 
+        (invoiceId, itemId, description, hsn, uom, quantity, rate, discount, tax, taxAmount, amount, meta) 
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           invoiceId,
@@ -718,13 +1192,17 @@ exports.create = async (req, res) => {
     logInvoiceAction(
       invoiceId,
       'created',
-      `Sales invoice ${payload.invoiceNumber} created with ${payload.items.length} items`,
+      `Sales invoice ${generatedNumber} created with ${payload.items.length} items ${gstApplicable ? '' : '(GST Exempt)'} ${isManualInvoice ? '(manual number)' : '(auto-generated)'}`,
       {
-        invoiceNumber: payload.invoiceNumber,
+        invoiceNumber: generatedNumber,
+        invoiceSequence: invoiceSequence,
+        sequenceString: sequenceStr,
+        isManualInvoice: isManualInvoice,
         client: payload.clientId,
         total: payload.total || finalTotal,
         items: payload.items.length,
         taxType: taxType,
+        gstApplicable: gstApplicable,
         status: payload.status || "draft",
         projectId: payload.projectId || null,
         projectBudgetUsed: finalTotal,
@@ -736,8 +1214,12 @@ exports.create = async (req, res) => {
     res.status(201).json({ 
       message: "Sales invoice created", 
       id: invoiceId,
-      invoiceNumber: payload.invoiceNumber,
+      invoiceNumber: generatedNumber,
+      invoiceSequence: invoiceSequence,
+      sequenceString: sequenceStr,
+      isManualInvoice: isManualInvoice,
       taxType: taxType,
+      gstApplicable: gstApplicable,
       total: payload.total || finalTotal,
       roundingApplied: payload.roundingApplied || false,
       signatureSaved: !!signatureBase64,
@@ -749,8 +1231,12 @@ exports.create = async (req, res) => {
     await conn.rollback();
     console.error("Error creating sales invoice:", err);
     
-    // Check if it's a budget validation error
-    if (err.message && err.message.includes('exceeds project budget')) {
+    // Handle duplicate invoice number error
+    if (err.code === 'ER_DUP_ENTRY' || err.message.includes('Duplicate entry')) {
+      res.status(400).json({ 
+        message: "Invoice number already exists. Please use a different number."
+      });
+    } else if (err.message && err.message.includes('exceeds project budget')) {
       res.status(400).json({ 
         message: err.message,
         invoiceAmount: err.invoiceAmount,
@@ -768,7 +1254,7 @@ exports.create = async (req, res) => {
   }
 };
 
-// Update SALES invoice with project details - WITH LOGGING
+// Update SALES invoice with invoice number validation
 exports.update = async (req, res) => {
   const conn = await db.getConnection();
   
@@ -787,6 +1273,20 @@ exports.update = async (req, res) => {
     const oldInvoice = rows[0];
     const payload = req.body;
 
+    // Get GST applicability from payload (default to true if not specified)
+    const gstApplicable = payload.gstApplicable !== false;
+    const oldGstApplicable = oldInvoice.meta ? 
+      (typeof oldInvoice.meta === 'string' ? 
+        JSON.parse(oldInvoice.meta).gstApplicable !== false : 
+        (oldInvoice.meta.gstApplicable !== false)) : true;
+
+    // Get tax type based on GST applicability
+    const taxType = gstApplicable ? (payload.taxType || 'sgst_cgst') : 'none';
+    const oldTaxType = oldInvoice.meta ? 
+      (typeof oldInvoice.meta === 'string' ? 
+        (JSON.parse(oldInvoice.meta).taxType || 'sgst_cgst') : 
+        (oldInvoice.meta.taxType || 'sgst_cgst')) : 'sgst_cgst';
+
     // Track changes for history log
     const changes = {};
     
@@ -797,13 +1297,11 @@ exports.update = async (req, res) => {
     if (parseFloat(oldInvoice.total).toFixed(2) !== parseFloat(payload.total).toFixed(2)) {
       changes.total = { from: parseFloat(oldInvoice.total), to: parseFloat(payload.total) };
     }
-    if (oldInvoice.invoiceNumber !== payload.invoiceNumber) {
-      changes.invoiceNumber = { from: oldInvoice.invoiceNumber, to: payload.invoiceNumber };
-    }
-    if (oldInvoice.clientId !== payload.clientId) {
-      changes.client = { from: oldInvoice.clientId, to: payload.clientId };
-    }
-
+    
+    // Get current full invoice number for comparison
+    const currentFullNumber = oldInvoice.invoice_number_generated || 
+      `${oldInvoice.invoice_prefix || 'ICE/25-26/INV/'}${oldInvoice.invoiceNumber}`;
+    
     // Parse old invoice meta to get original project budget
     let oldInvoiceMeta = {};
     if (oldInvoice.meta) {
@@ -816,13 +1314,164 @@ exports.update = async (req, res) => {
       }
     }
 
-    // Get tax type from payload
-    const taxType = payload.taxType || 'sgst_cgst';
+    // Compare GST applicability changes
+    if (oldGstApplicable !== gstApplicable) {
+      changes.gstApplicable = { from: oldGstApplicable, to: gstApplicable };
+    }
 
-    // Compare tax type changes
-    const oldTaxType = oldInvoiceMeta.taxType || 'sgst_cgst';
-    if (oldTaxType !== taxType) {
+    // Compare tax type changes (only if GST is applicable)
+    if (gstApplicable && oldGstApplicable && oldTaxType !== taxType) {
       changes.taxType = { from: oldTaxType, to: taxType };
+    }
+
+    // ==================== INVOICE NUMBER HANDLING FOR UPDATE ====================
+    let newGeneratedNumber = oldInvoice.invoice_number_generated;
+    let newInvoiceSequence = oldInvoice.invoice_sequence;
+    let isManualInvoice = oldInvoice.is_manual_invoice;
+    let originalSequence = oldInvoice.original_sequence;
+    let sequenceStr = oldInvoice.invoiceNumber; // Current sequence string
+    let invoiceNumberChanged = false;
+    let invoicePrefix = payload.invoicePrefix || 'ICE/25-26/INV/';
+
+    console.log("Current invoice number:", currentFullNumber);
+    console.log("New invoice number from payload:", payload.manualInvoiceNumber);
+
+    // Check if invoice number is being changed
+    if (payload.manualInvoiceNumber && payload.manualInvoiceNumber !== currentFullNumber) {
+      console.log("Invoice number changed from", currentFullNumber, "to", payload.manualInvoiceNumber);
+      invoiceNumberChanged = true;
+      
+      // Parse the new invoice number
+      const parsed = parseInvoiceNumber(payload.manualInvoiceNumber, invoicePrefix);
+      
+      if (!parsed.number) {
+        await conn.rollback();
+        return res.status(400).json({ message: "Invalid invoice number format" });
+      }
+      
+      // Use the actual prefix from the parsed number
+      invoicePrefix = parsed.prefix;
+      newGeneratedNumber = parsed.number;
+      
+      // CRITICAL FIX: Validate uniqueness for the right project scope
+      // But skip validation if it's the same number (even if manual)
+      if (newGeneratedNumber !== currentFullNumber) {
+        const isValid = await validateInvoiceNumber(
+          conn,
+          newGeneratedNumber,
+          payload.projectId !== undefined ? payload.projectId : null, // null for no project
+          req.params.id // Exclude current invoice
+        );
+        
+        if (!isValid) {
+          await conn.rollback();
+          return res.status(400).json({
+            message: `Invoice number "${newGeneratedNumber}" already exists ${payload.projectId ? 'for this project' : 'globally'}`,
+            available: false,
+            existingInvoice: true
+          });
+        }
+      }
+      
+      newInvoiceSequence = parsed.sequence || 0;
+      isManualInvoice = true;
+      originalSequence = parsed.sequence || null;
+      sequenceStr = parsed.sequenceStr;
+      
+      console.log('Updated invoice number details:', {
+        newGeneratedNumber,
+        invoicePrefix,
+        newInvoiceSequence,
+        sequenceStr,
+        isManualInvoice
+      });
+      
+      // Update sequence tracker if needed
+      if (parsed.sequence && !isNaN(parsed.sequence)) {
+        const [existing] = await conn.execute(
+          'SELECT * FROM invoice_sequences WHERE project_id <=> ? AND prefix = ? AND invoice_type = ? FOR UPDATE',
+          [payload.projectId !== undefined ? payload.projectId : null, invoicePrefix, 'sales']
+        );
+        
+        if (existing.length === 0) {
+          await conn.execute(
+            'INSERT INTO invoice_sequences (project_id, prefix, invoice_type, last_sequence) VALUES (?, ?, ?, ?)',
+            [payload.projectId !== undefined ? payload.projectId : null, invoicePrefix, 'sales', parsed.sequence]
+          );
+        } else if (parsed.sequence > existing[0].last_sequence) {
+          await conn.execute(
+            'UPDATE invoice_sequences SET last_sequence = ? WHERE project_id <=> ? AND prefix = ? AND invoice_type = ?',
+            [parsed.sequence, payload.projectId !== undefined ? payload.projectId : null, invoicePrefix, 'sales']
+          );
+        }
+      }
+      
+      // Track invoice number change
+      changes.invoiceNumber = { 
+        from: currentFullNumber, 
+        to: newGeneratedNumber 
+      };
+      changes.isManualInvoice = { from: oldInvoice.is_manual_invoice, to: true };
+      changes.sequenceString = { from: oldInvoice.invoiceNumber, to: sequenceStr };
+    } else if (!payload.manualInvoiceNumber) {
+      // Auto-generated mode - check if sequence is being changed
+      const oldSequence = oldInvoice.invoiceNumber;
+      const newSequence = payload.invoiceNumber ? payload.invoiceNumber.padStart(4, '0') : oldSequence;
+      
+      if (oldSequence !== newSequence) {
+        invoiceNumberChanged = true;
+        
+        // Build full invoice number
+        newGeneratedNumber = `${invoicePrefix}${newSequence}`;
+        
+        // Validate uniqueness
+        const isValid = await validateInvoiceNumber(
+          conn,
+          newGeneratedNumber,
+          payload.projectId !== undefined ? payload.projectId : null,
+          req.params.id
+        );
+        
+        if (!isValid) {
+          await conn.rollback();
+          return res.status(400).json({
+            message: `Invoice number "${newGeneratedNumber}" already exists ${payload.projectId ? 'for this project' : 'globally'}`,
+            available: false,
+            existingInvoice: true
+          });
+        }
+        
+        // Update sequence
+        const sequenceNum = parseInt(newSequence, 10);
+        if (!isNaN(sequenceNum)) {
+          newInvoiceSequence = sequenceNum;
+          sequenceStr = newSequence;
+          
+          // Update sequence tracker
+          const [existing] = await conn.execute(
+            'SELECT * FROM invoice_sequences WHERE project_id <=> ? AND prefix = ? AND invoice_type = ? FOR UPDATE',
+            [payload.projectId !== undefined ? payload.projectId : null, invoicePrefix, 'sales']
+          );
+          
+          if (existing.length === 0) {
+            await conn.execute(
+              'INSERT INTO invoice_sequences (project_id, prefix, invoice_type, last_sequence) VALUES (?, ?, ?, ?)',
+              [payload.projectId !== undefined ? payload.projectId : null, invoicePrefix, 'sales', sequenceNum]
+            );
+          } else if (sequenceNum > existing[0].last_sequence) {
+            await conn.execute(
+              'UPDATE invoice_sequences SET last_sequence = ? WHERE project_id <=> ? AND prefix = ? AND invoice_type = ?',
+              [sequenceNum, payload.projectId !== undefined ? payload.projectId : null, invoicePrefix, 'sales']
+            );
+          }
+        }
+        
+        changes.invoiceNumber = { 
+          from: currentFullNumber, 
+          to: newGeneratedNumber 
+        };
+        changes.sequenceString = { from: oldSequence, to: newSequence };
+      }
     }
 
     // Project Budget Validation for Update - Use original project budget from invoice meta
@@ -838,8 +1487,8 @@ exports.update = async (req, res) => {
         
         if (!isNaN(projectBudget) && projectBudget > 0) {
           // Calculate new invoice total for validation
-          const taxType = payload.taxType || 'sgst_cgst';
-          
+          const taxType = gstApplicable ? (payload.taxType || 'sgst_cgst') : 'none';
+
           // Calculate subtotal using the helper function
           const subtotal = payload.items.reduce((sum, item) => {
             return sum + calculateItemBaseAmount(item);
@@ -854,22 +1503,30 @@ exports.update = async (req, res) => {
           const taxable = subtotal - discountValue + additionalChargesTotal;
           const tcs = payload.applyTCS ? taxable * 0.01 : 0;
           
-          // Calculate total tax, SGST, CGST, and IGST from items based on tax type
+          // Calculate total tax based on GST applicability
           let totalTax = 0;
           let sgstTotal = 0;
           let cgstTotal = 0;
           let igstTotal = 0;
 
-          payload.items.forEach(item => {
-            const amounts = calculateItemAmounts(item, taxType);
-            totalTax += amounts.taxAmount;
-            sgstTotal += amounts.sgstAmount;
-            cgstTotal += amounts.cgstAmount;
-            igstTotal += amounts.igstAmount;
-          });
+          if (gstApplicable) {
+            payload.items.forEach(item => {
+              const amounts = calculateItemAmounts(item, taxType, true);
+              totalTax += amounts.taxAmount;
+              sgstTotal += amounts.sgstAmount;
+              cgstTotal += amounts.cgstAmount;
+              igstTotal += amounts.igstAmount;
+            });
+          }
 
           // Apply rounding if enabled
-          const calculatedTotal = taxable + tcs + totalTax + sgstTotal + cgstTotal + igstTotal;
+          let calculatedTotal;
+          if (gstApplicable) {
+            calculatedTotal = taxable + tcs + totalTax + sgstTotal + cgstTotal + igstTotal;
+          } else {
+            calculatedTotal = taxable + tcs; // No tax when GST is not applicable
+          }
+          
           const finalTotal = payload.roundingApplied ? Math.round(calculatedTotal) : calculatedTotal;
           
           console.log("New invoice total amount:", finalTotal, "Original project budget:", projectBudget);
@@ -938,22 +1595,30 @@ exports.update = async (req, res) => {
     const taxable = subtotal - discountValue + additionalChargesTotal;
     const tcs = payload.applyTCS ? taxable * 0.01 : 0;
     
-    // Calculate total tax, SGST, CGST, and IGST from items based on tax type
+    // Calculate total tax based on GST applicability
     let totalTax = 0;
     let sgstTotal = 0;
     let cgstTotal = 0;
     let igstTotal = 0;
 
-    payload.items.forEach(item => {
-      const amounts = calculateItemAmounts(item, taxType);
-      totalTax += amounts.taxAmount;
-      sgstTotal += amounts.sgstAmount;
-      cgstTotal += amounts.cgstAmount;
-      igstTotal += amounts.igstAmount;
-    });
+    if (gstApplicable) {
+      payload.items.forEach(item => {
+        const amounts = calculateItemAmounts(item, taxType, true);
+        totalTax += amounts.taxAmount;
+        sgstTotal += amounts.sgstAmount;
+        cgstTotal += amounts.cgstAmount;
+        igstTotal += amounts.igstAmount;
+      });
+    }
     
     // Apply rounding if enabled
-    const calculatedTotal = taxable + tcs + totalTax + sgstTotal + cgstTotal + igstTotal;
+    let calculatedTotal;
+    if (gstApplicable) {
+      calculatedTotal = taxable + tcs + totalTax + sgstTotal + cgstTotal + igstTotal;
+    } else {
+      calculatedTotal = taxable + tcs; // No tax when GST is not applicable
+    }
+    
     const finalTotal = payload.roundingApplied ? Math.round(calculatedTotal) : calculatedTotal;
 
     // Track rounding changes
@@ -962,9 +1627,10 @@ exports.update = async (req, res) => {
       changes.roundingApplied = { from: oldRoundingApplied, to: payload.roundingApplied || false };
     }
 
-    // Create meta object with tax type and project details
+    // Create meta object with tax type, GST applicability and project details
     const meta = {
       taxType: taxType,
+      gstApplicable: gstApplicable,
       discount: payload.discount || { type: "flat", value: 0 },
       discountValue: discountValue,
       additionalCharges: payload.additionalCharges || [],
@@ -972,9 +1638,9 @@ exports.update = async (req, res) => {
       applyTCS: payload.applyTCS || false,
       tcs: tcs,
       taxableAmount: taxable,
-      sgstTotal: taxType === 'sgst_cgst' ? sgstTotal : 0,
-      cgstTotal: taxType === 'sgst_cgst' ? cgstTotal : 0,
-      igstTotal: taxType === 'igst' ? igstTotal : 0,
+      sgstTotal: gstApplicable && taxType === 'sgst_cgst' ? sgstTotal : 0,
+      cgstTotal: gstApplicable && taxType === 'sgst_cgst' ? cgstTotal : 0,
+      igstTotal: gstApplicable && taxType === 'igst' ? igstTotal : 0,
       totalTax: totalTax,
       
       // Rounding information
@@ -1000,29 +1666,44 @@ exports.update = async (req, res) => {
       poNumber: payload.poNumber || "",
       ewayBillNumber: payload.ewayBillNumber || "",
       vendorCode: payload.vendorCode || "",
-      poDate: formattedPoDate
+      poDate: formattedPoDate,
+      
+      // Invoice number information
+      isManualInvoice: isManualInvoice,
+      invoicePrefix: invoicePrefix,
+      generatedInvoiceNumber: newGeneratedNumber
     };
 
-    // Update main invoice record with project_id
+    // Update main invoice record with project_id and new invoice number fields
     await conn.execute(
       `UPDATE invoices SET 
-        invoiceNumber=?, 
-        date=?, 
-        dueDate=?, 
-        clientId=?, 
-        status=?, 
-        subTotal=?, 
-        tax=?, 
-        discount=?, 
-        total=?, 
-        notes=?, 
-        signature=?, 
-        meta=?, 
-        project_id=?,
-        updatedAt=NOW() 
-      WHERE id=? AND type='sales'`,
+        invoice_prefix = ?,
+        invoice_sequence = ?,
+        invoice_number_generated = ?,
+        is_manual_invoice = ?,
+        original_sequence = ?,
+        invoiceNumber = ?,
+        date = ?, 
+        dueDate = ?, 
+        clientId = ?, 
+        status = ?, 
+        subTotal = ?, 
+        tax = ?, 
+        discount = ?, 
+        total = ?, 
+        notes = ?, 
+        signature = ?, 
+        meta = ?, 
+        project_id = ?,
+        updatedAt = NOW() 
+      WHERE id = ? AND type = 'sales'`,
       [
-        payload.invoiceNumber,
+        invoicePrefix,
+        newInvoiceSequence,
+        newGeneratedNumber,
+        isManualInvoice,
+        originalSequence,
+        sequenceStr, // Store the sequence string
         formattedDate,
         formattedDueDate,
         payload.clientId,
@@ -1109,13 +1790,13 @@ exports.update = async (req, res) => {
 
     // Insert updated items
     for (const item of payload.items) {
-      const amounts = calculateItemAmounts(item, taxType);
+      const amounts = calculateItemAmounts(item, taxType, gstApplicable);
 
-      // Create item meta with tax information based on tax type
+      // Create item meta with tax information based on GST applicability
       const itemMeta = {
-        sgst: taxType === 'sgst_cgst' ? (item.sgst || 9) : 0,
-        cgst: taxType === 'sgst_cgst' ? (item.cgst || 9) : 0,
-        igst: taxType === 'igst' ? (item.igst || 18) : 0,
+        sgst: gstApplicable && taxType === 'sgst_cgst' ? (item.sgst || 9) : 0,
+        cgst: gstApplicable && taxType === 'sgst_cgst' ? (item.cgst || 9) : 0,
+        igst: gstApplicable && taxType === 'igst' ? (item.igst || 18) : 0,
         sgstAmount: amounts.sgstAmount,
         cgstAmount: amounts.cgstAmount,
         igstAmount: amounts.igstAmount,
@@ -1129,7 +1810,7 @@ exports.update = async (req, res) => {
 
       await conn.execute(
         `INSERT INTO invoice_items 
-        (invoiceId,itemId, description, hsn, uom, quantity, rate, discount, tax, taxAmount, amount, meta) 
+        (invoiceId, itemId, description, hsn, uom, quantity, rate, discount, tax, taxAmount, amount, meta) 
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           req.params.id,
@@ -1152,7 +1833,13 @@ exports.update = async (req, res) => {
     await conn.commit();
 
     // THEN log the update action OUTSIDE the transaction
-    let details = `Sales invoice ${payload.invoiceNumber} updated`;
+    let details = `Sales invoice updated to ${newGeneratedNumber}`;
+    if (!gstApplicable) {
+      details += ' (GST Exempt)';
+    }
+    if (invoiceNumberChanged) {
+      details += ' - Invoice number changed';
+    }
     if (Object.keys(changes).length > 0) {
       details += ` - ${Object.keys(changes).join(', ')} changed`;
     }
@@ -1168,8 +1855,12 @@ exports.update = async (req, res) => {
     res.json({ 
       message: "Sales invoice updated successfully",
       id: req.params.id,
-      invoiceNumber: payload.invoiceNumber,
+      invoiceNumber: newGeneratedNumber,
+      invoiceSequence: newInvoiceSequence,
+      sequenceString: sequenceStr,
+      isManualInvoice: isManualInvoice,
       taxType: taxType,
+      gstApplicable: gstApplicable,
       total: payload.total || finalTotal,
       roundingApplied: payload.roundingApplied || false,
       signatureUpdated: !!signatureBase64,
@@ -1181,8 +1872,13 @@ exports.update = async (req, res) => {
     await conn.rollback();
     console.error("Error updating sales invoice:", err);
     
-    // Check if it's a budget validation error
-    if (err.message && err.message.includes('exceeds project budget')) {
+    // Handle duplicate invoice number error
+    if (err.code === 'ER_DUP_ENTRY' || err.message.includes('Duplicate entry')) {
+      res.status(400).json({ 
+        message: "Invoice number already exists. Please use a different number.",
+        error: err.message
+      });
+    } else if (err.message && err.message.includes('exceeds project budget')) {
       res.status(400).json({ 
         message: err.message,
         invoiceAmount: err.invoiceAmount,
@@ -1233,7 +1929,9 @@ exports.delete = async (req, res) => {
 
     // LOG THE DELETION ACTION BEFORE DELETING THE INVOICE
     const logData = {
-      invoiceNumber: invoice.invoiceNumber,
+      invoiceNumber: invoice.invoice_number_generated,
+      invoiceSequence: invoice.invoice_sequence,
+      isManualInvoice: invoice.is_manual_invoice,
       total: invoice.total,
       client: invoice.clientId,
       status: invoice.status,
@@ -1393,7 +2091,7 @@ exports.updatePaymentStatus = async (req, res) => {
     logInvoiceAction(
       req.params.id,
       'payment_updated',
-      `Payment status updated for sales invoice ${oldInvoice.invoiceNumber}`,
+      `Payment status updated for sales invoice ${oldInvoice.invoice_number_generated}`,
       changes,
       req
     );
@@ -1425,7 +2123,7 @@ exports.removeSignature = async (req, res) => {
     await conn.beginTransaction();
 
     const [rows] = await conn.execute(
-      "SELECT id, invoiceNumber FROM invoices WHERE id = ? AND type = 'sales'",
+      "SELECT id, invoice_number_generated FROM invoices WHERE id = ? AND type = 'sales'",
       [req.params.id]
     );
     
@@ -1447,7 +2145,7 @@ exports.removeSignature = async (req, res) => {
     logInvoiceAction(
       req.params.id,
       'signature_removed',
-      `Signature removed from sales invoice ${invoice.invoiceNumber}`,
+      `Signature removed from sales invoice ${invoice.invoice_number_generated}`,
       {
         signature: { from: 'Had signature', to: 'No signature' }
       },
@@ -1630,6 +2328,28 @@ exports.getSalesInvoiceStats = async (req, res) => {
     });
   } catch (err) {
     console.error("Error fetching sales invoice stats:", err);
+    res.status(500).json({ message: "Database error" });
+  }
+};
+
+exports.getHistory = async (req, res) => {
+  try {
+    const [logs] = await db.execute(
+      `SELECT * FROM invoice_history 
+       WHERE invoiceId = ? 
+       ORDER BY createdAt DESC`,
+      [req.params.id]
+    );
+
+    // Parse JSON changes field
+    const parsedLogs = logs.map(log => ({
+      ...log,
+      changes: log.changes ? (typeof log.changes === 'string' ? JSON.parse(log.changes) : log.changes) : {}
+    }));
+
+    res.json(parsedLogs);
+  } catch (err) {
+    console.error("Error fetching invoice history:", err);
     res.status(500).json({ message: "Database error" });
   }
 };

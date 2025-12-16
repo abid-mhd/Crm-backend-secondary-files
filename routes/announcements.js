@@ -3,6 +3,10 @@ const router = express.Router();
 
 // Import the controller properly
 const announcementController = require('../controllers/announcementController');
+const authMiddleware = require('../middleware/authMiddleware');
+
+
+router.use(authMiddleware);
 
 // Define all routes
 router.get('/', announcementController.getAnnouncements);

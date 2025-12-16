@@ -39,6 +39,9 @@ class AnnouncementController {
         this.testAnnouncementNotifications = this.testAnnouncementNotifications.bind(this);
         this.testConnection = this.testConnection.bind(this);
         this.getEmployeesForBirthday = this.getEmployeesForBirthday.bind(this);
+        this.shouldDisplayAnnouncement = this.shouldDisplayAnnouncement.bind(this);
+        this.sendBirthdayEmailToUser = this.sendBirthdayEmailToUser.bind(this);
+        this.sendBirthdaySMSToUser = this.sendBirthdaySMSToUser.bind(this);
         
         // Environment detection
         this.isProduction = process.env.NODE_ENV === 'production';
@@ -54,7 +57,10 @@ class AnnouncementController {
                 SELECT a.*, 
                        u.name as created_by_name,
                        e.employeeName as employee_name,
-                       e.position as employee_position
+                       e.position as employee_position,
+                       e.birthday as employee_dob,
+                       e.email as employee_email,
+                       e.phone as employee_phone
                 FROM announcements a 
                 LEFT JOIN users u ON a.created_by = u.id 
                 LEFT JOIN employees e ON a.employee_id = e.id
@@ -83,14 +89,24 @@ class AnnouncementController {
     async createAnnouncement(req, res) {
         let connection;
         try {
-            const { title, message, priority = 'medium', expiry_date, is_birthday_announcement = false, employee_id } = req.body;
-            const createdBy = req.user?.id || 1; // Get user ID from authenticated user
+            const { 
+                title, 
+                message, 
+                priority = 'medium', 
+                expiry_date, 
+                display_date, // NEW: For scheduled announcements
+                is_birthday_announcement = false, 
+                employee_id 
+            } = req.body;
+            
+            const createdBy = req.user?.id || 1;
             
             console.log('Creating announcement:', { 
                 title, 
                 message, 
                 priority, 
                 expiry_date, 
+                display_date,
                 createdBy, 
                 is_birthday_announcement, 
                 employee_id,
@@ -113,12 +129,29 @@ class AnnouncementController {
                 });
             }
 
+            // For birthday announcements, display_date is required
+            if (is_birthday_announcement && !display_date) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Display date is required for birthday announcements'
+                });
+            }
+
             connection = await pool.getConnection();
             await connection.beginTransaction();
 
+            // Updated query with display_date
             const query = `
-                INSERT INTO announcements (title, message, priority, expiry_date, created_by, employee_id)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO announcements (
+                    title, 
+                    message, 
+                    priority, 
+                    expiry_date, 
+                    display_date, 
+                    created_by, 
+                    employee_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
             `;
 
             const params = [
@@ -126,9 +159,12 @@ class AnnouncementController {
                 message.trim(),
                 priority,
                 expiry_date || null,
+                display_date || null,
                 createdBy,
                 is_birthday_announcement ? employee_id : null
             ];
+
+            console.log('Executing query with params:', params);
 
             const [result] = await connection.query(query, params);
             const announcementId = result.insertId;
@@ -168,33 +204,77 @@ class AnnouncementController {
                 }
             }
 
-            // Send comprehensive notifications to all users except the excluded user
-            const notificationResult = await this.sendAnnouncementNotificationsComprehensive(
-                announcementId, 
-                title, 
-                message, 
-                priority, 
-                expiry_date,
-                excludeUserId, // Exclude creator or birthday person
-                creator.name,
-                is_birthday_announcement,
-                employeeName,
-                birthdayEmployeeEmail,
-                birthdayEmployeePhone
-            );
+            // Check if notifications should be sent now
+            let notificationResult = null;
+            if (is_birthday_announcement) {
+                // For birthday announcements, check if display_date is today
+                const today = new Date();
+                today.setHours(0, 0, 0, 0);
+                
+                const announcementDate = new Date(display_date);
+                announcementDate.setHours(0, 0, 0, 0);
+                
+                if (today.getTime() === announcementDate.getTime()) {
+                    // Send notifications only if display_date is today
+                    notificationResult = await this.sendAnnouncementNotificationsComprehensive(
+                        announcementId, 
+                        title, 
+                        message, 
+                        priority, 
+                        expiry_date,
+                        display_date,
+                        excludeUserId,
+                        creator.name,
+                        is_birthday_announcement,
+                        employeeName,
+                        birthdayEmployeeEmail,
+                        birthdayEmployeePhone
+                    );
+                } else {
+                    console.log(`⏰ Birthday announcement scheduled for ${display_date}, notifications will be sent on that date`);
+                    notificationResult = {
+                        scheduled: true,
+                        display_date: display_date,
+                        message: `Notifications scheduled for ${display_date}`
+                    };
+                }
+            } else {
+                // For regular announcements, send notifications immediately
+                notificationResult = await this.sendAnnouncementNotificationsComprehensive(
+                    announcementId, 
+                    title, 
+                    message, 
+                    priority, 
+                    expiry_date,
+                    display_date,
+                    excludeUserId,
+                    creator.name,
+                    is_birthday_announcement,
+                    employeeName,
+                    birthdayEmployeeEmail,
+                    birthdayEmployeePhone
+                );
+            }
 
             await connection.commit();
 
-            console.log('Notification result:', notificationResult);
+            console.log('Announcement created:', {
+                announcementId,
+                display_date,
+                notifications_sent: !!notificationResult && !notificationResult.scheduled
+            });
 
             res.json({
                 success: true,
                 message: is_birthday_announcement ? 
-                    'Birthday announcement created successfully and notifications sent' : 
+                    (notificationResult.scheduled ? 
+                        `Birthday announcement scheduled for ${display_date}` : 
+                        'Birthday announcement created successfully and notifications sent') : 
                     'Announcement created successfully and notifications sent',
                 id: announcementId,
                 notificationResult: notificationResult,
-                environment: this.isProduction ? 'production' : 'development/staging'
+                environment: this.isProduction ? 'production' : 'development/staging',
+                display_date: display_date || null
             });
         } catch (error) {
             if (connection) await connection.rollback();
@@ -213,10 +293,18 @@ class AnnouncementController {
     async sendBirthdayAnnouncement(req, res) {
         let connection;
         try {
-            const { employee_id, custom_message } = req.body;
+            const { 
+                employee_id, 
+                custom_message, 
+                display_date, // NEW: Required for birthday announcements
+                title: customTitle,
+                message: customMessage 
+            } = req.body;
+            
             const createdBy = req.user?.id || 1;
 
             console.log('Sending birthday announcement for employee:', employee_id, {
+                display_date,
                 environment: this.isProduction ? 'production' : 'development/staging'
             });
 
@@ -227,12 +315,20 @@ class AnnouncementController {
                 });
             }
 
+            if (!display_date) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Display date is required for birthday announcements'
+                });
+            }
+
             connection = await pool.getConnection();
             await connection.beginTransaction();
 
             // Get employee details
             const [employeeDetails] = await connection.query(`
-                SELECT e.employeeName, e.position, e.email, e.phone, u.id as user_id 
+                SELECT e.employeeName, e.position, e.email, e.phone, u.id as user_id,
+                       e.birthday as dob
                 FROM employees e 
                 LEFT JOIN users u ON u.employee_id = e.id 
                 WHERE e.id = ?
@@ -253,19 +349,29 @@ class AnnouncementController {
             const employeePhone = employee.phone;
 
             // Create birthday announcement
-            const title = `🎉 Happy Birthday ${employeeName}!`;
-            const message = custom_message || `Wishing ${employeeName} (${position}) a very happy birthday! May your special day be filled with joy and happiness. 🎂🎈`;
+            const title = customTitle || `🎉 Happy Birthday ${employeeName}!`;
+            const message = customMessage || custom_message || 
+                `Wishing ${employeeName} (${position}) a very happy birthday! May your special day be filled with joy and happiness. 🎂🎈`;
 
+            // Updated query with display_date
             const query = `
-                INSERT INTO announcements (title, message, priority, created_by, employee_id)
-                VALUES (?, ?, 'high', ?, ?)
+                INSERT INTO announcements (
+                    title, 
+                    message, 
+                    priority, 
+                    created_by, 
+                    employee_id, 
+                    display_date
+                )
+                VALUES (?, ?, 'high', ?, ?, ?)
             `;
 
             const [result] = await connection.query(query, [
                 title,
                 message,
                 createdBy,
-                employee_id
+                employee_id,
+                display_date
             ]);
 
             const announcementId = result.insertId;
@@ -283,32 +389,61 @@ class AnnouncementController {
             // Exclude the birthday person's user account if it exists
             const excludeUserId = employee.user_id || createdBy;
 
-            // Send birthday notifications to all users including special notification for birthday person
-            const notificationResult = await this.sendBirthdayNotifications(
-                announcementId,
-                title,
-                message,
-                excludeUserId,
-                creator.name,
-                employeeName,
-                position,
-                employeeEmail,
-                employeePhone
-            );
+            // Check if today is the display date
+            const today = new Date();
+            today.setHours(0, 0, 0, 0);
+            
+            const announcementDate = new Date(display_date);
+            announcementDate.setHours(0, 0, 0, 0);
+            
+            const isToday = today.getTime() === announcementDate.getTime();
+
+            // Send birthday notifications only if it's the display date
+            let notificationResult = null;
+            if (isToday) {
+                notificationResult = await this.sendBirthdayNotifications(
+                    announcementId,
+                    title,
+                    message,
+                    excludeUserId,
+                    creator.name,
+                    employeeName,
+                    position,
+                    employeeEmail,
+                    employeePhone,
+                    display_date
+                );
+            } else {
+                console.log(`🎂 Birthday announcement scheduled for ${display_date}, notifications will be sent on that date`);
+                notificationResult = {
+                    scheduled: true,
+                    display_date: display_date,
+                    message: `Notifications scheduled for ${display_date}`
+                };
+            }
 
             await connection.commit();
 
-            console.log('Birthday notification result:', notificationResult);
+            console.log('Birthday announcement saved:', {
+                announcementId,
+                display_date,
+                notifications_sent: isToday,
+                scheduled_for: isToday ? 'today' : display_date
+            });
 
             res.json({
                 success: true,
-                message: 'Birthday announcement sent successfully',
+                message: isToday ? 
+                    'Birthday announcement sent successfully' : 
+                    `Birthday announcement scheduled for ${display_date}`,
                 id: announcementId,
                 employee: {
                     name: employeeName,
-                    position: position
+                    position: position,
+                    display_date: display_date
                 },
                 notificationResult: notificationResult,
+                scheduled: !isToday,
                 environment: this.isProduction ? 'production' : 'development/staging'
             });
 
@@ -326,11 +461,12 @@ class AnnouncementController {
     }
 
     // Send birthday notifications
-    async sendBirthdayNotifications(announcementId, title, message, excludeUserId, creatorName, employeeName, position, employeeEmail, employeePhone) {
+    async sendBirthdayNotifications(announcementId, title, message, excludeUserId, creatorName, employeeName, position, employeeEmail, employeePhone, display_date) {
         try {
             console.log(`🎂 Starting birthday notifications for ${employeeName}`, {
                 environment: this.isProduction ? 'production' : 'development/staging',
-                smsEnabled: this.isProduction
+                smsEnabled: this.isProduction,
+                display_date: display_date
             });
             
             // Get all active users except the birthday person
@@ -365,7 +501,7 @@ class AnnouncementController {
             // Send special birthday wish to the birthday employee
             if (employeeEmail) {
                 notificationPromises.push(
-                    this.sendBirthdayWishToEmployee(employeeEmail, employeeName, position, creatorName, announcementId)
+                    this.sendBirthdayWishToEmployee(employeeEmail, employeeName, position, creatorName, announcementId, display_date)
                         .then(() => ({ type: 'birthday_wish_email', success: true }))
                         .catch(err => {
                             console.error(`Birthday wish email error for ${employeeName}:`, err);
@@ -376,7 +512,7 @@ class AnnouncementController {
 
             if (employeePhone && this.isProduction) {
                 notificationPromises.push(
-                    this.sendBirthdayWishSMS(employeePhone, employeeName, creatorName, announcementId)
+                    this.sendBirthdayWishSMS(employeePhone, employeeName, creatorName, announcementId, display_date)
                         .then(() => ({ type: 'birthday_wish_sms', success: true }))
                         .catch(err => {
                             console.error(`Birthday wish SMS error for ${employeeName}:`, err);
@@ -414,7 +550,7 @@ class AnnouncementController {
                 // Email notification - send to individual with CC to all others
                 if (user.email) {
                     userNotificationPromises.push(
-                        this.sendBirthdayEmailToUser(user, title, message, employeeName, position, announcementId, ccEmails)
+                        this.sendBirthdayEmailToUser(user, title, message, employeeName, position, announcementId, ccEmails, display_date)
                             .then(() => ({ type: 'email', success: true }))
                             .catch(err => {
                                 console.error(`Email error for user ${user.id}:`, err);
@@ -426,7 +562,7 @@ class AnnouncementController {
                 // SMS notification - only in production
                 if (user.phone && this.isProduction) {
                     userNotificationPromises.push(
-                        this.sendBirthdaySMSToUser(user, title, message, employeeName, announcementId)
+                        this.sendBirthdaySMSToUser(user, title, message, employeeName, announcementId, display_date)
                             .then(() => ({ type: 'sms', success: true }))
                             .catch(err => {
                                 console.error(`SMS error for user ${user.id}:`, err);
@@ -486,7 +622,8 @@ class AnnouncementController {
                 failed: totalFailed,
                 details: allResults,
                 environment: this.isProduction ? 'production' : 'development/staging',
-                smsEnabled: this.isProduction
+                smsEnabled: this.isProduction,
+                display_date: display_date
             };
 
         } catch (error) {
@@ -496,7 +633,7 @@ class AnnouncementController {
     }
 
     // Send special birthday wish email to the birthday employee
-    async sendBirthdayWishToEmployee(employeeEmail, employeeName, position, creatorName, announcementId) {
+    async sendBirthdayWishToEmployee(employeeEmail, employeeName, position, creatorName, announcementId, display_date) {
         try {
             if (!employeeEmail) {
                 console.log(`No email address for birthday employee ${employeeName}`);
@@ -504,6 +641,13 @@ class AnnouncementController {
             }
 
             const staffPortalLink = process.env.FRONTEND_URL || 'http://16.16.110.203';
+
+            const displayDateFormatted = display_date ? new Date(display_date).toLocaleDateString('en-IN', {
+                weekday: 'long',
+                year: 'numeric',
+                month: 'long',
+                day: 'numeric'
+            }) : 'Today';
 
             const emailHtml = `<!DOCTYPE html>
             <html>
@@ -516,6 +660,7 @@ class AnnouncementController {
                     .wish-content { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border-radius: 8px; padding: 30px; margin: 20px 0; line-height: 1.6; text-align: center; }
                     .button { display: inline-block; background: #091D78; color: #fff; padding: 12px 30px; border-radius: 6px; text-decoration: none; font-weight: bold; margin: 10px 0; }
                     .footer { margin-top: 30px; padding-top: 20px; border-top: 1px solid #e5e7eb; color: #6b7280; font-size: 14px; }
+                    .date-badge { display: inline-block; background: rgba(255,255,255,0.2); padding: 5px 15px; border-radius: 20px; margin: 10px 0; font-size: 14px; }
                 </style>
             </head>
             <body>
@@ -523,6 +668,7 @@ class AnnouncementController {
                     <div class="header">
                         <div class="birthday-icon">🎉</div>
                         <h2 style="color: #091D78; margin: 0;">Happy Birthday ${employeeName}!</h2>
+                        <div class="date-badge">${displayDateFormatted}</div>
                     </div>
                     
                     <div class="wish-content">
@@ -581,7 +727,7 @@ class AnnouncementController {
     }
 
     // Send special birthday wish SMS to the birthday employee
-    async sendBirthdayWishSMS(employeePhone, employeeName, creatorName, announcementId) {
+    async sendBirthdayWishSMS(employeePhone, employeeName, creatorName, announcementId, display_date) {
         try {
             // Only send SMS in production environment
             if (!this.isProduction) {
@@ -602,6 +748,8 @@ class AnnouncementController {
                 formattedPhone = `+91${cleanPhone}`;
             }
 
+            const displayDateFormatted = display_date ? new Date(display_date).toLocaleDateString('en-IN') : 'Today';
+
             const smsMessage = `🎉 Happy Birthday ${employeeName}! 🎂
 
 On behalf of Icebergs India, we wish you a wonderful birthday filled with joy and happiness!
@@ -611,6 +759,7 @@ May your special day be as amazing as you are. Enjoy your day to the fullest!
 Warm regards,
 ${creatorName} & Icebergs India Team
 
+Date: ${displayDateFormatted}
 - Icebergs India HR System`;
 
             const messageOptions = {
@@ -638,7 +787,7 @@ ${creatorName} & Icebergs India Team
     }
 
     // Send birthday email to other users (not the birthday person)
-    async sendBirthdayEmailToUser(user, title, message, employeeName, position, announcementId, ccEmails = []) {
+    async sendBirthdayEmailToUser(user, title, message, employeeName, position, announcementId, ccEmails = [], display_date = null) {
         try {
             if (!user.email) {
                 console.log(`No email address for user ${user.name}`);
@@ -647,6 +796,13 @@ ${creatorName} & Icebergs India Team
 
             const staffPortalLink = process.env.FRONTEND_URL || 'http://16.16.110.203';
             const announcementLink = `${staffPortalLink}/announcements`;
+
+            const displayDateFormatted = display_date ? new Date(display_date).toLocaleDateString('en-IN', {
+                weekday: 'long',
+                year: 'numeric',
+                month: 'long',
+                day: 'numeric'
+            }) : 'Today';
 
             const emailHtml = `<!DOCTYPE html>
             <html>
@@ -660,6 +816,7 @@ ${creatorName} & Icebergs India Team
                     .button { display: inline-block; background: #091D78; color: #fff; padding: 12px 30px; border-radius: 6px; text-decoration: none; font-weight: bold; margin: 10px 0; }
                     .footer { margin-top: 30px; padding-top: 20px; border-top: 1px solid #e5e7eb; color: #6b7280; font-size: 14px; }
                     .employee-card { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px; border-radius: 8px; margin: 20px 0; text-align: center; }
+                    .date-badge { display: inline-block; background: rgba(255,255,255,0.2); padding: 5px 15px; border-radius: 20px; margin: 10px 0; font-size: 14px; }
                 </style>
             </head>
             <body>
@@ -667,6 +824,7 @@ ${creatorName} & Icebergs India Team
                     <div class="header">
                         <div class="birthday-icon">🎉</div>
                         <h2 style="color: #091D78; margin: 0;">Birthday Celebration!</h2>
+                        <div class="date-badge">${displayDateFormatted}</div>
                     </div>
                     
                     <div class="employee-card">
@@ -707,8 +865,8 @@ ${creatorName} & Icebergs India Team
             const mailOptions = {
                 from: `"Icebergs India - Birthday Wishes" <${process.env.EMAIL_USER}>`,
                 to: user.email,
-                cc: ccEmails.filter(email => email !== user.email), // CC all other employees except current recipient
-                subject: title,
+                cc: ccEmails.filter(email => email !== user.email),
+                subject: `${title} - ${displayDateFormatted}`,
                 html: emailHtml
             };
 
@@ -722,7 +880,7 @@ ${creatorName} & Icebergs India Team
     }
 
     // Send birthday SMS to other users (not the birthday person)
-    async sendBirthdaySMSToUser(user, title, message, employeeName, announcementId) {
+    async sendBirthdaySMSToUser(user, title, message, employeeName, announcementId, display_date = null) {
         try {
             // Only send SMS in production environment
             if (!this.isProduction) {
@@ -743,11 +901,16 @@ ${creatorName} & Icebergs India Team
                 formattedPhone = `+91${cleanPhone}`;
             }
 
+            const displayDateFormatted = display_date ? new Date(display_date).toLocaleDateString('en-IN') : 'Today';
+
             const smsMessage = `🎉 Birthday Celebration!
 
 Today is ${employeeName}'s birthday!
 
-${message}
+${this.truncateMessage(message, 80)}
+
+Date: ${displayDateFormatted}
+Announcement ID: ${announcementId}
 
 Let's wish ${employeeName} a wonderful birthday! 🎂
 
@@ -790,7 +953,8 @@ Let's wish ${employeeName} a wonderful birthday! 🎂
                     e.department,
                     e.email,
                     e.phone,
-                    DATE_FORMAT(e.birthday, '%d-%m-%Y') as birthday
+                    DATE_FORMAT(e.birthday, '%d-%m-%Y') as birthday,
+                    e.birthday
                 FROM employees e
                 ORDER BY e.employeeName
             `;
@@ -813,14 +977,38 @@ Let's wish ${employeeName} a wonderful birthday! 🎂
         }
     }
 
-    // Updated comprehensive announcement notifications to handle birthday announcements
-    async sendAnnouncementNotificationsComprehensive(announcementId, title, message, priority, expiry_date, excludeUserId, creatorName, isBirthdayAnnouncement = false, employeeName = null, birthdayEmployeeEmail = null, birthdayEmployeePhone = null) {
+    // Updated comprehensive announcement notifications to handle display_date
+    async sendAnnouncementNotificationsComprehensive(announcementId, title, message, priority, expiry_date, display_date, excludeUserId, creatorName, isBirthdayAnnouncement = false, employeeName = null, birthdayEmployeeEmail = null, birthdayEmployeePhone = null) {
         try {
             console.log(`🔔 Starting comprehensive announcement notifications for announcement ${announcementId}`, {
                 environment: this.isProduction ? 'production' : 'development/staging',
-                smsEnabled: this.isProduction
+                smsEnabled: this.isProduction,
+                display_date: display_date,
+                isBirthdayAnnouncement: isBirthdayAnnouncement
             });
             
+            // Check if announcement should be sent today based on display_date
+            if (isBirthdayAnnouncement && display_date) {
+                const today = new Date();
+                today.setHours(0, 0, 0, 0);
+                
+                const announcementDate = new Date(display_date);
+                announcementDate.setHours(0, 0, 0, 0);
+                
+                if (today.getTime() !== announcementDate.getTime()) {
+                    console.log(`⏰ Birthday announcement ${announcementId} is scheduled for ${display_date}, skipping notifications for today`);
+                    return {
+                        totalUsers: 0,
+                        totalNotifications: 0,
+                        successful: 0,
+                        failed: 0,
+                        scheduled: true,
+                        display_date: display_date,
+                        message: `Notifications scheduled for ${display_date}`
+                    };
+                }
+            }
+
             // Get all active users except the excluded user
             const [users] = await pool.query(`
                 SELECT 
@@ -853,7 +1041,7 @@ Let's wish ${employeeName} a wonderful birthday! 🎂
             // For birthday announcements, send special wishes to the birthday employee
             if (isBirthdayAnnouncement && birthdayEmployeeEmail) {
                 notificationPromises.push(
-                    this.sendBirthdayWishToEmployee(birthdayEmployeeEmail, employeeName, '', creatorName, announcementId)
+                    this.sendBirthdayWishToEmployee(birthdayEmployeeEmail, employeeName, '', creatorName, announcementId, display_date)
                         .then(() => ({ type: 'birthday_wish_email', success: true }))
                         .catch(err => {
                             console.error(`Birthday wish email error for ${employeeName}:`, err);
@@ -864,7 +1052,7 @@ Let's wish ${employeeName} a wonderful birthday! 🎂
 
             if (isBirthdayAnnouncement && birthdayEmployeePhone && this.isProduction) {
                 notificationPromises.push(
-                    this.sendBirthdayWishSMS(birthdayEmployeePhone, employeeName, creatorName, announcementId)
+                    this.sendBirthdayWishSMS(birthdayEmployeePhone, employeeName, creatorName, announcementId, display_date)
                         .then(() => ({ type: 'birthday_wish_sms', success: true }))
                         .catch(err => {
                             console.error(`Birthday wish SMS error for ${employeeName}:`, err);
@@ -903,7 +1091,7 @@ Let's wish ${employeeName} a wonderful birthday! 🎂
                 if (user.email) {
                     if (isBirthdayAnnouncement) {
                         userNotificationPromises.push(
-                            this.sendBirthdayEmailToUser(user, title, message, employeeName, '', announcementId, ccEmails)
+                            this.sendBirthdayEmailToUser(user, title, message, employeeName, '', announcementId, ccEmails, display_date)
                                 .then(() => ({ type: 'email', success: true }))
                                 .catch(err => {
                                     console.error(`Birthday email error for user ${user.id}:`, err);
@@ -912,7 +1100,7 @@ Let's wish ${employeeName} a wonderful birthday! 🎂
                         );
                     } else {
                         userNotificationPromises.push(
-                            this.sendAnnouncementEmailToUser(user, title, message, priority, expiry_date, creatorName, announcementId)
+                            this.sendAnnouncementEmailToUser(user, title, message, priority, expiry_date, creatorName, announcementId, display_date)
                                 .then(() => ({ type: 'email', success: true }))
                                 .catch(err => {
                                     console.error(`Email error for user ${user.id}:`, err);
@@ -926,7 +1114,7 @@ Let's wish ${employeeName} a wonderful birthday! 🎂
                 if (user.phone && this.isProduction) {
                     if (isBirthdayAnnouncement) {
                         userNotificationPromises.push(
-                            this.sendBirthdaySMSToUser(user, title, message, employeeName, announcementId)
+                            this.sendBirthdaySMSToUser(user, title, message, employeeName, announcementId, display_date)
                                 .then(() => ({ type: 'sms', success: true }))
                                 .catch(err => {
                                     console.error(`Birthday SMS error for user ${user.id}:`, err);
@@ -935,7 +1123,7 @@ Let's wish ${employeeName} a wonderful birthday! 🎂
                         );
                     } else {
                         userNotificationPromises.push(
-                            this.sendAnnouncementSMSToUser(user, title, message, priority, announcementId)
+                            this.sendAnnouncementSMSToUser(user, title, message, priority, announcementId, display_date)
                                 .then(() => ({ type: 'sms', success: true }))
                                 .catch(err => {
                                     console.error(`SMS error for user ${user.id}:`, err);
@@ -997,7 +1185,8 @@ Let's wish ${employeeName} a wonderful birthday! 🎂
                 failed: totalFailed,
                 details: allResults,
                 environment: this.isProduction ? 'production' : 'development/staging',
-                smsEnabled: this.isProduction
+                smsEnabled: this.isProduction,
+                display_date: display_date
             };
 
         } catch (error) {
@@ -1007,7 +1196,7 @@ Let's wish ${employeeName} a wonderful birthday! 🎂
     }
 
     // Send announcement email to user (for regular announcements)
-    async sendAnnouncementEmailToUser(user, title, message, priority, expiry_date, creatorName, announcementId) {
+    async sendAnnouncementEmailToUser(user, title, message, priority, expiry_date, creatorName, announcementId, display_date = null) {
         try {
             if (!user.email) {
                 console.log(`No email address for user ${user.name}`);
@@ -1018,6 +1207,12 @@ Let's wish ${employeeName} a wonderful birthday! 🎂
             const announcementLink = `${staffPortalLink}/announcements`;
             
             const priorityInfo = this.getPriorityInfo(priority);
+
+            const displayDateInfo = display_date ? `
+                <div class="detail-item">
+                    <strong>Display Date:</strong> ${new Date(display_date).toLocaleDateString('en-IN')}
+                </div>
+            ` : '';
 
             const emailHtml = `<!DOCTYPE html>
             <html>
@@ -1053,6 +1248,7 @@ Let's wish ${employeeName} a wonderful birthday! 🎂
                         <div class="detail-item">
                             <strong>Announcement ID:</strong> #${announcementId}
                         </div>
+                        ${displayDateInfo}
                         ${expiry_date ? `
                         <div class="detail-item">
                             <strong>Expires:</strong> ${new Date(expiry_date).toLocaleDateString('en-IN')}
@@ -1107,7 +1303,7 @@ Let's wish ${employeeName} a wonderful birthday! 🎂
     }
 
     // Send announcement SMS to user (for regular announcements)
-    async sendAnnouncementSMSToUser(user, title, message, priority, announcementId) {
+    async sendAnnouncementSMSToUser(user, title, message, priority, announcementId, display_date = null) {
         try {
             // Only send SMS in production environment
             if (!this.isProduction) {
@@ -1137,10 +1333,17 @@ Let's wish ${employeeName} a wonderful birthday! 🎂
 
             const priorityEmoji = priorityTexts[priority] || '📢';
             const truncatedMessage = this.truncateMessage(message, 80);
+            
+            let displayInfo = '';
+            if (display_date) {
+                const displayDate = new Date(display_date);
+                displayInfo = `\n📅 Display Date: ${displayDate.toLocaleDateString('en-IN')}`;
+            }
 
             const smsMessage = `${priorityEmoji} New Announcement: ${title}
 
 ${truncatedMessage}
+${displayInfo}
 
 Announcement ID: ${announcementId}
 
@@ -1233,9 +1436,9 @@ Please check the staff portal for details.`;
     async updateAnnouncement(req, res) {
         try {
             const { id } = req.params;
-            const { title, message, priority, expiry_date, is_active } = req.body;
+            const { title, message, priority, expiry_date, display_date, is_active } = req.body;
 
-            console.log('Updating announcement:', id, { title, message, priority, expiry_date, is_active });
+            console.log('Updating announcement:', id, { title, message, priority, expiry_date, display_date, is_active });
 
             // Check if announcement exists
             const [existing] = await pool.query('SELECT * FROM announcements WHERE id = ?', [id]);
@@ -1268,6 +1471,11 @@ Please check the staff portal for details.`;
             if (expiry_date !== undefined) {
                 updateFields.push('expiry_date = ?');
                 updateParams.push(expiry_date);
+            }
+
+            if (display_date !== undefined) {
+                updateFields.push('display_date = ?');
+                updateParams.push(display_date);
             }
 
             if (is_active !== undefined) {
@@ -1314,9 +1522,13 @@ Please check the staff portal for details.`;
             console.log('Fetching announcement:', id);
 
             const query = `
-                SELECT a.*, u.name as created_by_name 
+                SELECT a.*, 
+                       u.name as created_by_name,
+                       e.employeeName as employee_name,
+                       e.position as employee_position
                 FROM announcements a 
                 LEFT JOIN users u ON a.created_by = u.id 
+                LEFT JOIN employees e ON a.employee_id = e.id
                 WHERE a.id = ?
             `;
             
@@ -1348,11 +1560,20 @@ Please check the staff portal for details.`;
         try {
             console.log('Fetching active announcements...');
             
+            const today = new Date().toISOString().split('T')[0];
+            
             const query = `
-                SELECT a.*, u.name as created_by_name 
+                SELECT a.*, 
+                       u.name as created_by_name,
+                       e.employeeName as employee_name,
+                       e.position as employee_position
                 FROM announcements a 
                 LEFT JOIN users u ON a.created_by = u.id 
-               
+                LEFT JOIN employees e ON a.employee_id = e.id
+                WHERE 
+                    (a.employee_id IS NULL AND (a.expiry_date IS NULL OR a.expiry_date >= ?)) -- Regular announcements not expired
+                    OR 
+                    (a.employee_id IS NOT NULL AND a.display_date = ?) -- Birthday announcements for today
                 ORDER BY 
                     CASE a.priority 
                         WHEN 'urgent' THEN 1 
@@ -1363,13 +1584,14 @@ Please check the staff portal for details.`;
                     a.created_at DESC
             `;
             
-            const [results] = await pool.query(query);
+            const [results] = await pool.query(query, [today, today]);
             
-            console.log('Found active announcements:', results.length);
+            console.log('Found active announcements:', results.length, { today });
             
             res.json({
                 success: true,
-                announcements: results
+                announcements: results,
+                today: today
             });
         } catch (error) {
             console.log('Database error:', error);
@@ -1379,6 +1601,32 @@ Please check the staff portal for details.`;
                 error: error.message
             });
         }
+    }
+
+    // Helper function to check if announcement should be displayed
+    shouldDisplayAnnouncement(announcement) {
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        
+        // For regular announcements
+        if (!announcement.employee_id) {
+            if (!announcement.expiry_date) return true;
+            
+            const expiryDate = new Date(announcement.expiry_date);
+            expiryDate.setHours(0, 0, 0, 0);
+            
+            return expiryDate >= today;
+        }
+        
+        // For birthday announcements
+        if (announcement.display_date) {
+            const displayDate = new Date(announcement.display_date);
+            displayDate.setHours(0, 0, 0, 0);
+            
+            return displayDate.getTime() === today.getTime();
+        }
+        
+        return false;
     }
 
     // Test announcement notifications
@@ -1412,7 +1660,8 @@ Please check the staff portal for details.`;
             const testTitle = 'Test Announcement';
             const testMessage = 'This is a test announcement to verify notification systems. Please ignore this message.';
             const testPriority = 'high';
-            const testExpiryDate = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]; // 7 days from now
+            const testExpiryDate = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+            const testDisplayDate = new Date().toISOString().split('T')[0];
 
             console.log(`Testing notifications for user: ${user.name}`, {
                 email: user.email,
@@ -1436,13 +1685,13 @@ Please check the staff portal for details.`;
                 .catch(err => ({ type: 'panel', success: false, error: err.message })),
                 
                 // Email notification
-                user.email ? this.sendAnnouncementEmailToUser(user, testTitle, testMessage, testPriority, testExpiryDate, 'Test System', testAnnouncementId)
+                user.email ? this.sendAnnouncementEmailToUser(user, testTitle, testMessage, testPriority, testExpiryDate, 'Test System', testAnnouncementId, testDisplayDate)
                     .then(() => ({ type: 'email', success: true }))
                     .catch(err => ({ type: 'email', success: false, error: err.message })) 
                     : Promise.resolve({ type: 'email', success: true, skipped: 'No email' }),
                 
                 // SMS notification - only in production
-                (user.phone && this.isProduction) ? this.sendAnnouncementSMSToUser(user, testTitle, testMessage, testPriority, testAnnouncementId)
+                (user.phone && this.isProduction) ? this.sendAnnouncementSMSToUser(user, testTitle, testMessage, testPriority, testAnnouncementId, testDisplayDate)
                     .then(() => ({ type: 'sms', success: true }))
                     .catch(err => ({ type: 'sms', success: false, error: err.message }))
                     : Promise.resolve({ 
