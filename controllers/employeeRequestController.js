@@ -78,6 +78,7 @@ class EmployeeRequestController {
           AND a.status = 'Absent'
           AND DATE(a.date) >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)
           AND DATE(a.date) < CURDATE()
+          AND a.check_in IS NOT NULL
           AND a.check_out IS NULL
           AND NOT EXISTS (
             SELECT 1 FROM employee_requests er 
