@@ -78,7 +78,7 @@ class EmployeeRequestController {
           AND a.status = 'Absent'
           AND DATE(a.date) >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)
           AND DATE(a.date) < CURDATE()
-          AND a.check_in IS NOT NULL
+          AND a.check_in IS NOT NULL  
           AND a.check_out IS NULL
           AND NOT EXISTS (
             SELECT 1 FROM employee_requests er 
@@ -809,59 +809,105 @@ async sendRequestSubmissionSMSToEmployee(employee, requestDate, reason, requestI
 }
 
   // Get my requests (for employee)
-  async getMyRequests(req, res) {
-    try {
-      const employeeId = await this.getEmployeeId(req);
+async getMyRequests(req, res) {
+  try {
+    const employeeId = await this.getEmployeeId(req);
 
-      if (!employeeId) {
-        return res.status(400).json({
-          success: false,
-          message: 'Employee ID not found in user data'
-        });
-      }
-
-      const [requests] = await db.query(`
-        SELECT 
-          er.*,
-          a.status as original_status,
-          u.name as reviewed_by_name
-        FROM employee_requests er
-        LEFT JOIN attendance a ON er.employee_id = a.employee_id AND er.request_date = a.date
-        LEFT JOIN users u ON er.handled_by = u.id
-        WHERE er.employee_id = ?
-        ORDER BY er.created_at DESC
-      `, [employeeId]);
-
-      res.json({
-        success: true,
-        data: requests,
-        message: 'Requests fetched successfully'
-      });
-
-    } catch (error) {
-      console.error('Error fetching requests:', error);
-      res.status(500).json({
+    if (!employeeId) {
+      return res.status(400).json({
         success: false,
-        message: 'Failed to fetch requests',
-        error: error.message
+        message: 'Employee ID not found in user data'
       });
     }
-  }
 
-  async getAllRequests(req, res) {
+    const [allRequests] = await db.query(`
+      SELECT 
+        er.*,
+        a.status as original_status,
+        u.name as reviewed_by_name
+      FROM employee_requests er
+      LEFT JOIN attendance a ON er.employee_id = a.employee_id AND er.request_date = a.date
+      LEFT JOIN users u ON er.handled_by = u.id
+      WHERE er.employee_id = ?
+      AND (
+        er.request_type != 'unmark_absent' 
+        OR er.attendance_id IS NULL
+        OR er.status != 'pending'
+        OR NOT EXISTS (
+          SELECT 1 
+          FROM employee_requests er2 
+          WHERE er2.request_type = 'unmark_absent' 
+            AND er2.attendance_id = er.attendance_id 
+            AND er2.status = 'approved'
+            AND er2.employee_id = er.employee_id
+        )
+      )
+      ORDER BY er.created_at DESC
+    `, [employeeId]);
+
+    // Filter for unmark_absent type to ensure unique attendance_id
+    const processedRequests = [];
+    const seenAttendanceIds = new Set();
+
+    for (const request of allRequests) {
+      if (request.request_type === 'unmark_absent' && request.attendance_id) {
+        if (seenAttendanceIds.has(request.attendance_id)) {
+          continue;
+        }
+        seenAttendanceIds.add(request.attendance_id);
+      }
+      processedRequests.push(request);
+    }
+
+    res.json({
+      success: true,
+      data: processedRequests,
+      message: 'Requests fetched successfully'
+    });
+
+  } catch (error) {
+    console.error('Error fetching requests:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch requests',
+      error: error.message
+    });
+  }
+}
+
+async getAllRequests(req, res) {
   try {
     const { page = 1, limit = 10, status = 'all' } = req.query;
     const offset = (page - 1) * limit;
 
-    let whereClause = '';
-    let queryParams = [parseInt(limit), parseInt(offset)];
+    let whereClause = 'WHERE 1=1';
+    let queryParams = [];
+    let countParams = [];
 
     if (status !== 'all') {
-      whereClause = 'WHERE er.status = ?';
-      queryParams = [status, parseInt(limit), parseInt(offset)];
+      whereClause += ' AND er.status = ?';
+      queryParams.push(status);
+      countParams.push(status);
     }
 
-    const [requests] = await db.query(`
+    // Add exclusion for pending unmark_absent requests where attendance_id already approved
+    whereClause += ` AND (
+      er.request_type != 'unmark_absent' 
+      OR er.attendance_id IS NULL
+      OR er.status != 'pending'
+      OR NOT EXISTS (
+        SELECT 1 
+        FROM employee_requests er2 
+        WHERE er2.request_type = 'unmark_absent' 
+          AND er2.attendance_id = er.attendance_id 
+          AND er2.status = 'approved'
+          AND er2.employee_id = er.employee_id
+      )
+    )`;
+
+    queryParams.push(parseInt(limit), parseInt(offset));
+
+    const [allRequests] = await db.query(`
       SELECT 
         er.*,
         e.employeeName,
@@ -877,21 +923,60 @@ async sendRequestSubmissionSMSToEmployee(employee, requestDate, reason, requestI
       LIMIT ? OFFSET ?
     `, queryParams);
 
-    // Get total count
-    let countQuery = 'SELECT COUNT(*) as total FROM employee_requests er';
-    let countParams = [];
+    // Filter for unmark_absent type to ensure unique attendance_id
+    const processedRequests = [];
+    const seenAttendanceIds = new Set();
+
+    for (const request of allRequests) {
+      if (request.request_type === 'unmark_absent' && request.attendance_id) {
+        // Skip if we've already seen this attendance_id for this employee
+        const uniqueKey = `${request.employee_id}_${request.attendance_id}`;
+        if (seenAttendanceIds.has(uniqueKey)) {
+          continue;
+        }
+        seenAttendanceIds.add(uniqueKey);
+      }
+      processedRequests.push(request);
+    }
+
+    // Get total count with the same exclusion logic
+    let countQuery = `
+      SELECT COUNT(DISTINCT 
+        CASE 
+          WHEN er.request_type = 'unmark_absent' AND er.attendance_id IS NOT NULL 
+          THEN CONCAT(er.employee_id, '_', er.attendance_id, '_', er.status)
+          ELSE CONCAT('other_', er.id)
+        END
+      ) as total 
+      FROM employee_requests er
+      WHERE 1=1
+    `;
     
     if (status !== 'all') {
-      countQuery += ' WHERE er.status = ?';
-      countParams = [status];
+      countQuery += ' AND er.status = ?';
     }
+
+    // Add the same exclusion logic to count query
+    countQuery += ` AND (
+      er.request_type != 'unmark_absent' 
+      OR er.attendance_id IS NULL
+      OR er.status != 'pending'
+      OR NOT EXISTS (
+        SELECT 1 
+        FROM employee_requests er2 
+        WHERE er2.request_type = 'unmark_absent' 
+          AND er2.attendance_id = er.attendance_id 
+          AND er2.status = 'approved'
+          AND er2.employee_id = er.employee_id
+      )
+    )`;
 
     const [totalCount] = await db.query(countQuery, countParams);
 
     res.json({
       success: true,
       data: {
-        requests: requests,
+        requests: processedRequests,
         total: totalCount[0].total,
         page: parseInt(page),
         limit: parseInt(limit)
@@ -915,7 +1000,8 @@ async getAllPendingRequests(req, res) {
     const { page = 1, limit = 5 } = req.query;
     const offset = (page - 1) * limit;
 
-    const [requests] = await db.query(`
+    // Get all pending requests, but exclude unmark_absent requests where attendance_id already has an approved request
+    const [allRequests] = await db.query(`
       SELECT 
         er.*,
         e.employeeName,
@@ -927,21 +1013,65 @@ async getAllPendingRequests(req, res) {
       INNER JOIN employees e ON er.employee_id = e.id
       LEFT JOIN users u ON er.handled_by = u.id
       WHERE er.status = 'pending'
+      AND (
+        er.request_type != 'unmark_absent' 
+        OR er.attendance_id IS NULL
+        OR NOT EXISTS (
+          SELECT 1 
+          FROM employee_requests er2 
+          WHERE er2.request_type = 'unmark_absent' 
+            AND er2.attendance_id = er.attendance_id 
+            AND er2.status = 'approved'
+            AND er2.employee_id = er.employee_id
+        )
+      )
       ORDER BY er.created_at DESC
       LIMIT ? OFFSET ?
     `, [parseInt(limit), parseInt(offset)]);
 
-    // Get total count
+    // Further filter for unmark_absent to ensure unique attendance_id in the result set
+    const processedRequests = [];
+    const seenAttendanceIds = new Set();
+
+    for (const request of allRequests) {
+      if (request.request_type === 'unmark_absent' && request.attendance_id) {
+        if (seenAttendanceIds.has(request.attendance_id)) {
+          continue;
+        }
+        seenAttendanceIds.add(request.attendance_id);
+      }
+      processedRequests.push(request);
+    }
+
+    // Get total count with the same exclusion logic
     const [totalCount] = await db.query(`
-      SELECT COUNT(*) as total 
-      FROM employee_requests 
-      WHERE status = 'pending'
+      SELECT COUNT(DISTINCT 
+        CASE 
+          WHEN er.request_type = 'unmark_absent' AND er.attendance_id IS NOT NULL 
+          THEN CONCAT(er.employee_id, '_unmark_absent_', er.attendance_id)
+          ELSE CONCAT('other_', er.id)
+        END
+      ) as total 
+      FROM employee_requests er
+      WHERE er.status = 'pending'
+      AND (
+        er.request_type != 'unmark_absent' 
+        OR er.attendance_id IS NULL
+        OR NOT EXISTS (
+          SELECT 1 
+          FROM employee_requests er2 
+          WHERE er2.request_type = 'unmark_absent' 
+            AND er2.attendance_id = er.attendance_id 
+            AND er2.status = 'approved'
+            AND er2.employee_id = er.employee_id
+        )
+      )
     `);
 
     res.json({
       success: true,
       data: {
-        requests: requests,
+        requests: processedRequests,
         total: totalCount[0].total,
         page: parseInt(page),
         limit: parseInt(limit)
@@ -959,7 +1089,7 @@ async getAllPendingRequests(req, res) {
   }
 }
 
-// Update request status (for HR/Admin)
+ // Update request status (for HR/Admin)
 async updateRequestStatus(req, res) {
   try {
     const { requestId } = req.params;
@@ -999,7 +1129,7 @@ async updateRequestStatus(req, res) {
       user_id: request.employee_user_id
     };
 
-    // Check if request is already processed (NOT pending)
+   // Check if request is already processed (NOT pending)
     if (request.status == 'pending') {
       return res.status(400).json({
         success: false,
@@ -1012,30 +1142,66 @@ async updateRequestStatus(req, res) {
       connection = await db.getConnection();
       await connection.beginTransaction();
 
-      // Update request status
+      // For unmark_absent requests, also update duplicate pending requests with same attendance_id
+      let relatedRequestIds = [requestId];
+      
+      if (request.request_type === 'unmark_absent' && request.attendance_id) {
+        // Find all pending requests with same attendance_id and same type
+        const [relatedRequests] = await connection.query(`
+          SELECT id 
+          FROM employee_requests 
+          WHERE request_type = 'unmark_absent' 
+            AND attendance_id = ? 
+            AND status = 'pending'
+            AND employee_id = ?
+            AND id != ?
+        `, [request.attendance_id, request.employee_id, requestId]);
+
+        // Add related request IDs to the array
+        relatedRequestIds = [
+          requestId,
+          ...relatedRequests.map(r => r.id)
+        ];
+      }
+
+      // Update all related requests (will be just requestId for non-unmark_absent requests)
       await connection.query(`
         UPDATE employee_requests 
         SET status = ?, admin_remarks = ?, handled_by = ?, handled_at = NOW(), updated_at = NOW()
-        WHERE id = ?
-      `, [status, review_notes || null, reviewedBy, requestId]);
+        WHERE id IN (?)
+      `, [status, review_notes || null, reviewedBy, relatedRequestIds]);
 
       // If approved, handle different request types
       if (status === 'approved') {
-        await this.handleApprovedRequest(connection, request, requestId);
+        // For unmark_absent, pass all related request IDs to handle duplicates properly
+        if (request.request_type === 'unmark_absent') {
+          await this.handleUnmarkAbsentApproval(connection, request, requestId, relatedRequestIds);
+        } else {
+          await this.handleApprovedRequest(connection, request, requestId);
+        }
       }
 
       await connection.commit();
 
       // Notify employee about the decision
-      await this.notifyEmployeeDecisionComprehensive(employee, request, status, review_notes, request.request_type);
+      await this.notifyEmployeeDecisionComprehensive(
+        employee, 
+        request, 
+        status, 
+        review_notes, 
+        request.request_type,
+        relatedRequestIds.length > 1 ? relatedRequestIds : undefined
+      );
 
       res.json({
         success: true,
-        message: `Request ${status} successfully`,
+        message: `Request${relatedRequestIds.length > 1 ? 's' : ''} ${status} successfully`,
         data: {
-          requestId: requestId,
+          requestIds: relatedRequestIds,
+          updatedCount: relatedRequestIds.length,
           status: status,
-          updatedAt: new Date()
+          updatedAt: new Date(),
+          requestType: request.request_type
         },
         environment: this.isProduction ? 'production' : 'development/staging'
       });
@@ -1081,7 +1247,7 @@ async handleApprovedRequest(connection, request, requestId) {
 }
 
 // Handle unmark_absent approval
-async handleUnmarkAbsentApproval(connection, request, requestId) {
+async handleUnmarkAbsentApproval(connection, request, requestId, relatedRequestIds = [requestId]) {
   // Get attendance settings to calculate checkout time
   const [attendanceSettings] = await connection.query(`
     SELECT settings_data FROM attendance_settings ORDER BY id LIMIT 1
@@ -1116,6 +1282,9 @@ async handleUnmarkAbsentApproval(connection, request, requestId) {
     WHERE employee_id = ? AND DATE(date) = DATE(?)
   `, [request.employee_id, request.request_date]);
 
+  // Create remarks with all related request IDs
+  const allRequestIds = relatedRequestIds.join(', #');
+  
   if (attendanceRecords.length > 0) {
     const attendanceRecord = attendanceRecords[0];
     let checkoutTime = null;
@@ -1156,7 +1325,7 @@ async handleUnmarkAbsentApproval(connection, request, requestId) {
       UPDATE attendance 
       SET status = 'Present', 
           check_out = ?,
-          remarks = CONCAT(IFNULL(remarks, ''), ' Absent regularized via request #${requestId}'),
+          remarks = CONCAT(IFNULL(remarks, ''), ' Absent regularized via request #${allRequestIds}'),
           updated_at = NOW()
       WHERE id = ?
     `, [checkoutTime, attendanceRecord.id]);
@@ -1179,7 +1348,7 @@ async handleUnmarkAbsentApproval(connection, request, requestId) {
     await connection.query(`
       INSERT INTO attendance 
       (employee_id, date, status, check_in, check_out, remarks, created_at, updated_at)
-      VALUES (?, ?, 'Present', ?, ?, 'Absent regularized via request #${requestId}', NOW(), NOW())
+      VALUES (?, ?, 'Present', ?, ?, 'Absent regularized via request #${allRequestIds}', NOW(), NOW())
     `, [request.employee_id, request.request_date, defaultCheckIn, checkoutTime]);
 
     console.log(`Created new attendance record with check_in: ${defaultCheckIn}, check_out: ${checkoutTime}`);
